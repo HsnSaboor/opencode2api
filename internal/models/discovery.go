@@ -57,12 +57,39 @@ type capabilityModelCost struct {
 	Output *float64 `json:"output"`
 }
 
+// defaultInterleavedField is the wire field interleaved reasoning defaults to
+// when a catalog entry declares interleaving without naming a field. It must
+// stay in sync with the fallback in protocol request normalization.
+const defaultInterleavedField = "reasoning_content"
+
 // capabilityModelInterleaved is the catalog's declaration that a model
 // interleaves its reasoning with tool calls in a named wire field. It is the
 // machine-readable form of "this endpoint wants reasoning replayed on
 // tool-call turns"; the gateway previously inferred it from vendor names.
+// The catalog mixes two encodings: an object carrying the field name and a
+// legacy boolean meaning "interleaves in the default field". Both decode
+// here, so either form cannot fail the whole catalog refresh.
 type capabilityModelInterleaved struct {
 	Field string `json:"field"`
+}
+
+// UnmarshalJSON accepts both catalog encodings of the interleaved flag.
+func (c *capabilityModelInterleaved) UnmarshalJSON(data []byte) error {
+	var enabled bool
+	if err := json.Unmarshal(data, &enabled); err == nil {
+		c.Field = ""
+		if enabled {
+			c.Field = defaultInterleavedField
+		}
+		return nil
+	}
+	type plain capabilityModelInterleaved
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = capabilityModelInterleaved(decoded)
+	return nil
 }
 
 // capabilityModelReasoning is one entry of reasoning_options: either an
