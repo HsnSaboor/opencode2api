@@ -205,6 +205,8 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 这只是网关的路由判断，上游仍可能拒绝或限制请求。匿名请求在上游认证头中使用 `public` 凭证。
 
+Zen 免费层在上游还会校验客户端指纹，网关会完整复刻官方 CLI 的请求画像：`Authorization: Bearer public`、`opencode/<channel>/<version>/cli` 形式的 User-Agent、在所有 `x-opencode-session`/`x-session-affinity`/`x-session-id`/`x-opencode-session-id` 别名上使用规范会话 ID，以及符合网关放行的两种画像之一的请求体——代理流量（`tools` 中包含名为 `read` 的函数）或标题生成器（无工具 + 其系统提示词）。无工具且非标题画像的请求会被补上一个仅含名称的 `read` 声明；已声明的工具列表保持不变，标题生成请求永不注入工具。会话 ID 的 12 位十六进制编码了每毫秒计数器，取值必须不超过 63；网关使用官方编码器生成会话。旧的 `/zen` 上游地址会在加载配置时自动迁移到当前的 `https://opencode.ai/inference`。
+
 路由顺序：
 
 1. 符合条件的模型先尝试匿名通道，每个可用出口通道最多一次。
@@ -239,6 +241,8 @@ Key 初始化时均衡分配到出口通道。真实流量可以触发通道检�
 
 失败冷却按指数增长，最高为 `performance.failure_cooldown_seconds` 的八倍；如果上游的 `Retry-After` 更长，则使用更长时间。所有认证 Key 都处于冷却时，路由仍可能尝试最早结束冷却的 Key；仍在冷却的匿名节点会被跳过。
 
+免费层上游可能封禁整个出口前缀——例如某个已使用过的 `/48` 的每个 `/64` 都返回 `FreeTierError`，而同一隧道上的其它前缀正常。网关会把每次 `FreeTier` 判定归因到所属配置前缀：单次判定只停用该出口，同一前缀连续判定则将该前缀从补充采样中冷却 15 分钟，避免继续生成注定被拒的出口。冷却到期后，探测任务每 5 分钟用最小请求重试该前缀，上游封禁解除后自动恢复；冷却期间流量继续通过其余前缀。
+
 ## 配置参考
 
 完整起始配置见 [config.example.json](config.example.json)。配置支持 `//` 和 `/* ... */` 注释，未知字段和无效取值会被拒绝。
@@ -252,8 +256,8 @@ Key 初始化时均衡分配到出口通道。真实流量可以触发通道检�
 | `zen_keys`、`go_keys`       | 未启用匿名模式时，至少需要一个上游 Key。                                              |
 | `anonymous`                 | `false`。                                                                             |
 | `prefer`                    | `go`；可选 `go`、`zen`。                                                              |
-| `upstream.zen`              | `https://opencode.ai/zen`。                                                           |
-| `upstream.go`               | `https://opencode.ai/zen/go`。                                                        |
+| `upstream.zen`              | `https://opencode.ai/inference`。                                                    |
+| `upstream.go`               | `https://opencode.ai/inference/go`。                                                 |
 | `egress.enable_ipv6`        | `true`。                                                                              |
 | `egress.prefixes`           | `["2001:470:7331::/48"]`；最多 8 个 IPv6 CIDR。                                       |
 | `egress.pool_size`          | `16`；轮换地址池大小，范围 1–128。                                                    |

@@ -22,6 +22,11 @@ type probeResult struct {
 	effort                             models.EffortProbe
 }
 
+// anonymousProbeLanes bounds how many anonymous lanes one availability probe
+// tries before reporting the model's state, so a single flagged prefix cannot
+// decide the probe outcome.
+const anonymousProbeLanes = 3
+
 func (g *Gateway) resolvedEffort(model string, tier config.Tier, protocol wire.Protocol) string {
 	effort := g.cfg.ForcedEffort(model)
 	if effort != "auto" {
@@ -61,7 +66,7 @@ func probePayload(model string, protocol wire.Protocol, effort string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	return shapeAnonymousBody(b, protocol, true), nil
+	return shapeAnonymousBody(b, protocol), nil
 }
 
 func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult {
@@ -73,15 +78,22 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if !d.AvailableZen || !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
-	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: identity.StableID("prj", "opencode2api:default-project")}
+	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: identity.ProjectID("")}
 	type lane struct {
 		key, name string
 		client    *http.Client
 	}
 	var lanes []lane
 	if g.cfg.Anonymous {
+		// A few anonymous lanes per probe: a single lane may sit on a
+		// FreeTier-flagged prefix and answer 403 without saying anything about
+		// the model. The first successful lane ends the scan.
 		cursor := g.anonymous.CursorFor(ids.Session)
-		if node := cursor.Next(); node != nil {
+		for len(lanes) < anonymousProbeLanes {
+			node := cursor.Next()
+			if node == nil {
+				break
+			}
 			lanes = append(lanes, lane{anonymousZenKey, "anonymous", node.egress.client})
 		}
 	}

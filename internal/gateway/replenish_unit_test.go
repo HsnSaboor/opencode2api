@@ -17,7 +17,7 @@ func TestReplenishGrowsPoolOnFreshSubnet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
-	pool, err := newTransportPool(addrs, testPerf(), 0)
+	pool, err := newTransportPool(addrs, testPerf(), 0, nil)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestReplenishCapsAtMax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
-	pool, err := newTransportPool(addrs, testPerf(), 0)
+	pool, err := newTransportPool(addrs, testPerf(), 0, nil)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestSelectableCountsSplit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
-	pool, err := newTransportPool(addrs, testPerf(), 0)
+	pool, err := newTransportPool(addrs, testPerf(), 0, nil)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}

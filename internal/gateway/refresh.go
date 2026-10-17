@@ -2,13 +2,17 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sync"
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/httpx"
+	"opencode2api/internal/identity"
 	modelcatalog "opencode2api/internal/models"
+	wire "opencode2api/internal/protocol"
 )
 
 const (
@@ -19,6 +23,13 @@ const (
 	// lanes; each lane additionally caps its own check at
 	// egressHealthCheckTimeout, so this is the outer budget only.
 	egressWarmTimeout = 10 * time.Second
+	// prefixProbationInterval is how often the gateway re-tests a cooled
+	// egress prefix whose cooldown window has expired. The probe request is
+	// one minimal completion; a still-flagged prefix re-cools for another
+	// full window, so a blocked prefix costs a few probes per hour while
+	// recovery to a healthy rotation is automatic.
+	prefixProbationInterval = 5 * time.Minute
+	prefixProbationTimeout  = 30 * time.Second
 )
 
 // syncEgressResult updates lane health from real traffic. Only timeouts and
@@ -135,7 +146,124 @@ func (g *Gateway) applyEgressHealthResult(result egressHealthResult, source stri
 	g.logger.Debug("egress health check is still failing", "component", "egress", "event", "health_check_still_failing", "source", source, "upstream_status", upstreamStatus, "egress", config.RedactURL(result.egress.address), "error", result.err)
 }
 
+// startPrefixProbation re-tests FreeTier-cooled prefixes on a timer so a
+// prefix that was blocked upstream rejoins the rotation as soon as the flag
+// clears, without waiting for incidental traffic. It runs beside the model
+// refresh loop and stops with the same context.
+func (g *Gateway) startPrefixProbation(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(prefixProbationInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				g.probeCoolingPrefixes(ctx)
+			}
+		}
+	}()
+}
+
+// probeCoolingPrefixes sends one minimal gated request from each cooled
+// prefix whose window has expired. A success clears the cooldown (the prefix
+// is serving traffic again); a repeated FreeTier verdict restarts it. Other
+// outcomes — including transport errors, which say nothing about the flag —
+// leave the state untouched.
+func (g *Gateway) probeCoolingPrefixes(ctx context.Context) {
+	if !g.cfg.Anonymous {
+		return
+	}
+	cooling := g.transports.CoolingPrefixes()
+	if len(cooling) == 0 {
+		return
+	}
+	model := g.probationModel()
+	if model == "" {
+		return
+	}
+	now := time.Now()
+	for prefix, until := range cooling {
+		if ctx.Err() != nil {
+			return
+		}
+		if now.Before(until) {
+			continue
+		}
+		g.probeCoolingPrefix(ctx, prefix, model)
+	}
+}
+
+// probationModel picks the free model a probation probe asks for: any free
+// model exercises the same FreeTier gate, and the request is capped at a
+// single token.
+func (g *Gateway) probationModel() string {
+	for _, model := range g.catalog.List() {
+		if g.catalog.IsFreeModel(model) {
+			return model
+		}
+	}
+	return ""
+}
+
+func (g *Gateway) probeCoolingPrefix(ctx context.Context, prefix, model string) {
+	addrs, err := config.SampleFreshEgress([]string{prefix}, 1, nil)
+	if err != nil || len(addrs) == 0 {
+		g.logger.Debug("egress prefix probation could not sample an address", "component", "egress", "event", "prefix_probation_sample_failed", "prefix", prefix, "error", err)
+		return
+	}
+	address := addrs[0]
+	egress, err := g.transports.buildLane(0, address)
+	if err != nil {
+		g.logger.Debug("egress prefix probation could not build a lane", "component", "egress", "event", "prefix_probation_lane_failed", "prefix", prefix, "egress", config.RedactURL(address), "error", err)
+		return
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":      model,
+		"messages":   []any{map[string]any{"role": "user", "content": "ping"}},
+		"max_tokens": 1,
+		"stream":     true,
+	})
+	if err != nil {
+		return
+	}
+	// Probation traffic carries the same fingerprint as production traffic:
+	// the verdict is only meaningful when the request itself would pass the
+	// gate from a healthy prefix.
+	body = shapeAnonymousBody(body, wire.Chat)
+	ids := identity.RequestIDs{
+		Session: identity.CanonicalSessionID("probation:" + prefix),
+		Project: identity.ProjectID(""),
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, prefixProbationTimeout)
+	defer cancel()
+	req, err := newUpstreamRequest(probeCtx, g.cfg.Upstream.Zen, wire.Chat, body, ids, anonymousZenKey)
+	if err != nil {
+		return
+	}
+	started := time.Now()
+	resp, err := egress.client.Do(req)
+	duration := time.Since(started)
+	if err != nil {
+		g.logger.Debug("egress prefix probation request failed", "component", "egress", "event", "prefix_probation_transport_failed", "prefix", prefix, "egress", config.RedactURL(address), "duration_ms", duration.Milliseconds(), "error", err)
+		return
+	}
+	defer httpx.DrainAndClose(resp.Body)
+	if resp.StatusCode == http.StatusForbidden && classifyForbidden(peekForbiddenSnippet(resp, 2048)) == forbiddenFreeTier {
+		g.transports.reCoolPrefix(config.CanonicalizePrefix(prefix))
+		g.logger.Info("egress prefix probation still blocked", "component", "egress", "event", "prefix_probation_blocked", "prefix", prefix, "egress", config.RedactURL(address), "duration_ms", duration.Milliseconds())
+		return
+	}
+	if resp.StatusCode/100 == 2 {
+		g.transports.ClearPrefix(address)
+		g.logger.Info("egress prefix probation succeeded; prefix rejoined the rotation", "component", "egress", "event", "prefix_probation_recovered", "prefix", prefix, "egress", config.RedactURL(address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+		return
+	}
+	g.logger.Debug("egress prefix probation was inconclusive", "component", "egress", "event", "prefix_probation_inconclusive", "prefix", prefix, "egress", config.RedactURL(address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+}
+
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
+	g.startPrefixProbation(ctx)
 	refresh := func() {
 		var zen, goModels []string
 		var capabilities modelcatalog.Capabilities

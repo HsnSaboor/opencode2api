@@ -54,6 +54,14 @@ type transportPool struct {
 	perf          config.PerformanceConfig
 	headerTimeout time.Duration
 	prefixes      []string
+	// prefixMu guards prefixStrikes/prefixCooling, which track FreeTier
+	// verdicts per configured prefix: a prefix whose lanes keep answering
+	// FreeTier is blocked upstream as a unit and leaves replenishment
+	// sampling until its cooldown expires. Only the rare verdict path takes
+	// this mutex.
+	prefixMu      sync.Mutex
+	prefixStrikes map[string]int
+	prefixCooling map[string]int64
 	// maxLanes caps total lanes (initial + replacements) so a sustained
 	// flag storm cannot grow the pool without bound. Zero means the
 	// constructor default below.
@@ -243,6 +251,18 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 // subnet-wide, health and failure counters untouched.
 const freitierCooldown = 30 * time.Minute
 
+// Prefix-level cooling: one FreeTier 403 parks a single lane, but a prefix
+// whose lanes keep answering FreeTier is blocked upstream as a unit — a
+// rotated /48 that had been used for abuse answered 403 FreeTierError from
+// every /64 tried while sibling routed /64s on the same tunnel answered 200.
+// After prefixFreeTierStrikeLimit strikes with no success in between, the
+// whole prefix leaves replenishment sampling for prefixFreeTierCooldown;
+// expiry (or a successful fallback lane) re-admits it.
+const (
+	prefixFreeTierStrikeLimit = 2
+	prefixFreeTierCooldown    = 15 * time.Minute
+)
+
 // ParkFreitier parks the lane after an upstream FreeTier 403 and grows a
 // fresh replacement lane on an unused /64, keeping the pool's selectable
 // count stable through a flag storm. The lane keeps its health and failure
@@ -260,13 +280,16 @@ func (p *anonymousPool) ParkFreitier(egress *egressTransport) {
 	p.maybeReplenish(egress)
 }
 
-// replenishPrefixes returns the configured egress CIDRs for replenishment
-// sampling. Nil-safe for a nil pool.
+// replenishPrefixes returns the configured egress CIDRs available for
+// replenishment sampling. FreeTier-cooled prefixes are held back so a blocked
+// prefix does not keep minting doomed lanes; the healthy list falls back to
+// the full set when every prefix is cooling, so recovery stays possible.
+// Nil-safe for a nil pool.
 func (p *anonymousPool) replenishPrefixes() []string {
-	if p == nil {
+	if p == nil || p.transports == nil {
 		return nil
 	}
-	return p.prefixes
+	return p.transports.HealthyPrefixes(p.prefixes)
 }
 
 // maybeReplenish appends one fresh node+lane when the pool is below cap. It
@@ -349,6 +372,117 @@ func (p *transportPool) pruneSubnetCooldowns() {
 	p.subnetMu.Unlock()
 }
 
+// StrikePrefix attributes a FreeTier 403 to the configured prefix holding
+// addr. It returns the prefix key (empty when addr maps to none), the running
+// strike count, and whether the prefix is cooling as of this verdict — either
+// this strike started the cooldown or one was already running.
+func (p *transportPool) StrikePrefix(addr string) (string, int, bool) {
+	if p == nil {
+		return "", 0, false
+	}
+	key := config.PrefixKeyFor(p.prefixes, addr)
+	if key == "" {
+		return "", 0, false
+	}
+	now := time.Now().UnixNano()
+	p.prefixMu.Lock()
+	defer p.prefixMu.Unlock()
+	if p.prefixCooling[key] > now {
+		return key, p.prefixStrikes[key], true
+	}
+	if p.prefixStrikes == nil {
+		p.prefixStrikes = make(map[string]int)
+	}
+	if p.prefixCooling == nil {
+		p.prefixCooling = make(map[string]int64)
+	}
+	p.prefixStrikes[key]++
+	if p.prefixStrikes[key] >= prefixFreeTierStrikeLimit {
+		delete(p.prefixStrikes, key)
+		p.prefixCooling[key] = now + int64(prefixFreeTierCooldown)
+		return key, prefixFreeTierStrikeLimit, true
+	}
+	return key, p.prefixStrikes[key], false
+}
+
+// reCoolPrefix restarts a cooled prefix's cooldown window. The probation
+// probe calls it when a re-tested prefix is still answering FreeTier, so the
+// prefix stays out of sampling for another full cooldown instead of being
+// retried on every probation tick.
+func (p *transportPool) reCoolPrefix(key string) {
+	if p == nil || key == "" {
+		return
+	}
+	p.prefixMu.Lock()
+	if p.prefixCooling == nil {
+		p.prefixCooling = make(map[string]int64)
+	}
+	p.prefixCooling[key] = time.Now().Add(prefixFreeTierCooldown).UnixNano()
+	delete(p.prefixStrikes, key)
+	p.prefixMu.Unlock()
+}
+
+// CoolingPrefixes returns the prefixes currently tracked as FreeTier-cooled
+// together with the end of their cooldown. The set is bounded by the
+// configured prefix count.
+func (p *transportPool) CoolingPrefixes() map[string]time.Time {
+	if p == nil {
+		return nil
+	}
+	p.prefixMu.Lock()
+	defer p.prefixMu.Unlock()
+	out := make(map[string]time.Time, len(p.prefixCooling))
+	for key, until := range p.prefixCooling {
+		if until > 0 {
+			out[key] = time.Unix(0, until)
+		}
+	}
+	return out
+}
+
+// ClearPrefix retires any strikes and cooldown for the prefix holding addr:
+// the prefix just served a request, so it is not blocked. Callers pass the
+// address of the lane that produced the 2xx; a nil pool or an address outside
+// the configured prefixes is a no-op.
+func (p *transportPool) ClearPrefix(addr string) {
+	if p == nil {
+		return
+	}
+	key := config.PrefixKeyFor(p.prefixes, addr)
+	if key == "" {
+		return
+	}
+	p.prefixMu.Lock()
+	delete(p.prefixStrikes, key)
+	delete(p.prefixCooling, key)
+	p.prefixMu.Unlock()
+}
+
+// HealthyPrefixes filters prefixes down to those not cooling from FreeTier
+// verdicts. An empty result falls back to the full list: sampling must keep
+// drawing somewhere for a cooled prefix to get a chance to prove itself (a
+// successful request clears the cooldown), otherwise a total outage would
+// never recover.
+func (p *transportPool) HealthyPrefixes(prefixes []string) []string {
+	if p == nil || len(prefixes) == 0 {
+		return prefixes
+	}
+	now := time.Now().UnixNano()
+	p.prefixMu.Lock()
+	defer p.prefixMu.Unlock()
+	healthy := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		key := config.CanonicalizePrefix(prefix)
+		if key == "" || p.prefixCooling[key] <= now {
+			healthy = append(healthy, prefix)
+		}
+	}
+	if len(healthy) == 0 {
+		return prefixes
+	}
+	return healthy
+}
+
 func (p *transportPool) hasHealthy() bool {
 	for _, egress := range p.snapshot() {
 		if egress.healthy.Load() {
@@ -397,7 +531,7 @@ func (p *anonymousPool) snapshotNodes() []*anonymousNode {
 // connection budgets are divided across the pool so the configured totals
 // stay global instead of multiplying per lane; a zero MaxConnsPerHost keeps
 // its unlimited meaning.
-func newTransportPool(addresses []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
+func newTransportPool(addresses []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration, prefixes []string) (*transportPool, error) {
 	if len(addresses) == 0 {
 		return nil, errors.New("at least one egress address is required")
 	}
@@ -405,6 +539,7 @@ func newTransportPool(addresses []string, cfg config.PerformanceConfig, response
 		items:         make([]*egressTransport, 0, len(addresses)),
 		perf:          cfg,
 		headerTimeout: responseHeaderTimeout,
+		prefixes:      append([]string(nil), prefixes...),
 		maxLanes:      maxPoolLanes,
 	}
 	for _, address := range addresses {

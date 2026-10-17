@@ -47,7 +47,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		return nil, err
 	}
 	addresses := cfg.EgressAddresses()
-	transports, err := newTransportPool(addresses, cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
+	transports, err := newTransportPool(addresses, cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second), cfg.Egress.Prefixes)
 	if err != nil {
 		return nil, err
 	}

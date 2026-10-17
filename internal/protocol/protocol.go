@@ -19,15 +19,20 @@ func Valid(p Protocol) bool {
 	return p == Chat || p == Responses || p == Anthropic || p == SystemOne
 }
 
+// Path returns the endpoint path for a protocol under an OpenCode inference
+// base (https://opencode.ai/inference for Zen, https://opencode.ai/inference/go
+// for Go). The current contract scopes the vendor-compatible routes under
+// /openai, /anthropic, and /systemone; the retired /zen base served the same
+// protocols straight under /v1/*.
 func Path(protocol Protocol) string {
 	switch protocol {
 	case Responses:
-		return "/v1/responses"
+		return "/openai/v1/responses"
 	case Anthropic:
-		return "/v1/messages"
+		return "/anthropic/v1/messages"
 	case SystemOne:
-		return "/v1/systemone"
+		return "/systemone/v1/systemone"
 	default:
-		return "/v1/chat/completions"
+		return "/openai/v1/chat/completions"
 	}
 }

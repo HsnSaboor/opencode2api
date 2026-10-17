@@ -125,7 +125,7 @@ func Load(path string) (Config, error) {
 	}
 	cfg := Config{
 		Listen:      "127.0.0.1:8080",
-		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/inference", Go: "https://opencode.ai/inference/go"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
@@ -143,6 +143,22 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return Normalize(path, cfg)
+}
+
+// legacyUpstreamBase rewrites the retired /zen API bases onto the current
+// /inference contract so existing configs keep working: the protocol routes
+// moved from /v1/* to the vendor-scoped paths (see protocol.Path), so a stale
+// base would 404 every call. Unknown hosts pass through untouched.
+func legacyUpstreamBase(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	switch strings.TrimRight(trimmed, "/") {
+	case "https://opencode.ai/zen":
+		return "https://opencode.ai/inference"
+	case "https://opencode.ai/zen/go":
+		return "https://opencode.ai/inference/go"
+	default:
+		return trimmed
+	}
 }
 
 // Normalize resolves external inputs and validates a Config supplied by
@@ -165,8 +181,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
 	}
-	cfg.Upstream.Zen = strings.TrimSpace(cfg.Upstream.Zen)
-	cfg.Upstream.Go = strings.TrimSpace(cfg.Upstream.Go)
+	cfg.Upstream.Zen = legacyUpstreamBase(cfg.Upstream.Zen)
+	cfg.Upstream.Go = legacyUpstreamBase(cfg.Upstream.Go)
 	for name, raw := range map[string]string{"upstream.zen": cfg.Upstream.Zen, "upstream.go": cfg.Upstream.Go} {
 		u, err := url.Parse(strings.TrimSpace(raw))
 		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {

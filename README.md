@@ -205,6 +205,8 @@ With `anonymous: true`, either condition makes a model eligible for the anonymou
 
 Eligibility is a routing decision; the upstream can still reject or rate-limit the request. Anonymous requests use `public` in the upstream authentication header.
 
+The Zen free tier is additionally gated upstream by a client fingerprint, so the gateway reproduces the official CLI's request profile exactly: `Authorization: Bearer public`, an `opencode/<channel>/<version>/cli` User-Agent, the canonical session ID on every `x-opencode-session`/`x-session-affinity`/`x-session-id`/`x-opencode-session-id` alias, and a body matching one of the two profiles the gate admits — agent traffic (`tools` contains a function named `read`) or the title generator (no tools plus its system prompt). Tool-less requests that are not the title profile are stamped with a single name-only `read` declaration; declared tool walls are preserved untouched, and title-generator requests are never given tools. Session IDs encode a per-millisecond counter in their 12 hex digits that the gate rejects above 63; the gateway mints them with the official encoder. A legacy `/zen` upstream base is migrated to the current `https://opencode.ai/inference` contract on load.
+
 The routing sequence is:
 
 1. For an eligible model, try each available anonymous egress lane once.
@@ -239,6 +241,8 @@ Without an explicit ID, the first user message is used as a seed. Conversations 
 
 Cooldowns grow exponentially up to eight times `performance.failure_cooldown_seconds`, and a longer `Retry-After` is honored. If every authenticated key is cooling down, routing may try the key whose cooldown ends first. Anonymous nodes still in cooldown are skipped.
 
+The free-tier gate can flag a whole egress prefix upstream — a used `/48` answering `FreeTierError` from every `/64` while sibling prefixes on the same tunnel answer normally. The gateway attributes each `FreeTier` verdict to its configured prefix: a single verdict parks that one lane, and repeated verdicts from the same prefix cool the prefix out of replenishment sampling for 15 minutes so it stops minting lanes the gate rejects. A probation probe re-tests cooled prefixes every five minutes once their window expires and restores them automatically when the upstream flag clears; while a prefix is cooling, traffic keeps flowing through the remaining configured prefixes.
+
 ## Configuration reference
 
 See [config.example.json](config.example.json) for a complete starting configuration. JSON supports `//` and `/* ... */` comments; unknown fields and invalid values are rejected.
@@ -252,8 +256,8 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `zen_keys`, `go_keys`       | At least one upstream key is required unless anonymous access is enabled.   |
 | `anonymous`                 | `false`.                                                                    |
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                |
-| `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
-| `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
+| `upstream.zen`              | `https://opencode.ai/inference`.                                            |
+| `upstream.go`               | `https://opencode.ai/inference/go`.                                         |
 | `egress.enable_ipv6`        | `true`.                                                                     |
 | `egress.prefixes`           | `["2001:470:7331::/48"]`; up to 8 IPv6 CIDRs.                               |
 | `egress.pool_size`          | `16`; range 1–128 source addresses in rotation.                             |

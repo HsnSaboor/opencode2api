@@ -25,7 +25,7 @@ type EgressConfig struct {
 }
 
 const (
-	defaultEgressPrefix   = "2001:470:735f::/48"
+	defaultEgressPrefix   = "2001:470:7331::/48"
 	defaultEgressPoolSize = 100
 	maxEgressPrefixes     = 8
 	maxEgressPoolSize     = 128
@@ -284,6 +284,39 @@ func SubnetKeyFor(prefixes []string, addr string) string {
 		return key
 	}
 	return ""
+}
+
+// PrefixKeyFor returns the configured CIDR from prefixes that contains addr,
+// or "" when addr matches none (or is not an IP literal, such as "direct").
+// The gateway uses it to attribute lane verdicts to the configured prefixes so
+// an upstream block covering a whole prefix can be cooled as a unit.
+func PrefixKeyFor(prefixes []string, addr string) string {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return ""
+	}
+	networks, _, err := parseEgressPrefixes(prefixes)
+	if err != nil {
+		return ""
+	}
+	for _, network := range networks {
+		if network.Contains(ip) {
+			return network.String()
+		}
+	}
+	return ""
+}
+
+// CanonicalizePrefix returns the canonical CIDR form of one configured prefix
+// (parseEgressPrefixes masks host bits), or "" when raw is not a valid prefix.
+// Prefix-health bookkeeping uses it so textually different spellings of the
+// same prefix compare equal.
+func CanonicalizePrefix(raw string) string {
+	networks, _, err := parseEgressPrefixes([]string{raw})
+	if err != nil || len(networks) == 0 {
+		return ""
+	}
+	return networks[0].String()
 }
 
 // parseEgressPrefixes normalizes and validates a prefix list once, so

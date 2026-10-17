@@ -279,10 +279,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// The anonymous free tier serves SSE only — non-streaming wire bodies are
 	// rejected with 403 FreeTierError — so streaming is forced here and the
 	// gateway collapses the stream back when the client asked for plain JSON.
-	// Nothing else is rewritten: the free-tier gate recognizes the client's
-	// own tool and prompt profile, and synthetic shapes are the rejected ones.
-	// Key tiers keep their original bodies.
-	body = shapeAnonymousBody(body, route.ProtocolFor(config.TierZen), false)
+	// The same shaping stamps the gate's required tool profile (see
+	// shapeAnonymousBody). Key tiers keep their original bodies.
+	body = shapeAnonymousBody(body, route.ProtocolFor(config.TierZen))
 	for attempts < limit {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
@@ -340,6 +339,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			if verdict == forbiddenFreeTier {
 				g.anonymous.ParkFreitier(node.egress)
+				if prefix, strikes, cooling := g.transports.StrikePrefix(node.egress.address); prefix != "" {
+					g.logger.Info("anonymous FreeTier verdict attributed to configured prefix", "component", "upstream", "event", "anonymous_prefix_strike", "request_id", ids.Request, "prefix", prefix, "strikes", strikes, "cooling", cooling)
+				}
 				freitierParks++
 				if freitierParks >= freitierScanLimit {
 					// The same verdict from every lane means the gate rejects
@@ -360,6 +362,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			continue
 		}
 		if err == nil && resp.StatusCode/100 == 2 {
+			g.transports.ClearPrefix(node.egress.address)
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
@@ -389,27 +392,35 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	return nil, lastErr, attempts
 }
 
-// anonymousCoreTools are the tool names the free-tier gate expects on agent
-// traffic. Requests that declare a tool profile are completed with any
-// missing names — foreign profiles (another client's capitalized or aliased
-// tools) are not recognized without them. Requests that declare no tools are
-// left alone: the gate rejects tool-bearing shapes for profiles that cannot
-// carry tools (OpenCode's title generator among them), and synthetic probe
-// traffic is the one case where the gateway stamps the full set itself.
-var anonymousCoreTools = []string{"bash", "edit", "glob", "grep", "read"}
+// anonymousReadTool is the one tool the free-tier gate requires on agent
+// traffic. The gate inspects only the function name, so a name-only
+// declaration suffices and is the least intrusive thing to add to a foreign
+// harness's tool wall.
+var anonymousReadTool = []string{"read"}
+
+// anonymousTitleMarker identifies OpenCode's internal title-generation
+// profile inside a system prompt. The free-tier gate matches that profile
+// fuzzily and rejects it when tools are present, so shaping must leave
+// tool-less title requests exactly as they are.
+const anonymousTitleMarker = "title generator"
 
 // shapeAnonymousBody prepares a free-tier wire body for the anonymous lane.
 // The upstream serves SSE only, so streaming is forced and Chat usage
 // reporting enabled; the gateway collapses the stream back when the client
-// asked for plain JSON. A declared tool profile is completed with the missing
-// official agent tool names. stampTools additionally materializes the whole
-// set for synthetic payloads that declare no tools at all (availability
-// probes); client traffic is never given tools it did not declare. Bodies
-// that already satisfy the shape (or are not JSON objects) are returned
-// unchanged. System One payloads are decision requests, not agent traffic, so
-// they are forwarded verbatim; injecting streaming would make the upstream
-// reject them.
-func shapeAnonymousBody(body []byte, protocol wire.Protocol, stampTools bool) []byte {
+// asked for plain JSON. Tool shaping makes the body recognizable to the
+// free-tier gate, which admits exactly two profiles:
+//
+//   - agent traffic: a non-empty tools list containing a function named
+//     "read" — declared tools are preserved and a missing "read" is appended;
+//   - the title generator: no tools at all.
+//
+// Everything else is answered with 403 FreeTierError, so tool-less requests
+// that are not the title profile are stamped with a minimal "read"
+// declaration. System One payloads are decision requests, not agent traffic,
+// so they are forwarded verbatim; injecting streaming would make the upstream
+// reject them. Bodies that already satisfy the shape (or are not JSON
+// objects) are returned unchanged.
+func shapeAnonymousBody(body []byte, protocol wire.Protocol) []byte {
 	if protocol == wire.SystemOne {
 		return body
 	}
@@ -425,7 +436,7 @@ func shapeAnonymousBody(body []byte, protocol wire.Protocol, stampTools bool) []
 	if ensureAnonymousChatUsage(payload, protocol) {
 		changed = true
 	}
-	if ensureAnonymousTools(payload, protocol, stampTools) {
+	if ensureAnonymousTools(payload, protocol) {
 		changed = true
 	}
 	if !changed {
@@ -458,41 +469,97 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 	return true
 }
 
-// ensureAnonymousTools completes a declared tool profile with any missing core
-// agent tool names so the free-tier gate recognizes it. It never fabricates a
-// list for a payload that declares none unless fabricate is set (synthetic
-// probe traffic, which has no profile of its own). It reports whether the
-// payload changed. Declared tools are otherwise left untouched.
-func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol, fabricate bool) bool {
+// ensureAnonymousTools makes a payload recognizable as free-tier agent
+// traffic: the tools list must exist, be non-empty, and contain a "read"
+// function. It reports whether the payload changed. The title generator's
+// tool-less profile is never given tools — the gate rejects that combination
+// outright — and a title-profile request that somehow already carries tools
+// is left untouched, because the official client never emits that shape and
+// rewriting caller semantics would be worse than the upstream verdict.
+func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 	raw, exists := payload["tools"]
 	items, isSlice := raw.([]any)
 	if !exists || (isSlice && len(items) == 0) {
-		if !fabricate {
+		if anonymousTitleProfile(payload, protocol) {
 			return false
 		}
-		payload["tools"] = anonymousToolset(protocol, nil)
+		payload["tools"] = anonymousToolset(protocol, anonymousReadTool)
 		return true
 	}
 	if !isSlice {
 		return false
 	}
-	present := make(map[string]bool, len(items))
 	for _, item := range items {
-		if name := anonymousToolName(protocol, item); name != "" {
-			present[name] = true
+		if anonymousToolName(protocol, item) == "read" {
+			return false
 		}
 	}
-	missing := make([]string, 0, len(anonymousCoreTools))
-	for _, name := range anonymousCoreTools {
-		if !present[name] {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) == 0 {
+	if anonymousTitleProfile(payload, protocol) {
 		return false
 	}
-	payload["tools"] = append(items, anonymousToolset(protocol, missing)...)
+	payload["tools"] = append(items, anonymousTool(protocol, "read"))
 	return true
+}
+
+// anonymousTitleProfile reports whether the payload is OpenCode's internal
+// title-generation request. The gate's own matching is loose (prompt
+// mutations pass), so a marker search is a faithful approximation — and
+// conservative in the right direction: agent payloads always carry tools and
+// a harness system prompt that never contains the marker. Only system-side
+// prompts are inspected; a user message that happens to mention titles cannot
+// misclassify the request.
+func anonymousTitleProfile(payload map[string]any, protocol wire.Protocol) bool {
+	prompt := anonymousSystemPrompt(payload, protocol)
+	return prompt != "" && strings.Contains(strings.ToLower(prompt), anonymousTitleMarker)
+}
+
+// anonymousSystemPrompt extracts the system/instruction text from the
+// protocol-specific shapes a wire body can carry.
+func anonymousSystemPrompt(payload map[string]any, protocol wire.Protocol) string {
+	if protocol == wire.Anthropic {
+		return textContent(payload["system"])
+	}
+	if protocol == wire.Responses {
+		if text := textContent(payload["instructions"]); text != "" {
+			return text
+		}
+	}
+	for _, field := range []string{"messages", "input"} {
+		for _, raw := range jsonutil.SliceAt(payload, field) {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role := jsonutil.StringAt(item, "role"); role != "system" && role != "developer" {
+				continue
+			}
+			if text := textContent(item["content"]); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+// textContent flattens the string-or-parts content shapes Chat, Anthropic,
+// and Responses use for system prompts and messages.
+func textContent(raw any) string {
+	switch value := raw.(type) {
+	case string:
+		return value
+	case []any:
+		var b strings.Builder
+		for _, part := range value {
+			switch item := part.(type) {
+			case string:
+				b.WriteString(item)
+			case map[string]any:
+				b.WriteString(jsonutil.StringAt(item, "text"))
+			}
+		}
+		return b.String()
+	}
+	return ""
 }
 
 func anonymousToolName(protocol wire.Protocol, item any) string {
@@ -508,7 +575,7 @@ func anonymousToolName(protocol wire.Protocol, item any) string {
 
 func anonymousToolset(protocol wire.Protocol, names []string) []any {
 	if names == nil {
-		names = anonymousCoreTools
+		names = anonymousReadTool
 	}
 	tools := make([]any, 0, len(names))
 	for _, name := range names {
@@ -595,7 +662,7 @@ func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier
 	if !g.catalog.IsFreeModel(route.ID) {
 		return body, false
 	}
-	shaped := shapeAnonymousBody(body, route.ProtocolFor(tier), false)
+	shaped := shapeAnonymousBody(body, route.ProtocolFor(tier))
 	return shaped, !bytes.Equal(shaped, body)
 }
 
@@ -886,19 +953,24 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Proto
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	// The header set mirrors the official CLI's model requests
+	// (packages/core/src/session/model-request.ts): Accept: */*, the
+	// opencode/<channel>/<version>/cli UA, and the same canonical session on
+	// every affinity alias — the free-tier gate accepts any of
+	// x-opencode-session / x-session-affinity / x-session-id, and provider
+	// prompt caches key off them. The current contract reads no
+	// x-opencode-request header, so none is sent.
+	req.Header.Set("Accept", "*/*")
 	req.Header.Set("User-Agent", httpx.UserAgent())
 	req.Header.Set("x-opencode-client", "cli")
 	req.Header.Set("x-opencode-session", ids.Session)
-	// OpenCode 1.18.x sends these correlation headers to preserve provider-side
-	// prompt/session affinity. Keep the legacy x-opencode-session header too so
-	// older Zen deployments continue to recognize the request.
+	req.Header.Set("x-opencode-session-id", ids.Session)
 	req.Header.Set("x-session-affinity", ids.Session)
 	req.Header.Set("X-Session-Id", ids.Session)
-	req.Header.Set("x-opencode-request", ids.Request)
 	req.Header.Set("x-opencode-project", ids.Project)
 	if ids.ParentSession != "" {
 		req.Header.Set("x-parent-session-id", ids.ParentSession)
+		req.Header.Set("x-opencode-parent-session-id", ids.ParentSession)
 	}
 	if protocol == wire.Anthropic {
 		req.Header.Set("x-api-key", key)

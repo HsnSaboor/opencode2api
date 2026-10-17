@@ -6,12 +6,12 @@
   "anonymous": false,
   "egress": {
     "enable_ipv6": true,
-    "prefixes": ["2001:470:7331::/48"],
+    "prefixes": ["2001:470:7331::/48", "2001:470:1f0b:cf4::/64"],
     "pool_size": 100
   },
   "upstream": {
-    "zen": "https://opencode.ai/zen",
-    "go": "https://opencode.ai/zen/go"
+    "zen": "https://opencode.ai/inference",
+    "go": "https://opencode.ai/inference/go"
   },
   "retry": {
     "max_attempts": 3,

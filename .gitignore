@@ -22,3 +22,6 @@ coverage.out
 # Local credentials, deployment backups, and verification artifacts
 .local/
 *.availability.json
+
+# Local research and reference clones
+.devdocs/

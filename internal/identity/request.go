@@ -3,6 +3,7 @@ package identity
 
 import (
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -46,9 +47,6 @@ func DeriveRequestIDs(r *http.Request, body map[string]any) RequestIDs {
 	}
 	session := CanonicalSessionID(signal)
 	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
-	if projectSignal == "" {
-		projectSignal = "opencode2api:default-project"
-	}
 	parentSession := jsonutil.FirstString(
 		r.Header.Get("x-parent-session-id"),
 		jsonutil.StringAt(body, "metadata", "parent_session_id"),
@@ -56,7 +54,7 @@ func DeriveRequestIDs(r *http.Request, body map[string]any) RequestIDs {
 	return RequestIDs{
 		Session:       session,
 		Request:       RandomID("req", 16),
-		Project:       StableID("prj", projectSignal),
+		Project:       ProjectID(projectSignal),
 		ParentSession: parentSession,
 	}
 }
@@ -80,9 +78,37 @@ func conversationSeed(body map[string]any) string {
 	return ""
 }
 
-func StableID(prefix, value string) string {
-	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
-	return prefix + "_" + hex.EncodeToString(sum[:12])
+// defaultProjectSignal names the synthetic project the gateway attributes
+// conversations to when the downstream client does not send one.
+const defaultProjectSignal = "opencode2api"
+
+// ProjectID reproduces the x-opencode-project value the official client
+// sends: the 40-hex SHA-1 of "directory:<cwd>", or the literal "global"
+// outside a project (packages/core/src/session/model-request.ts). Values that
+// already carry that shape pass through untouched; everything else is hashed
+// into a stable synthetic identity so provider-side session telemetry sees a
+// plausible project instead of a gateway marker.
+func ProjectID(signal string) string {
+	if signal == "" {
+		signal = defaultProjectSignal
+	}
+	if signal == "global" || isHex40(signal) {
+		return signal
+	}
+	sum := sha1.Sum([]byte("directory:" + signal))
+	return hex.EncodeToString(sum[:])
+}
+
+func isHex40(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, c := range value {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // canonicalSessionPattern matches OpenCode's canonical session format:
@@ -93,16 +119,20 @@ var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{1
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// sessionEpochMs is the fixed countdown epoch of OpenCode's session ID
-// encoder (verified against 400+ real client sessions):
+// OpenCode session IDs encode their creation time in the 12 hex digits after
+// "ses_". The official client (SessionID.make) computes
 //
-//	value = (sessionEpochMs - createdMs) * 4096 - 2  (mod 2^48)
+//	value = ~(createdMs*4096 + counter) & 0xFFFFFFFFFFFF
 //
-// The 12 hex digits are a 1/4096-ms countdown; the Zen free-tier gate decodes
-// them and rejects sessions that do not map to a plausible creation time, so
-// hashed or random hex parts fail with 403 FreeTierError.
+// and the free-tier gate decodes the same shape: the low 12 bits are a
+// per-millisecond counter and values above 63 are rejected with 403
+// FreeTierError (verified empirically: counter 63 passes, 64 fails). The
+// 36-bit millisecond field wraps every ~795 days and is not validated, so
+// memoized sessions remain acceptable for their whole TTL. Random or hashed
+// hex parts fail the decode outright.
 const (
-	sessionEpochMs    = int64(1855425872000)
+	sessionCounter    = int64(1)
+	sessionCounterMax = int64(63)
 	sessionBackdateMs = int64(30_000)
 	sessionMemoTTL    = 7 * 24 * time.Hour
 )
@@ -147,12 +177,13 @@ func CanonicalSessionID(signal string) string {
 	return minted
 }
 
-// mintSessionID encodes now (backdated slightly to absorb clock skew) with
-// OpenCode's session countdown and appends a random Base62 tail.
+// mintSessionID encodes the current time the way the official client does
+// (backdated slightly to absorb clock skew) and appends a random Base62 tail.
+// The counter is 1: the first session a real client mints in any millisecond
+// carries that value, and every counter up to 63 is accepted by the gate.
 func mintSessionID(now time.Time) string {
 	createdMs := now.UnixMilli() - sessionBackdateMs
-	value := (sessionEpochMs-createdMs)*4096 - 2
-	value &= (1 << 48) - 1
+	value := (^(createdMs*4096 + sessionCounter)) & ((1 << 48) - 1)
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		panic(fmt.Sprintf("crypto/rand failed: %v", err))
