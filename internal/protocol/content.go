@@ -37,7 +37,7 @@ func decodeOpenAIBlocksChecked(value any) ([]bridgeBlock, error) {
 			case "image_url":
 				blocks = append(blocks, bridgeBlock{Kind: "image", URL: jsonutil.FirstString(jsonutil.StringAt(part, "image_url", "url"), jsonutil.StringAt(part, "image_url"))})
 			case "input_image":
-				blocks = append(blocks, bridgeBlock{Kind: "image", URL: jsonutil.StringAt(part, "image_url")})
+				blocks = append(blocks, bridgeBlock{Kind: "image", URL: jsonutil.FirstString(jsonutil.StringAt(part, "image_url", "url"), jsonutil.StringAt(part, "image_url"))})
 			case "file", "input_file":
 				file := jsonutil.MapAt(part, "file")
 				blocks = append(blocks, bridgeBlock{
@@ -307,6 +307,45 @@ func bridgeArgumentsJSON(block bridgeBlock) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// splitToolResultForChat separates a tool result into the text a Chat tool
+// message can carry and any image/file parts that must travel separately.
+//
+// Chat completions tool messages are text-only on every upstream this gateway
+// targets. Serializing a mixed result as JSON (the previous behavior) shipped
+// base64 bytes to the model as text, so a view_image result never reached the
+// model as a picture. The caller re-attaches the returned blocks in a
+// follow-up user message, which every vision-capable target understands.
+func splitToolResultForChat(value any) (string, []bridgeBlock) {
+	if text, ok := value.(string); ok {
+		return text, nil
+	}
+	blocks, err := decodeOpenAIBlocksChecked(value)
+	if err != nil {
+		blocks, err = decodeAnthropicBlocksChecked(value)
+	}
+	if err != nil {
+		return bridgeToolResultContent(value), nil
+	}
+	var text strings.Builder
+	var extras []bridgeBlock
+	for _, block := range blocks {
+		switch block.Kind {
+		case "text":
+			text.WriteString(block.Text)
+		case "image", "file":
+			extras = append(extras, block)
+		}
+	}
+	if len(extras) == 0 {
+		return bridgeToolResultContent(value), nil
+	}
+	content := text.String()
+	if content == "" {
+		content = "[tool returned an attachment]"
+	}
+	return content, extras
 }
 
 func bridgeToolResultContent(value any) string {

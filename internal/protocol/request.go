@@ -793,13 +793,23 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 			}
 		}
 		if len(pending) == 0 && len(pendingOrder) > 0 {
+			var attachments []bridgeBlock
 			for _, id := range pendingOrder {
 				result := pendingResults[id]
+				content, extras := splitToolResultForChat(result.Result)
 				messages = append(messages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": id,
-					"content":      bridgeToolResultContent(result.Result),
+					"content":      content,
 				})
+				attachments = append(attachments, extras...)
+			}
+			if len(attachments) > 0 {
+				// Chat tool messages carry text only. Image/file parts of a tool
+				// result (Codex view_image, Claude Code Read) travel in a
+				// follow-up user message; serializing them into the tool string
+				// used to hand the model base64 bytes instead of the picture.
+				messages = append(messages, map[string]any{"role": "user", "content": encodeChatBlocks(attachments)})
 			}
 			flushDeferred()
 			pendingOrder = nil

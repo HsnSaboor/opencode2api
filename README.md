@@ -474,6 +474,7 @@ npm run check:web
 | Requests return 502/504              | Inspect upstream attempts, credentials, egress lanes, and total/per-attempt timeouts.     |
 | `FreeTierError` from every lane      | The upstream may reject a whole IPv6 range; configure a passing range or `egress.ipv4_only`. |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
+| `view_image` / image `Read` returns base64 | Tool-result images travel in a follow-up user message; update past the tool-result split fix and declare image input for the model. |
 | Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |
 | Container ports are unreachable      | Check listener addresses, published ports, and the active volume configuration.           |
 | Monitoring disappeared after restart | Monitoring is stored only in memory; collect stdout logs externally.                      |
