@@ -243,7 +243,7 @@ Cooldowns grow exponentially up to eight times `performance.failure_cooldown_sec
 
 The free-tier gate can flag a whole egress prefix upstream — a used `/48` answering `FreeTierError` from every `/64` while sibling prefixes on the same tunnel answer normally. The gateway attributes each `FreeTier` verdict to its configured prefix: a single verdict parks that one lane, and repeated verdicts from the same prefix cool the prefix out of replenishment sampling for 15 minutes so it stops minting lanes the gate rejects. A probation probe re-tests cooled prefixes every five minutes once their window expires and restores them automatically when the upstream flag clears; while a prefix is cooling, traffic keeps flowing through the remaining configured prefixes.
 
-The gate can also reject IPv6 egress as a family: the same shaped request that answers `200` over IPv4 is answered `403 FreeTierError` over IPv6, including from never-used addresses in every configured prefix. When that happens, rotation cannot help because the block is not per-address; switch to `egress.ipv4_only` (with `egress.enable_ipv6: false`) to run the single unbound IPv4 lane. The prefix machinery stays dormant in that mode, so the configured prefixes can stay on file for when the upstream lifts the IPv6 block.
+The gate can also reject an IPv6 range wholesale, below the granularity of the per-prefix flag above: the same shaped request answers `200` from one range and `403 FreeTierError` from another, including from never-used addresses in both. In testing, tunnel-broker prefixes were rejected while several rented `/64`s passed, with identical request bytes, TLS, and headers. When every configured prefix is rejected but IPv4 answers `200`, rotation cannot help; switch to `egress.ipv4_only` (with `egress.enable_ipv6: false`) to run the single unbound IPv4 lane until a passing IPv6 range is available. The prefix machinery stays dormant in that mode, so the configured prefixes can stay on file for when the upstream lifts the IPv6 block.
 
 ## Configuration reference
 
@@ -472,6 +472,7 @@ npm run check:web
 | Health remains `starting`            | Inspect catalog refresh logs and outbound connectivity; add protocol overrides if needed. |
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
 | Requests return 502/504              | Inspect upstream attempts, credentials, egress lanes, and total/per-attempt timeouts.     |
+| `FreeTierError` from every lane      | The upstream may reject a whole IPv6 range; configure a passing range or `egress.ipv4_only`. |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
 | Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |
 | Container ports are unreachable      | Check listener addresses, published ports, and the active volume configuration.           |
