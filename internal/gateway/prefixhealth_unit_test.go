@@ -7,7 +7,7 @@ import (
 
 func prefixTestPool(t *testing.T, prefixes []string) *transportPool {
 	t.Helper()
-	pool, err := newTransportPool([]string{"2001:db8:ffff::1"}, testPerf(), 0, prefixes)
+	pool, err := newTransportPool([]string{"2001:db8:ffff::1"}, testPerf(), 0, prefixes, nil)
 	if err != nil {
 		t.Fatalf("newTransportPool: %v", err)
 	}

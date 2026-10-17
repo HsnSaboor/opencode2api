@@ -49,12 +49,13 @@ type transportPool struct {
 	// freitier parks cannot overshoot the pool cap. The hot selection
 	// paths never take it.
 	replenishMu sync.Mutex
-	// perf, headerTimeout, and prefixes carry the construction inputs a
-	// replacement lane needs: a fresh lane must dial with the same
-	// budgets as its siblings.
+	// perf, headerTimeout, prefixes, and weights carry the construction
+	// inputs a replacement lane needs: a fresh lane must dial with the same
+	// budgets as its siblings and land with the same prefix mix.
 	perf          config.PerformanceConfig
 	headerTimeout time.Duration
 	prefixes      []string
+	weights       map[string]int
 	// prefixMu guards prefixStrikes/prefixCooling, which track FreeTier
 	// verdicts per configured prefix: a prefix whose lanes keep answering
 	// FreeTier is blocked upstream as a unit and leaves replenishment
@@ -532,15 +533,20 @@ func (p *anonymousPool) snapshotNodes() []*anonymousNode {
 // connection budgets are divided across the pool so the configured totals
 // stay global instead of multiplying per lane; a zero MaxConnsPerHost keeps
 // its unlimited meaning.
-func newTransportPool(addresses []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration, prefixes []string) (*transportPool, error) {
+func newTransportPool(addresses []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration, prefixes []string, weights map[string]int) (*transportPool, error) {
 	if len(addresses) == 0 {
 		return nil, errors.New("at least one egress address is required")
+	}
+	weightCopy := make(map[string]int, len(weights))
+	for prefix, weight := range weights {
+		weightCopy[prefix] = weight
 	}
 	p := &transportPool{
 		items:         make([]*egressTransport, 0, len(addresses)),
 		perf:          cfg,
 		headerTimeout: responseHeaderTimeout,
 		prefixes:      append([]string(nil), prefixes...),
+		weights:       weightCopy,
 		maxLanes:      maxPoolLanes,
 	}
 	for _, address := range addresses {
@@ -596,6 +602,8 @@ func (p *transportPool) buildLane(index int, address string) (*egressTransport, 
 // selectable count stable instead of shrinking toward zero under a flag
 // storm. Growth is capped at maxLanes; at the cap the park stands alone.
 // Replacement lanes start healthy and warm on demand like any other lane.
+// Sampling honors the pool's prefix weights so replacements keep the
+// primary/reserve mix instead of drifting toward a uniform draw.
 func (p *transportPool) replenishLane(prefixes []string, parked *egressTransport) *egressTransport {
 	if p == nil || len(prefixes) == 0 {
 		return nil
@@ -616,7 +624,7 @@ func (p *transportPool) replenishLane(prefixes []string, parked *egressTransport
 			exclude[key] = struct{}{}
 		}
 	}
-	addrs, err := config.SampleFreshEgress(prefixes, 1, exclude)
+	addrs, err := config.SampleFreshEgress(prefixes, p.weights, 1, exclude)
 	if err != nil || len(addrs) == 0 {
 		return nil
 	}

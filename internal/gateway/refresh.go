@@ -207,7 +207,7 @@ func (g *Gateway) probationModel() string {
 }
 
 func (g *Gateway) probeCoolingPrefix(ctx context.Context, prefix, model string) {
-	addrs, err := config.SampleFreshEgress([]string{prefix}, 1, nil)
+	addrs, err := config.SampleFreshEgress([]string{prefix}, nil, 1, nil)
 	if err != nil || len(addrs) == 0 {
 		g.logger.Debug("egress prefix probation could not sample an address", "component", "egress", "event", "prefix_probation_sample_failed", "prefix", prefix, "error", err)
 		return

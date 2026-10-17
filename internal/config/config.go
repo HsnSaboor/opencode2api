@@ -341,7 +341,7 @@ func (cfg Config) EgressAddresses() []string {
 		}
 		prefixes = []string{defaultEgressPrefix}
 	}
-	addrs, err := resolveEgress(prefixes, size)
+	addrs, err := resolveEgress(prefixes, cfg.Egress.PrefixWeights, size)
 	if err != nil {
 		// resolveEgress only fails when the configured prefixes cannot yield
 		// the pool, which Validate/Normalize already rejects. Keep the
@@ -366,6 +366,13 @@ func Clone(cfg Config) Config {
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
 	cfg.Egress.Prefixes = append([]string(nil), cfg.Egress.Prefixes...)
+	if cfg.Egress.PrefixWeights != nil {
+		weights := make(map[string]int, len(cfg.Egress.PrefixWeights))
+		for prefix, weight := range cfg.Egress.PrefixWeights {
+			weights[prefix] = weight
+		}
+		cfg.Egress.PrefixWeights = weights
+	}
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))
 		for key, value := range cfg.Models.Protocols {

@@ -26,7 +26,7 @@ func TestDirect4LaneReachesLocalIPv4Server(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pool, err := newTransportPool([]string{"direct4"}, testPerf(), 0, nil)
+	pool, err := newTransportPool([]string{"direct4"}, testPerf(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newTransportPool: %v", err)
 	}

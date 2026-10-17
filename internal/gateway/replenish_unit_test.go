@@ -13,11 +13,11 @@ func testPerf() config.PerformanceConfig {
 
 func TestReplenishGrowsPoolOnFreshSubnet(t *testing.T) {
 	prefixes := []string{"2001:470:735f::/48"}
-	addrs, err := config.SampleFreshEgress(prefixes, 4, nil)
+	addrs, err := config.SampleFreshEgress(prefixes, nil, 4, nil)
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
-	pool, err := newTransportPool(addrs, testPerf(), 0, nil)
+	pool, err := newTransportPool(addrs, testPerf(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
@@ -47,11 +47,11 @@ func TestReplenishGrowsPoolOnFreshSubnet(t *testing.T) {
 
 func TestReplenishCapsAtMax(t *testing.T) {
 	prefixes := []string{"2001:470:735f::/48"}
-	addrs, err := config.SampleFreshEgress(prefixes, 2, nil)
+	addrs, err := config.SampleFreshEgress(prefixes, nil, 2, nil)
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
-	pool, err := newTransportPool(addrs, testPerf(), 0, nil)
+	pool, err := newTransportPool(addrs, testPerf(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
@@ -70,11 +70,11 @@ func TestReplenishCapsAtMax(t *testing.T) {
 
 func TestSelectableCountsSplit(t *testing.T) {
 	prefixes := []string{"2001:470:735f::/48"}
-	addrs, err := config.SampleFreshEgress(prefixes, 2, nil)
+	addrs, err := config.SampleFreshEgress(prefixes, nil, 2, nil)
 	if err != nil {
 		t.Fatalf("sample: %v", err)
 	}
-	pool, err := newTransportPool(addrs, testPerf(), 0, nil)
+	pool, err := newTransportPool(addrs, testPerf(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}

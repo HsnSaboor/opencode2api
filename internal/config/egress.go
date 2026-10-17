@@ -23,9 +23,17 @@ type EgressConfig struct {
 	// same request over IPv4, so a dual-stack direct lane would silently
 	// prefer the blocked family. Requires enable_ipv6 to be false.
 	IPv4Only bool `json:"ipv4_only,omitempty"`
-	// Prefixes are sampled uniformly. Relative order is preserved; duplicates
-	// are ignored.
+	// Prefixes are sampled uniformly unless PrefixWeights says otherwise.
+	// Relative order is preserved; duplicates are ignored.
 	Prefixes []string `json:"prefixes,omitempty"`
+	// PrefixWeights scales how often each prefix is drawn relative to its
+	// siblings (a missing entry means 1). Keys are IPv6 CIDRs matched
+	// canonically; entries naming no configured prefix are ignored, so a
+	// primary prefix can be pre-weighted before it joins Prefixes. The
+	// deployed composition weights the HE /48 at 24 against six weight-1
+	// rented /64s, drawing the /48 ~80% of the pool while the rented lanes
+	// stay as a reserve that carries traffic when the /48 is flagged.
+	PrefixWeights map[string]int `json:"prefix_weights,omitempty"`
 	// PoolSize is the number of source addresses held in rotation.
 	PoolSize int `json:"pool_size"`
 }
@@ -35,6 +43,9 @@ const (
 	defaultEgressPoolSize = 100
 	maxEgressPrefixes     = 8
 	maxEgressPoolSize     = 128
+	// maxEgressPrefixWeight caps a single prefix's draw weight; the bound
+	// only keeps typos (e.g. a percentage slipped in as 8000) loud.
+	maxEgressPrefixWeight = 256
 )
 
 func defaultEgress() EgressConfig {
@@ -62,6 +73,14 @@ func (e EgressConfig) validate() error {
 	}
 	if len(e.Prefixes) == 0 || len(e.Prefixes) > maxEgressPrefixes {
 		return fmt.Errorf("egress.prefixes must contain between 1 and %d IPv6 CIDRs", maxEgressPrefixes)
+	}
+	for raw, weight := range e.PrefixWeights {
+		if _, _, err := parseEgressPrefix(raw); err != nil {
+			return fmt.Errorf("egress.prefix_weights: %w", err)
+		}
+		if weight < 1 || weight > maxEgressPrefixWeight {
+			return fmt.Errorf("egress.prefix_weights[%q] must be between 1 and %d", raw, maxEgressPrefixWeight)
+		}
 	}
 	capacity := new(big.Int)
 	for _, raw := range e.Prefixes {
@@ -112,9 +131,13 @@ func parseEgressPrefix(raw string) (*net.IPNet, int, error) {
 // lanes never share upstream per-/64 rate-limit fate. Prefixes narrower than
 // a /64 (a /120 has only 256 addresses, a /128 exactly one) cap what the
 // pool can hold, so callers validate size against the configured prefixes
-// first.
-func resolveEgress(prefixes []string, size int) ([]string, error) {
+// first. weights scales each prefix's share of draws (nil means uniform).
+func resolveEgress(prefixes []string, weights map[string]int, size int) ([]string, error) {
 	networks, lengths, err := parseEgressPrefixes(prefixes)
+	if err != nil {
+		return nil, err
+	}
+	drawWeights, err := egressWeights(networks, weights)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +145,7 @@ func resolveEgress(prefixes []string, size int) ([]string, error) {
 	unique := make(map[string]struct{}, size)
 	used64 := make(map[string]struct{}, size)
 	for budget := size*32 + 64; len(out) < size && budget > 0; budget-- {
-		addr, err := sampleEgressIP(networks, lengths)
+		addr, err := sampleEgressIP(networks, lengths, drawWeights)
 		if err != nil {
 			return nil, err
 		}
@@ -148,20 +171,21 @@ func resolveEgress(prefixes []string, size int) ([]string, error) {
 	return out, nil
 }
 
-// sampleEgressIP draws one address uniformly from the given networks. A /48
-// keeps whole /64 subnets in rotation (the subnet index never draws zero);
-// every other prefix draws uniform host bits with the all-zero host
-// reserved, so the network address itself is never used as a source.
-func sampleEgressIP(networks []*net.IPNet, lengths []int) (string, error) {
-	return sampleEgressIPExcept(networks, lengths, nil)
+// sampleEgressIP draws one address from the given networks, picking a
+// prefix according to weights. A /48 keeps whole /64 subnets in rotation
+// (the subnet index never draws zero); every other prefix draws uniform
+// host bits with the all-zero host reserved, so the network address itself
+// is never used as a source.
+func sampleEgressIP(networks []*net.IPNet, lengths []int, weights []int) (string, error) {
+	return sampleEgressIPExcept(networks, lengths, weights, nil)
 }
 
 // sampleEgressIPExcept draws like sampleEgressIP but skips addresses whose
 // /64 (for /48 draws) is in exclude. It reports an error when every draw in
 // its budget collides, so callers can decide whether to retry or reuse.
-func sampleEgressIPExcept(networks []*net.IPNet, lengths []int, exclude map[string]struct{}) (string, error) {
+func sampleEgressIPExcept(networks []*net.IPNet, lengths []int, weights []int, exclude map[string]struct{}) (string, error) {
 	for tries := 0; tries < 64; tries++ {
-		addr, err := drawEgressIP(networks, lengths)
+		addr, err := drawEgressIP(networks, lengths, weights)
 		if err != nil {
 			return "", err
 		}
@@ -177,10 +201,34 @@ func sampleEgressIPExcept(networks []*net.IPNet, lengths []int, exclude map[stri
 	return "", errors.New("could not sample an unused /64 subnet; the configured prefixes are exhausted")
 }
 
-func drawEgressIP(networks []*net.IPNet, lengths []int) (string, error) {
-	pick, err := cryptoBelow(uint64(len(networks)))
-	if err != nil {
-		return "", err
+// drawEgressIP picks one network and draws one host address inside it. A
+// weights slice aligned with networks biases the pick (rolls are uniform
+// over the total weight); a nil or misaligned slice draws uniformly.
+func drawEgressIP(networks []*net.IPNet, lengths []int, weights []int) (string, error) {
+	pick := uint64(0)
+	if len(weights) == len(networks) && len(weights) > 0 {
+		total := 0
+		for _, weight := range weights {
+			total += weight
+		}
+		roll, err := cryptoBelow(uint64(total))
+		if err != nil {
+			return "", err
+		}
+		acc := uint64(0)
+		for i, weight := range weights {
+			acc += uint64(weight)
+			if roll < acc {
+				pick = uint64(i)
+				break
+			}
+		}
+	} else {
+		roll, err := cryptoBelow(uint64(len(networks)))
+		if err != nil {
+			return "", err
+		}
+		pick = roll
 	}
 	base := new(big.Int).SetBytes(networks[pick].IP.To16())
 	prefixLen := lengths[pick]
@@ -249,20 +297,57 @@ func maxDistinct48Subnets(networks []*net.IPNet, lengths []int) int {
 	return total
 }
 
+// egressWeights resolves per-prefix sampling weights aligned with the parsed
+// networks. Keys in weights are matched canonically, so any spelling of a
+// configured CIDR applies; a missing entry means weight 1. Entries naming
+// no parsed network are ignored, which lets a deployment pre-weight its
+// primary prefix before adding it to Prefixes.
+func egressWeights(networks []*net.IPNet, weights map[string]int) ([]int, error) {
+	resolved := make([]int, len(networks))
+	for i := range resolved {
+		resolved[i] = 1
+	}
+	if len(weights) == 0 {
+		return resolved, nil
+	}
+	canonical := make(map[string]int, len(weights))
+	for raw, weight := range weights {
+		network, _, err := parseEgressPrefix(raw)
+		if err != nil {
+			return nil, fmt.Errorf("egress.prefix_weights: %w", err)
+		}
+		if weight < 1 || weight > maxEgressPrefixWeight {
+			return nil, fmt.Errorf("egress.prefix_weights[%q] must be between 1 and %d", raw, maxEgressPrefixWeight)
+		}
+		canonical[network.String()] = weight
+	}
+	for i, network := range networks {
+		if weight, ok := canonical[network.String()]; ok {
+			resolved[i] = weight
+		}
+	}
+	return resolved, nil
+}
+
 // SampleFreshEgress draws count addresses from prefixes avoiding the given
 // /64 subnet keys (as returned by SubnetKeyFor). It is the replenishment
 // primitive: replacement lanes land on subnets no live lane already holds,
 // so a flagged /64 never re-enters the pool through regrowth. It returns an
-// error when the prefixes cannot yield count fresh subnets.
-func SampleFreshEgress(prefixes []string, count int, exclude map[string]struct{}) ([]string, error) {
+// error when the prefixes cannot yield count fresh subnets. weights scales
+// each prefix's share of draws, exactly as in resolveEgress.
+func SampleFreshEgress(prefixes []string, weights map[string]int, count int, exclude map[string]struct{}) ([]string, error) {
 	networks, lengths, err := parseEgressPrefixes(prefixes)
+	if err != nil {
+		return nil, err
+	}
+	drawWeights, err := egressWeights(networks, weights)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]string, 0, count)
 	seen := make(map[string]struct{}, count)
 	for len(out) < count {
-		addr, err := sampleEgressIPExcept(networks, lengths, exclude)
+		addr, err := sampleEgressIPExcept(networks, lengths, drawWeights, exclude)
 		if err != nil {
 			return nil, err
 		}

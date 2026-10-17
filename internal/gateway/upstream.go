@@ -255,9 +255,13 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 
 // freitierScanLimit bounds how many lanes one request may park on a FreeTier
 // verdict before the scan concludes the verdict is request-scoped. The gate
-// returns the same 403 body for the same request on every exit, so scanning
-// further only parks healthy lanes for a decision no lane can change.
-const freitierScanLimit = 5
+// usually returns the same 403 body for the same request on every exit of a
+// flagged prefix, so a tight budget would surface the 403 to the client even
+// when the pool holds lanes outside that prefix. Ten attempts reach a
+// reserve lane in a weighted primary/reserve pool (~80/20) ~89% of the time
+// (1-0.8^10); during a space-wide flare every attempt parks a genuinely
+// flagged lane, so the extra scans are not wasted work.
+const freitierScanLimit = 10
 
 // doAnonymousUpstream tries every currently available egress lane at most
 // once. Transport failures and retryable responses (5xx, 401/403/429)
