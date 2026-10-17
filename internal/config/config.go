@@ -324,6 +324,12 @@ func (cfg Config) ForcedEffort(model string) string {
 // and a lazy Once field would either share the sample across clones or
 // need explicit invalidation).
 func (cfg Config) EgressAddresses() []string {
+	if cfg.Egress.IPv4Only {
+		// The unbound direct lane, dialing tcp4: the upstream free-tier
+		// gate rejects IPv6 traffic while accepting the same request over
+		// IPv4, so a family-racing direct lane is not enough.
+		return []string{"direct4"}
+	}
 	size := cfg.Egress.PoolSize
 	if size < 1 {
 		size = defaultEgressPoolSize

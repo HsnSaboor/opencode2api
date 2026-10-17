@@ -12,7 +12,7 @@ The executable includes the WebUI. Running the service requires no Node.js runti
 - Text, images, reasoning, function tools, tool calls, and tool results; file content where the target protocol can represent it.
 - Separate Zen and Go key pools, configurable tier preference, retries, and session affinity.
 - Optional anonymous Zen access with the OpenCode `public` credential.
-- IPv6 egress rotation: each lane binds its own source address sampled from configured /48 (or wider) prefixes.
+- IPv6 egress rotation: each lane binds its own source address sampled from configured /48 (or wider) prefixes, with a single-lane IPv4-only fallback for upstreams that reject IPv6.
 - Dynamic model discovery, native protocol metadata, and disk caches.
 - A separate management port with configuration editing, a Playground, diagnostics, token statistics, and live logs.
 - Configuration hot reload with validation before switching new requests to a replacement gateway.
@@ -243,6 +243,8 @@ Cooldowns grow exponentially up to eight times `performance.failure_cooldown_sec
 
 The free-tier gate can flag a whole egress prefix upstream — a used `/48` answering `FreeTierError` from every `/64` while sibling prefixes on the same tunnel answer normally. The gateway attributes each `FreeTier` verdict to its configured prefix: a single verdict parks that one lane, and repeated verdicts from the same prefix cool the prefix out of replenishment sampling for 15 minutes so it stops minting lanes the gate rejects. A probation probe re-tests cooled prefixes every five minutes once their window expires and restores them automatically when the upstream flag clears; while a prefix is cooling, traffic keeps flowing through the remaining configured prefixes.
 
+The gate can also reject IPv6 egress as a family: the same shaped request that answers `200` over IPv4 is answered `403 FreeTierError` over IPv6, including from never-used addresses in every configured prefix. When that happens, rotation cannot help because the block is not per-address; switch to `egress.ipv4_only` (with `egress.enable_ipv6: false`) to run the single unbound IPv4 lane. The prefix machinery stays dormant in that mode, so the configured prefixes can stay on file for when the upstream lifts the IPv6 block.
+
 ## Configuration reference
 
 See [config.example.json](config.example.json) for a complete starting configuration. JSON supports `//` and `/* ... */` comments; unknown fields and invalid values are rejected.
@@ -259,6 +261,7 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `upstream.zen`              | `https://opencode.ai/inference`.                                            |
 | `upstream.go`               | `https://opencode.ai/inference/go`.                                         |
 | `egress.enable_ipv6`        | `true`.                                                                     |
+| `egress.ipv4_only`          | `false`; forces the unbound lane to IPv4 (`tcp4`). Requires `enable_ipv6: false`. |
 | `egress.prefixes`           | `["2001:470:7331::/48"]`; up to 8 IPv6 CIDRs.                               |
 | `egress.pool_size`          | `16`; range 1–128 source addresses in rotation.                             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |
@@ -300,6 +303,8 @@ the object in `PUT /api/config`; clients that omit the field keep the existing
 value, while sending an empty object clears it.
 
 Each egress lane binds one sampled IPv6 source address (or `direct` when IPv6 rotation is disabled). Addresses are sampled once per process start from the configured prefixes: a `/48` rotates whole `/64` subnets with a random interface ID, wider prefixes draw uniform host bits with the network address reserved. Prefixes that cannot yield `pool_size` unique addresses are rejected at startup.
+
+With `egress.ipv4_only: true` (and `enable_ipv6: false`) the pool holds one `direct4` lane instead: it still lets the kernel pick the source address, but every dial forces network `tcp4`. That is deliberate — a dual-stack lane would connect over IPv6 first, and a connection that succeeds at the TCP layer never falls back to IPv4, so requests would silently keep landing on the blocked family. Combining `ipv4_only` with `enable_ipv6: true` is rejected at load time.
 
 ### Timeouts and connection pools
 

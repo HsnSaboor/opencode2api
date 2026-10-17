@@ -20,9 +20,10 @@ import (
 )
 
 // egressTransport is one upstream lane bound to a single source address. The
-// address is either "direct" (no explicit bind) or an IPv6 literal sampled
-// from the configured egress prefixes; every lane dials straight to the
-// upstream, so rotating lanes rotates the visible egress.
+// address is either "direct" (no explicit bind, kernel-chosen family),
+// "direct4" (no explicit bind, forced IPv4) or an IPv6 literal sampled from
+// the configured egress prefixes; every lane dials straight to the upstream,
+// so rotating lanes rotates the visible egress.
 type egressTransport struct {
 	index    int
 	address  string
@@ -574,7 +575,16 @@ func (p *transportPool) buildLane(index int, address string) (*egressTransport, 
 	transport.IdleConnTimeout = time.Duration(p.perf.IdleConnTimeoutSeconds) * time.Second
 	transport.ResponseHeaderTimeout = p.headerTimeout
 	transport.ForceAttemptHTTP2 = true
-	transport.DialContext = dialer.DialContext
+	if address == "direct4" {
+		// Force the IPv4 family: the kernel would otherwise prefer the (for
+		// the free tier, blocked) IPv6 route, and a connect that succeeds at
+		// the TCP layer never falls back to IPv4.
+		transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp4", addr)
+		}
+	} else {
+		transport.DialContext = dialer.DialContext
+	}
 	egress := &egressTransport{index: index, address: address, client: &http.Client{Transport: transport}}
 	egress.healthy.Store(true)
 	return egress, nil
@@ -632,16 +642,17 @@ func (p *transportPool) snapshot() []*egressTransport {
 	return append([]*egressTransport(nil), p.items...)
 }
 
-// egressDialer binds a lane to its source address. "direct" leaves the local
-// address unset so the kernel picks the route default; any other value must
-// be an IP literal assigned (or routed) on this host, otherwise the first
-// dial fails and health tracking takes the lane out of rotation.
+// egressDialer binds a lane to its source address. "direct" and "direct4"
+// leave the local address unset so the kernel picks the route default (the
+// caller forces the family for "direct4"); any other value must be an IP
+// literal assigned (or routed) on this host, otherwise the first dial fails
+// and health tracking takes the lane out of rotation.
 func egressDialer(address string, cfg config.PerformanceConfig) (*net.Dialer, error) {
 	dialer := &net.Dialer{
 		Timeout:   time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	if address == "direct" {
+	if address == "direct" || address == "direct4" {
 		return dialer, nil
 	}
 	ip := net.ParseIP(strings.TrimSpace(address))

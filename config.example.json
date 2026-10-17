@@ -4,8 +4,14 @@
   "zen_keys": ["sk-your-zen-key"],
   "go_keys": [],
   "anonymous": false,
+  // enable_ipv6 samples pool_size source addresses from prefixes and rotates
+  // the visible egress across them. ipv4_only instead runs one unbound lane
+  // forced to IPv4 (tcp4): use it when the upstream answers 403 FreeTierError
+  // to IPv6 traffic while accepting the same request over IPv4. It requires
+  // enable_ipv6=false and ignores prefixes until rotation is re-enabled.
   "egress": {
     "enable_ipv6": true,
+    "ipv4_only": false,
     "prefixes": ["2001:470:7331::/48", "2001:470:1f0b:cf4::/64"],
     "pool_size": 100
   },

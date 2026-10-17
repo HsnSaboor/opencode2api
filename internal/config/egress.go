@@ -17,6 +17,12 @@ type EgressConfig struct {
 	// EnableIPv6 samples PoolSize source addresses from Prefixes. When false
 	// the gateway uses a single unbound direct connection.
 	EnableIPv6 bool `json:"enable_ipv6"`
+	// IPv4Only forces the direct lane to dial IPv4 (network "tcp4") instead
+	// of letting the kernel race both families. The upstream free-tier gate
+	// answers 403 for requests arriving over IPv6 while still accepting the
+	// same request over IPv4, so a dual-stack direct lane would silently
+	// prefer the blocked family. Requires enable_ipv6 to be false.
+	IPv4Only bool `json:"ipv4_only,omitempty"`
 	// Prefixes are sampled uniformly. Relative order is preserved; duplicates
 	// are ignored.
 	Prefixes []string `json:"prefixes,omitempty"`
@@ -47,6 +53,9 @@ func (e *EgressConfig) withDefaults() {
 func (e EgressConfig) validate() error {
 	if e.PoolSize < 1 || e.PoolSize > maxEgressPoolSize {
 		return fmt.Errorf("egress.pool_size must be between 1 and %d", maxEgressPoolSize)
+	}
+	if e.IPv4Only && e.EnableIPv6 {
+		return errors.New("egress.ipv4_only requires egress.enable_ipv6 to be false")
 	}
 	if !e.EnableIPv6 {
 		return nil
