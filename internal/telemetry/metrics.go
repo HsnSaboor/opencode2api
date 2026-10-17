@@ -80,7 +80,7 @@ type UpstreamAttempt struct {
 	KeyID      string    `json:"key_id"`
 	Channel    string    `json:"channel"`
 	Anonymous  bool      `json:"anonymous"`
-	Proxy      string    `json:"proxy_node"`
+	Egress     string    `json:"egress_node"`
 	Status     int       `json:"status,omitempty"`
 	DurationMS int64     `json:"duration_ms"`
 	Success    bool      `json:"success"`
@@ -98,7 +98,7 @@ type UpstreamRequest struct {
 	KeyID      string    `json:"key_id,omitempty"`
 	Channel    string    `json:"channel"`
 	Anonymous  bool      `json:"anonymous"`
-	Proxy      string    `json:"proxy_node,omitempty"`
+	Egress     string    `json:"egress_node,omitempty"`
 	Attempts   int       `json:"attempts"`
 	Status     int       `json:"status"`
 	DurationMS int64     `json:"duration_ms"`
@@ -311,7 +311,7 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		if meta.Request != "" && meta.Model != "" {
 			request := UpstreamRequest{
 				Time: time.Now().UTC(), RequestID: meta.Request, Model: meta.Model, Tier: meta.Tier,
-				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy,
+				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Egress: meta.Egress,
 				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
 				Success: success,
 			}

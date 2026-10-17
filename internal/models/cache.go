@@ -56,7 +56,7 @@ func (c *Catalog) LoadCache(path string) error {
 }
 
 // SaveCache snapshots only public model capability data. Credentials and
-// proxy configuration are not part of modelCatalog and can never enter this
+// egress configuration are not part of modelCatalog and can never enter this
 // file.
 func (c *Catalog) SaveCache() error {
 	c.mu.RLock()

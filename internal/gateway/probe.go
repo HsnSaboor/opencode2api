@@ -61,7 +61,7 @@ func probePayload(model string, protocol wire.Protocol, effort string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	return prepareAnonymousBody(b, protocol), nil
+	return shapeAnonymousBody(b, protocol, true), nil
 }
 
 func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult {
@@ -82,13 +82,13 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if g.cfg.Anonymous {
 		cursor := g.anonymous.CursorFor(ids.Session)
 		if node := cursor.Next(); node != nil {
-			lanes = append(lanes, lane{anonymousZenKey, "anonymous", node.proxy.client})
+			lanes = append(lanes, lane{anonymousZenKey, "anonymous", node.egress.client})
 		}
 	}
 	cursor := g.zenNodes.CursorFor(ids.Session)
 	if node := cursor.Next(); node != nil {
-		if proxy := g.zenNodes.Proxy(node); proxy != nil {
-			lanes = append(lanes, lane{node.key, "zen", proxy.client})
+		if egress := g.zenNodes.Egress(node); egress != nil {
+			lanes = append(lanes, lane{node.key, "zen", egress.client})
 		}
 	}
 	result := probeResult{reason: "no_probe_channel"}
@@ -104,10 +104,11 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		result.channel = lane.name
 		if result.success {
 			if g.cfg.ForcedEffort(model) == "auto" && protocol != wire.SystemOne {
-				if !g.catalog.MetadataForTier(model, config.TierZen).Reasoning {
+				md := g.catalog.MetadataForTier(model, config.TierZen)
+				if !md.Reasoning {
 					result.effort = models.EffortProbe{Effort: "none", Protocol: string(protocol)}
 				} else {
-					for _, effort := range []string{"max", "xhigh", "high", "medium", "low", "minimal", "none"} {
+					for _, effort := range probeEffortLadder(md.ReasoningEfforts) {
 						if effort == "none" {
 							// Baseline already succeeded without an effort field.
 							result.effort = models.EffortProbe{Effort: "none", Protocol: string(protocol)}

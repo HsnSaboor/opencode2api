@@ -20,7 +20,7 @@ type RequestMeta struct {
 	KeyID      string
 	Channel    string
 	Anonymous  bool
-	Proxy      string
+	Egress     string
 	Attempts   int
 	Legs       []string
 	Stop       string

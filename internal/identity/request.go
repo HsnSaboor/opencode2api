@@ -10,6 +10,8 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"sync"
+	"time"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -91,19 +93,72 @@ var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{1
 
 const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
+// sessionEpochMs is the fixed countdown epoch of OpenCode's session ID
+// encoder (verified against 400+ real client sessions):
+//
+//	value = (sessionEpochMs - createdMs) * 4096 - 2  (mod 2^48)
+//
+// The 12 hex digits are a 1/4096-ms countdown; the Zen free-tier gate decodes
+// them and rejects sessions that do not map to a plausible creation time, so
+// hashed or random hex parts fail with 403 FreeTierError.
+const (
+	sessionEpochMs    = int64(1855425872000)
+	sessionBackdateMs = int64(30_000)
+	sessionMemoTTL    = 7 * 24 * time.Hour
+)
+
+type sessionMemoEntry struct {
+	id       string
+	mintedAt time.Time
+}
+
+var (
+	sessionMemoMu sync.RWMutex
+	sessionMemo   = make(map[[32]byte]sessionMemoEntry)
+)
+
 // CanonicalSessionID returns signal unchanged when it already carries an
 // official OpenCode session (preserving upstream prompt-cache affinity).
 // Any other downstream identity (UUIDs, foreign client sessions, legacy
-// gateway sessions, conversation seeds) is deterministically hashed into the
-// canonical shape so the same conversation keeps a stable session.
+// gateway sessions, conversation seeds) is memoized into a freshly encoded
+// canonical session so the same conversation keeps a stable session while
+// its timestamp stays inside the free-tier acceptance window.
 func CanonicalSessionID(signal string) string {
 	if canonicalSessionPattern.MatchString(signal) {
 		return signal
 	}
-	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	timePart := hex.EncodeToString(sum[:6])
-	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
-	return "ses_" + timePart + randomPart
+	key := sha256.Sum256([]byte("ses\x00" + signal))
+	now := time.Now()
+
+	sessionMemoMu.RLock()
+	entry, ok := sessionMemo[key]
+	sessionMemoMu.RUnlock()
+	if ok && now.Sub(entry.mintedAt) < sessionMemoTTL {
+		return entry.id
+	}
+
+	minted := mintSessionID(now)
+	sessionMemoMu.Lock()
+	if len(sessionMemo) >= 1<<16 {
+		sessionMemo = make(map[[32]byte]sessionMemoEntry)
+	}
+	sessionMemo[key] = sessionMemoEntry{id: minted, mintedAt: now}
+	sessionMemoMu.Unlock()
+	return minted
+}
+
+// mintSessionID encodes now (backdated slightly to absorb clock skew) with
+// OpenCode's session countdown and appends a random Base62 tail.
+func mintSessionID(now time.Time) string {
+	createdMs := now.UnixMilli() - sessionBackdateMs
+	value := (sessionEpochMs-createdMs)*4096 - 2
+	value &= (1 << 48) - 1
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	randomPart := base62Fixed(new(big.Int).SetBytes(buf), 14)
+	return fmt.Sprintf("ses_%012x%s", value, randomPart)
 }
 
 func base62Fixed(n *big.Int, width int) string {

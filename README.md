@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Responses, and Anthropic Messages endpoints, translates between their native protocols, and manages upstream keys and proxies.
+A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Responses, and Anthropic Messages endpoints, translates between their native protocols, and manages upstream keys with IPv6 egress rotation.
 
 The executable includes the WebUI. Running the service requires no Node.js runtime or database.
 
@@ -12,13 +12,13 @@ The executable includes the WebUI. Running the service requires no Node.js runti
 - Text, images, reasoning, function tools, tool calls, and tool results; file content where the target protocol can represent it.
 - Separate Zen and Go key pools, configurable tier preference, retries, and session affinity.
 - Optional anonymous Zen access with the OpenCode `public` credential.
-- Direct, HTTP, HTTPS, SOCKS5, and SOCKS5H connections, including a proxy file.
+- IPv6 egress rotation: each lane binds its own source address sampled from configured /48 (or wider) prefixes.
 - Dynamic model discovery, native protocol metadata, and disk caches.
 - A separate management port with configuration editing, a Playground, diagnostics, token statistics, and live logs.
 - Configuration hot reload with validation before switching new requests to a replacement gateway.
 - Go subscription quota dashboard with remaining percentages, reset times, and available models.
 - Local API key creation, naming, enabling, disabling, and deletion with immediate updates.
-- Sticky `sota` / `sweet` model groups with ordering, failure fallback, streaming protection, and persisted state.
+- Sticky `sota` / `sweet` model groups whose membership is derived from the live catalog's published prices, with ordering, failure fallback, streaming protection, and persisted state.
 
 See the [management console guide (Chinese)](docs/management.zh-CN.md) for the new pages and configuration.
 
@@ -101,8 +101,6 @@ docker run -d --name opencode2api \
   -v opencode2api-state:/var/lib/opencode2api \
   opencode2api:local
 ```
-
-A `proxyfile` used in Docker must also be available inside the container at the configured path.
 
 ## API usage
 
@@ -209,19 +207,19 @@ Eligibility is a routing decision; the upstream can still reject or rate-limit t
 
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once.
+1. For an eligible model, try each available anonymous egress lane once.
 2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
 Anonymous attempts are not cut short by `retry.max_attempts`, but all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
 
-Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/proxy retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
+Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/egress retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
 
 When only anonymous access is configured, `/v1/models` exposes only models eligible for that lane.
 
 ### Free model availability
 
-The gateway probes models whose IDs contain `free` (case-insensitive), or whose metadata reports zero input/output cost without deprecation, with a short request using its native protocol. It tries the enabled anonymous lane first and then one configured Zen Key. A valid completed response on either lane keeps the model enabled; the model is disabled in discovery and routing only when every attempted lane explicitly reports that the model does not exist or has been retired. Authentication errors, rate limits, timeouts, transport errors, 5xx responses, and malformed replies are inconclusive: they do not create a new disable, and are checked again in one hour. Probe traffic does not alter production key/proxy cooldowns or request statistics. It still reaches the upstream and may consume its free allowance.
+The gateway probes models whose IDs contain `free` (case-insensitive), or whose metadata reports zero input/output cost without deprecation, with a short request using its native protocol. It tries the enabled anonymous lane first and then one configured Zen Key. A valid completed response on either lane keeps the model enabled; the model is disabled in discovery and routing only when every attempted lane explicitly reports that the model does not exist or has been retired. Authentication errors, rate limits, timeouts, transport errors, 5xx responses, and malformed replies are inconclusive: they do not create a new disable, and are checked again in one hour. Probe traffic does not alter production key/egress cooldowns or request statistics. It still reaches the upstream and may consume its free allowance.
 
 System One models use a native `noul` question asking whether 1 + 1 equals 2; they are never sent chat/tool payloads. Model discovery includes `native_protocol` and `supported_endpoints`; rotation aliases are listed only when Go keys and eligible models exist. Legacy v1.3.6 disables are cleared on load and scheduled for immediate recheck because those probes used invalid session IDs.
 
@@ -231,11 +229,11 @@ State survives restarts in `config.json.<upstream-fingerprint>.availability.json
 
 Administration endpoints (login required; restore also requires CSRF): `GET /api/models/availability` and `POST /api/models/restore` with `{"model":"MODEL_ID"}`.
 
-### Sessions and proxies
+### Sessions and egress
 
-Keys are initially spread across proxies. Real traffic can trigger proxy checks, key rebinding, and cooldowns. Unhealthy proxies are rechecked every 15 minutes against Cloudflare trace.
+Keys are initially spread across egress lanes. Real traffic can trigger lane checks, key rebinding, and cooldowns. Unhealthy lanes are rechecked every 15 minutes against Cloudflare trace.
 
-A stable session hash selects the preferred key or anonymous proxy. Send an explicit `x-session-id` to separate independent conversations. The gateway also accepts `x-opencode-session`, `x-session-affinity`, `conversation-id`, `conversation_id`, and `metadata.session_id`.
+A stable session hash selects the preferred key or anonymous lane. Send an explicit `x-session-id` to separate independent conversations. The gateway also accepts `x-opencode-session`, `x-session-affinity`, `conversation-id`, `conversation_id`, and `metadata.session_id`.
 
 Without an explicit ID, the first user message is used as a seed. Conversations beginning with the same content can therefore share affinity. Changing pool membership can change the selected node.
 
@@ -256,8 +254,9 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                |
 | `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
-| `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
-| `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
+| `egress.enable_ipv6`        | `true`.                                                                     |
+| `egress.prefixes`           | `["2001:470:735f::/48"]`; up to 8 IPv6 CIDRs.                               |
+| `egress.pool_size`          | `16`; range 1–128 source addresses in rotation.                             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |
 | `models.protocols`          | `{}`; per-model native protocol overrides.                                  |
 | `reasoning.effort`          | Empty (off); `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`. |
@@ -296,18 +295,7 @@ The management API returns them as `reasoning` from `GET /api/config` and accept
 the object in `PUT /api/config`; clients that omit the field keep the existing
 value, while sending an empty object clears it.
 
-Proxy entries accept `direct`, `http://`, `https://`, `socks5://`, and `socks5h://`, including URL credentials. The inline list is merged with `proxyfile` and deduplicated in order.
-
-A proxy file contains one entry per line and supports blank lines and comments:
-
-```text
-# Primary proxy
-http://user:password@127.0.0.1:7890
-socks5://127.0.0.1:1080  # Backup proxy
-direct
-```
-
-Comment markers are `#`, `;`, and `//` at the start of a line or after whitespace.
+Each egress lane binds one sampled IPv6 source address (or `direct` when IPv6 rotation is disabled). Addresses are sampled once per process start from the configured prefixes: a `/48` rotates whole `/64` subnets with a random interface ID, wider prefixes draw uniform host bits with the network address reserved. Prefixes that cannot yield `pool_size` unique addresses are rejected at startup.
 
 ### Timeouts and connection pools
 
@@ -318,12 +306,12 @@ Comment markers are `#`, `;`, and `//` at the start of a line or after whitespac
 | `performance.attempt_timeout_seconds`   | `0`     | Header wait per attempt; 0 uses the request timeout.   |
 | `performance.connect_timeout_seconds`   | `5`     | Connection establishment timeout.                      |
 | `performance.failure_cooldown_seconds`  | `15`    | Base failure cooldown.                                 |
-| `performance.max_idle_conns`            | `2048`  | Idle connection limit per proxy transport.             |
+| `performance.max_idle_conns`            | `2048`  | Idle connection limit per egress transport.            |
 | `performance.max_idle_conns_per_host`   | `256`   | Idle connection limit per host and transport.          |
 | `performance.max_conns_per_host`        | `0`     | Connection limit per host; 0 is unlimited.             |
 | `performance.idle_conn_timeout_seconds` | `120`   | Idle connection lifetime.                              |
 
-The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or proxies.
+The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or lanes.
 
 ### Logging and management
 
@@ -339,7 +327,7 @@ The per-attempt header timeout is capped by the request timeout. Set it below th
 | `webui.password_hash`         | Generated Argon2id hash; replaces the plaintext password.     |
 | `webui.session_ttl_minutes`   | `720`; range 5–10,080.                                        |
 
-On startup, a bootstrap password is hashed and removed from the configuration. The backup containing that bootstrap plaintext is deleted. Keep configuration files and backups private: upstream keys and proxy credentials remain necessary configuration secrets.
+On startup, a bootstrap password is hashed and removed from the configuration. The backup containing that bootstrap plaintext is deleted. Keep configuration files and backups private: upstream keys remain necessary configuration secrets.
 
 Body dumps are opt-in and capped at 64 KiB per prepared body. Configured secrets are redacted, but conversation content may still be sensitive.
 
@@ -375,7 +363,7 @@ Playground requests require a session and `X-CSRF-Token` and are limited to 12 p
 
 The server forces `stream: false`. Use `{"mode":"selected","tier":"zen","id":"KEY_FINGERPRINT"}` to test a specific key from `/api/debug/models`. A selected request makes at most one upstream attempt, without anonymous access, key rotation, tier fallback, or reasoning replay.
 
-**Both automatic and selected diagnostics preserve production key cooldowns, failure counts, proxy health, and bindings.** They still make real upstream requests, can consume provider quota, and appear in monitoring.
+**Both automatic and selected diagnostics preserve production key cooldowns, failure counts, lane health, and bindings.** They still make real upstream requests, can consume provider quota, and appear in monitoring.
 
 After execution, the management endpoint returns HTTP 200 with the actual result in `ok`, `http_status`, `request_id`, `route`, and `response`. Selected-key results also include `selected_key` and `key_test`: `usable`, `rejected`, `rate_limited`, `transport_error`, `upstream_error`, `request_error`, or `unavailable`. Invalid management input, authentication, CSRF, and throttling retain their own HTTP error statuses.
 
@@ -383,7 +371,7 @@ After execution, the management endpoint returns HTTP 200 with the actual result
 
 The server validates a candidate configuration and builds its replacement gateway before saving and switching. Failed validation or persistence leaves the active gateway in place. Requests already running continue on their original gateway.
 
-Keys, proxies, upstream URLs, retry settings, model settings, logging, and routing preferences apply to new requests immediately. Changes to `listen`, `webui.listen`, or `webui.enabled` require a process restart. Saved JSON is normalized; comments are not retained.
+Keys, egress lanes, upstream URLs, retry settings, model settings, logging, and routing preferences apply to new requests immediately. Changes to `listen`, `webui.listen`, or `webui.enabled` require a process restart. Saved JSON is normalized; comments are not retained.
 
 ## Monitoring and persistence
 
@@ -407,9 +395,9 @@ Cache filenames are based on the actual configuration path. Lifetime counters me
 
 ### Health checks
 
-`/healthz` does not increment monitoring counters or trigger network requests. It reports resource counts without keys or proxy addresses.
+`/healthz` does not increment monitoring counters or trigger network requests. It reports resource counts without keys or addresses.
 
-- HTTP 503: initial catalog pending, no models routable with the current configuration, or no healthy proxies.
+- HTTP 503: initial catalog pending, no models routable with the current configuration, or no healthy egress lanes.
 - HTTP 200: ready, including when a usable catalog cache is stale. In that case the model status is `stale` and overall status is `degraded`.
 
 The staleness threshold is twice `models.refresh_seconds`, with a minimum of 60 seconds. Readiness is a discovery and resource check; it does not verify that an upstream key will accept the next inference.
@@ -474,7 +462,7 @@ npm run check:web
 | API returns 401                      | Use a configured local `server_keys` value.                                               |
 | Health remains `starting`            | Inspect catalog refresh logs and outbound connectivity; add protocol overrides if needed. |
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
-| Requests return 502/504              | Inspect upstream attempts, credentials, proxies, and total/per-attempt timeouts.          |
+| Requests return 502/504              | Inspect upstream attempts, credentials, egress lanes, and total/per-attempt timeouts.     |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
 | Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |
 | Container ports are unreachable      | Check listener addresses, published ports, and the active volume configuration.           |

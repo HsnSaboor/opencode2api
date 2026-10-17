@@ -46,9 +46,33 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	if err != nil {
 		return nil, err
 	}
-	transports, err := newTransportPool(cfg.RuntimeProxies(), cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
+	addresses := cfg.EgressAddresses()
+	transports, err := newTransportPool(addresses, cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
 	if err != nil {
 		return nil, err
+	}
+	if logger != nil {
+		// The sampled pool is fresh per process start, so one startup line
+		// names what this instance actually rotates. Full literals stay at
+		// debug: a pool of 128 addresses would spam the default log level.
+		logger.Info("egress pool ready", "component", "egress", "event", "egress_pool_ready", "prefixes", cfg.Egress.Prefixes, "pool_size", len(addresses))
+		logger.Debug("egress pool addresses", "component", "egress", "event", "egress_pool_addresses", "addresses", addresses)
+	}
+	// Pre-dial every lane against the same neutral target the scheduled
+	// health checks use, so the first client request does not pay for TLS
+	// and route setup. Warm failures never fail startup: lanes stay
+	// healthy and recover on demand.
+	warmCtx, warmCancel := context.WithTimeout(context.Background(), egressWarmTimeout)
+	results := transports.warmLanes(warmCtx, egressHealthCheckURL, egressHealthCheckTimeout)
+	warmCancel()
+	warmed := 0
+	for _, result := range results {
+		if result.err == nil {
+			warmed++
+		}
+	}
+	if logger != nil {
+		logger.Info("egress pool warmed", "component", "egress", "event", "egress_pool_warmed", "warmed", warmed, "total", len(results))
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
 	zenNodes, err := newNodePool(cfg.ZenKeys, transports, cooldown)
@@ -68,7 +92,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
-		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
+		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown, cfg.Egress.Prefixes),
 		catalog:    catalog,
 		monitor:    monitor,
 	}, nil
@@ -248,11 +272,10 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
-			// Key-tier shaped requests were force-streamed like the
-			// anonymous lane; collapse the same way.
-			// The anonymous lane is served streaming (see prepareAnonymousBody);
-			// collapse the events back into the single document this
-			// non-streaming client asked for.
+			// The anonymous lane and key-tier shaped requests were
+			// force-streamed (see shapeAnonymousBody); collapse the events
+			// back into the single document this non-streaming client
+			// asked for.
 			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
 			if err != nil {
 				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
@@ -410,11 +433,14 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 	bodies := make(map[config.Tier][]byte, len(tiers))
 	for _, tier := range tiers {
 		protocol := route.ProtocolFor(tier)
-		baseURL := g.cfg.Upstream.Zen
-		if tier == config.TierGo {
-			baseURL = g.cfg.Upstream.Go
+		tierInput := input
+		if from == wire.Responses {
+			if tools, ok := sanitizeToolsForUpstream(input, protocol); ok {
+				tierInput = withReplacedTools(input, tools)
+			}
 		}
-		upstreamPayload, err := wire.PrepareRequest(from, protocol, input, baseURL)
+		target := wire.Target{InterleavedField: g.catalog.MetadataForTier(route.ID, tier).InterleavedField}
+		upstreamPayload, err := wire.PrepareRequest(from, protocol, tierInput, target)
 		if err != nil {
 			if tier != route.Tier {
 				// A fallback tier may use a stricter wire format than the

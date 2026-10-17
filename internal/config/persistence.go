@@ -13,7 +13,6 @@ import (
 // config.json.bak. The temporary file is created beside the target so the
 // final rename stays on the same filesystem.
 func SaveAtomic(path string, cfg Config) error {
-	cfg.PasswordForSave()
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)

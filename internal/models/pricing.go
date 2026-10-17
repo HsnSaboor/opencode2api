@@ -88,7 +88,7 @@ func NewPricingStore(configPath string, logger *slog.Logger) *PricingStore {
 }
 
 // SetClientProvider supplies candidate HTTP clients for refresh attempts, most
-// preferred first. It lets the periodic models.dev refresh ride the proxy
+// preferred first. It lets the periodic models.dev refresh ride the egress
 // transports exposed by whichever gateway runtime is currently active.
 func (store *PricingStore) SetClientProvider(provider func() []*http.Client) {
 	store.mu.Lock()

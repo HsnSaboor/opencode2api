@@ -142,7 +142,10 @@ function fillConfig(value) {
   $("#c-session").value = value.webui.session_ttl_minutes;
   $("#c-web-enabled").checked = value.webui.enabled;
   $("#c-anonymous").checked = !!value.anonymous;
-  $("#c-proxyfile").value = value.proxyfile;
+  const egress = value.egress || {};
+  $("#c-egress-v6").checked = !!egress.enable_ipv6;
+  $("#c-egress-prefixes").value = (egress.prefixes || []).join("\n");
+  $("#c-egress-pool").value = egress.pool_size;
   $("#c-up-zen").value = value.upstream.zen;
   $("#c-up-go").value = value.upstream.go;
   $("#c-attempts").value = value.retry.max_attempts;
@@ -163,7 +166,7 @@ function fillConfig(value) {
   $("#c-level").value = value.logging.level;
   $("#c-ring").value = value.logging.ring_size;
   $("#c-dump-bodies").checked = !!value.logging.dump_request_bodies;
-  ["server_keys", "zen_keys", "go_keys", "proxies"].forEach(renderChips);
+  ["server_keys", "zen_keys", "go_keys"].forEach(renderChips);
   const notice = $("#restart-notice");
   if (value.restart_required_fields?.length) {
     notice.textContent = `已保存但尚未生效：${value.restart_required_fields.join(", ")}。当前 API ${value.effective.listen}、WebUI ${value.effective.webui_listen}。请重启进程。`;
@@ -207,8 +210,14 @@ $("#config-form").addEventListener("submit", async (event) => {
       zen_keys: secretInputs("zen_keys"),
       go_keys: secretInputs("go_keys"),
       anonymous: $("#c-anonymous").checked,
-      proxies: secretInputs("proxies"),
-      proxyfile: $("#c-proxyfile").value,
+      egress: {
+        enable_ipv6: $("#c-egress-v6").checked,
+        prefixes: $("#c-egress-prefixes")
+          .value.split(/\r?\n/)
+          .map((value) => value.trim())
+          .filter(Boolean),
+        pool_size: number("#c-egress-pool"),
+      },
       prefer: $("#c-prefer").value,
       upstream: { zen: $("#c-up-zen").value, go: $("#c-up-go").value },
       retry: { max_attempts: number("#c-attempts"), timeout_seconds: number("#c-timeout") },
@@ -244,9 +253,7 @@ $("#config-form").addEventListener("submit", async (event) => {
     };
     const result = await api("/api/config", { method: "PUT", body: JSON.stringify(update) });
     config = result.config;
-    ["server_keys", "zen_keys", "go_keys", "proxies"].forEach(
-      (name) => ($(`#${name}-new`).value = ""),
-    );
+    ["server_keys", "zen_keys", "go_keys"].forEach((name) => ($(`#${name}-new`).value = ""));
     fillConfig(config);
     await loadDebugModels();
     toast(
@@ -319,19 +326,25 @@ function emptyRow(host, columns, message = "暂无数据") {
   host.appendChild(row);
 }
 function renderResources(resources) {
-  const proxies = $("#proxy-table");
-  proxies.replaceChildren();
-  (resources.proxies || []).forEach((proxy) => {
+  const lanes = $("#egress-table");
+  lanes.replaceChildren();
+  (resources.egress || []).forEach((lane) => {
     const row = document.createElement("tr");
-    appendCell(row, proxy.address);
-    appendCell(row, proxy.healthy ? "正常" : "不可用", `status ${proxy.healthy ? "ok" : "bad"}`);
-    appendCell(
-      row,
-      `Z ${proxy.zen_keys} · G ${proxy.go_keys} · A ${proxy.anonymous ? "开" : "关"}`,
-    );
-    proxies.appendChild(row);
+    appendCell(row, lane.address);
+    // A lane can be transport-healthy yet unselectable (FreeTier park or
+    // failure backoff): show that state instead of a misleading green.
+    const state = !lane.healthy
+      ? ["不可用", "bad"]
+      : lane.parked_until
+        ? ["限流停放", "warn"]
+        : lane.cooling_until
+          ? ["冷却中", "warn"]
+          : ["正常", "ok"];
+    appendCell(row, state[0], `status ${state[1]}`);
+    appendCell(row, `Z ${lane.zen_keys} · G ${lane.go_keys} · A ${lane.anonymous ? "开" : "关"}`);
+    lanes.appendChild(row);
   });
-  if (!proxies.children.length) emptyRow(proxies, 3);
+  if (!lanes.children.length) emptyRow(lanes, 3);
   const keys = $("#key-table");
   keys.replaceChildren();
   if (resources.anonymous) {
@@ -400,9 +413,11 @@ function renderGuide() {
       (config.zen_keys || []).length + (config.go_keys || []).length > 0 || config.anonymous,
     ],
     [
-      "检查 Proxy",
-      "至少一个代理节点健康。",
-      (resources.proxies || []).some((proxy) => proxy.healthy),
+      "检查出口通道",
+      "至少一个出口地址可选（健康且未被限流停放）。",
+      (resources.egress || []).some(
+        (lane) => lane.healthy && !lane.parked_until && !lane.cooling_until,
+      ),
     ],
     ["等待模型目录", modelDescription, models.exposed > 0 && !!models.updated_at],
     ["复制接入示例", "进入接入手册，替换模型与 YOUR_API_KEY。", true],
@@ -739,7 +754,7 @@ function renderDiagnostics() {
       appendCell(row, attempt.model);
       appendCell(row, `${attempt.tier} / ${attempt.channel}`);
       appendCell(row, attempt.key_id);
-      appendCell(row, attempt.proxy_node);
+      appendCell(row, attempt.egress_node);
       appendCell(row, attempt.status || attempt.outcome, attempt.success ? "ok" : "bad");
       appendCell(row, `${attempt.duration_ms} ms`);
       attempts.appendChild(row);
@@ -1155,11 +1170,13 @@ $("#api-key-form").onsubmit = async (event) => {
     });
     if (!csrf) return;
     createdKey = data.key;
-    const goModels = debugData?.models?.filter((item) => item.available_go) || [];
+    // Offer a rotation alias first: it is the gateway's stable abstraction and
+    // keeps working as the catalog changes. Fall back to the first model the Go
+    // tier serves, then the first catalog model. Nothing is hardcoded.
+    const goModels = (debugData?.models || []).filter((item) => item.available_go);
+    const allModels = debugData?.models || [];
     const model =
-      goModels.find((item) => item.model === "glm-5.3-flash")?.model ||
-      goModels[0]?.model ||
-      "YOUR_MODEL";
+      (debugData?.aliases || [])[0] || goModels[0]?.model || allModels[0]?.model || "YOUR_MODEL";
     $("#api-key-env").textContent =
       `OPENAI_API_KEY=${data.key}\nOPENAI_BASE_URL=${derivedAPIBase()}/v1\nOPENAI_MODEL=${model}`;
     $("#api-key-created").classList.remove("hidden");
@@ -1207,6 +1224,7 @@ function renderRotation() {
   $("#rotation-status").textContent =
     state.persistence_error || "状态已更新 · 两组独立轮转，所有调用方共享当前位置。";
   $("#rotation-timeout").value = state.first_output_seconds;
+  $("#rotation-sota-size").value = state.sota_size;
   const host = $("#rotation-groups");
   host.replaceChildren();
   for (const group of state.groups) {
@@ -1367,13 +1385,19 @@ $("#rotation-refresh").onclick = () => {
 $("#rotation-timeout").oninput = () => {
   rotationDirty = true;
 };
+$("#rotation-sota-size").oninput = () => {
+  rotationDirty = true;
+};
 $("#rotation-form").onsubmit = async (event) => {
   event.preventDefault();
   if (!rotationData) return;
   const button = $("#rotation-save");
   button.disabled = true;
   try {
-    const body = { first_output_seconds: Number($("#rotation-timeout").value) };
+    const body = {
+      first_output_seconds: Number($("#rotation-timeout").value),
+      sota_size: Number($("#rotation-sota-size").value),
+    };
     for (const group of rotationData.groups)
       body[group.id] = { alias: group.alias.trim(), order: group.order };
     rotationData = await api("/api/rotation", { method: "PUT", body: JSON.stringify(body) });

@@ -99,7 +99,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 	// continues from the first round so monitoring never shows duplicate attempt
 	// numbers for one request.
 	//
-	// The client's session is deliberately preserved: it carries key/proxy
+	// The client's session is deliberately preserved: it carries key/egress
 	// affinity and upstream session correlation. Minting a fresh session made
 	// the replay land on a different node with a cold prompt cache and detached
 	// the reply from the chain the client still holds; the stale references are
@@ -253,31 +253,41 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	return nil, effectiveRoute, attempts, lastErr
 }
 
-// doAnonymousUpstream tries every currently available proxy at most once. Any
-// failure, including an HTTP error response, advances to the next proxy. Only a
-// successful response ends the anonymous phase; exhausting the proxy cursor
-// returns control to the preferred authenticated tiers.
+// freitierScanLimit bounds how many lanes one request may park on a FreeTier
+// verdict before the scan concludes the verdict is request-scoped. The gate
+// returns the same 403 body for the same request on every exit, so scanning
+// further only parks healthy lanes for a decision no lane can change.
+const freitierScanLimit = 5
+
+// doAnonymousUpstream tries every currently available egress lane at most
+// once. Transport failures and retryable responses (5xx, 401/403/429)
+// advance to the next lane; a deterministic non-retryable 4xx ends the scan
+// immediately (mirroring the key path) because no other IP will change the
+// verdict. Only a successful response ends the anonymous phase; exhausting
+// the lane cursor returns control to the preferred authenticated tiers.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
 	limit := g.anonymous.Len()
 	attempts := 0
+	freitierParks := 0
 	body := bodies[config.TierZen]
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
 	}
-	// The anonymous free tier only serves agent-shaped streaming requests
-	// (anything else is rejected with 403 FreeTierError). Normalize the
-	// wire body here; the gateway collapses the stream back when the
-	// downstream client asked for a plain JSON reply. Key tiers keep their
-	// original bodies.
-	body = prepareAnonymousBody(body, route.ProtocolFor(config.TierZen))
+	// The anonymous free tier serves SSE only — non-streaming wire bodies are
+	// rejected with 403 FreeTierError — so streaming is forced here and the
+	// gateway collapses the stream back when the client asked for plain JSON.
+	// Nothing else is rewritten: the free-tier gate recognizes the client's
+	// own tool and prompt profile, and synthetic shapes are the rejected ones.
+	// Key tiers keep their original bodies.
+	body = shapeAnonymousBody(body, route.ProtocolFor(config.TierZen), false)
 	for attempts < limit {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
 			// of firing attempts that cannot succeed and then recording them
-			// as failures against proxies that were never really tried.
+			// as failures against lanes that were never really tried.
 			if lastErr == nil {
 				lastErr = ctx.Err()
 			}
@@ -300,13 +310,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		if err != nil {
 			return nil, err, attempts
 		}
-		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.proxy)
+		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.egress)
 		started := time.Now()
-		resp, err := doInferenceAttempt(node.proxy.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+		resp, err := doInferenceAttempt(node.egress.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
 		duration := time.Since(started)
 		if ctx.Err() != nil {
 			// The parent budget expired while this attempt was in flight. Its
-			// outcome says nothing about this proxy, so record nothing and stop
+			// outcome says nothing about this lane, so record nothing and stop
 			// scanning.
 			lastResponse, lastErr = resp, err
 			if lastErr == nil && lastResponse == nil {
@@ -315,41 +325,91 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			break
 		}
 		g.observeAnonymousResult(ctx, node, resp, err)
-		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
+		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.egress, resp, err, duration)
+		// A 403 carries an exit-attributable verdict in its body (zen-proxy
+		// taxonomy): account blocks fail fast, FreeTier flags park the lane,
+		// region blocks cool the /64, bare 403s keep the failure path.
+		// The snippet peek restores the body, so lastResponse stays usable.
+		if err == nil && resp.StatusCode == http.StatusForbidden {
+			verdict := classifyForbidden(peekForbiddenSnippet(resp, 2048))
+			g.logger.Info("anonymous upstream returned 403", "component", "upstream", "event", "anonymous_forbidden", "request_id", ids.Request, "attempt", attempts, "verdict", string(verdict), "egress", config.RedactURL(node.egress.address), "duration_ms", duration.Milliseconds())
+			if verdict == forbiddenAccount {
+				lastResponse = resp
+				lastErr = err
+				break
+			}
+			if verdict == forbiddenFreeTier {
+				g.anonymous.ParkFreitier(node.egress)
+				freitierParks++
+				if freitierParks >= freitierScanLimit {
+					// The same verdict from every lane means the gate rejects
+					// the request itself, not the exit: another park would
+					// drain the pool for a decision no lane can change.
+					g.logger.Warn("anonymous FreeTier verdict repeated across lanes; failing fast", "component", "upstream", "event", "anonymous_freitier_scan_capped", "request_id", ids.Request, "attempts", attempts, "limit", freitierScanLimit)
+					lastResponse = resp
+					lastErr = err
+					break
+				}
+			}
+			if verdict == forbiddenRegion {
+				g.transports.CoolSubnet(node.egress.address, forbiddenRegionCooldown)
+				g.transports.pruneSubnetCooldowns()
+			}
+			lastResponse = resp
+			lastErr = err
+			continue
+		}
 		if err == nil && resp.StatusCode/100 == 2 {
-			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
 		lastResponse = resp
 		lastErr = err
+		// Deterministic client errors (never 401/403/429, which stay
+		// retryable so per-lane IP-reputation scanning is preserved) end
+		// the scan: no other lane will change the verdict. Lanes are not
+		// poisoned by this — observeAnonymousResult only cools lanes on
+		// cooldownWorthy outcomes, which already exclude these 4xx.
+		if isNonRetryableClientResponse(resp, err) {
+			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			break
+		}
 		if err != nil {
-			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "duration_ms", duration.Milliseconds(), "error", err)
 		} else {
-			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			g.logger.Debug("anonymous upstream returned an error response; trying the next lane", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 		}
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no healthy anonymous proxies available")
+		lastErr = errors.New("no healthy anonymous egress lanes available")
 	}
 	return nil, lastErr, attempts
 }
 
-// anonymousCoreTools are the tool names the anonymous free tier expects on
-// an agent-shaped request. Requests without them are rejected with 403
-// FreeTierError. Only the names matter; the gateway synthesizes minimal
-// definitions for whichever ones the downstream client did not declare.
+// anonymousCoreTools are the tool names the free-tier gate expects on agent
+// traffic. Requests that declare a tool profile are completed with any
+// missing names — foreign profiles (another client's capitalized or aliased
+// tools) are not recognized without them. Requests that declare no tools are
+// left alone: the gate rejects tool-bearing shapes for profiles that cannot
+// carry tools (OpenCode's title generator among them), and synthetic probe
+// traffic is the one case where the gateway stamps the full set itself.
 var anonymousCoreTools = []string{"bash", "edit", "glob", "grep", "read"}
 
-// prepareAnonymousBody returns a copy of body normalized for the anonymous
-// free tier: streaming enabled plus the core agent tools present. Bodies
-// that already satisfy both (or are not JSON objects) are returned
+// shapeAnonymousBody prepares a free-tier wire body for the anonymous lane.
+// The upstream serves SSE only, so streaming is forced and Chat usage
+// reporting enabled; the gateway collapses the stream back when the client
+// asked for plain JSON. A declared tool profile is completed with the missing
+// official agent tool names. stampTools additionally materializes the whole
+// set for synthetic payloads that declare no tools at all (availability
+// probes); client traffic is never given tools it did not declare. Bodies
+// that already satisfy the shape (or are not JSON objects) are returned
 // unchanged. System One payloads are decision requests, not agent traffic, so
-// they are forwarded verbatim; injecting streaming or tool definitions would
-// make the upstream reject them.
-func prepareAnonymousBody(body []byte, protocol wire.Protocol) []byte {
+// they are forwarded verbatim; injecting streaming would make the upstream
+// reject them.
+func shapeAnonymousBody(body []byte, protocol wire.Protocol, stampTools bool) []byte {
 	if protocol == wire.SystemOne {
 		return body
 	}
@@ -365,7 +425,7 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol) []byte {
 	if ensureAnonymousChatUsage(payload, protocol) {
 		changed = true
 	}
-	if ensureAnonymousTools(payload, protocol) {
+	if ensureAnonymousTools(payload, protocol, stampTools) {
 		changed = true
 	}
 	if !changed {
@@ -398,18 +458,22 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 	return true
 }
 
-// ensureAnonymousTools appends minimal definitions for any missing core
-// tool so the request reads as an agent session upstream. It reports
-// whether the payload changed. Tools the client already declared are left
-// untouched.
-func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
+// ensureAnonymousTools completes a declared tool profile with any missing core
+// agent tool names so the free-tier gate recognizes it. It never fabricates a
+// list for a payload that declares none unless fabricate is set (synthetic
+// probe traffic, which has no profile of its own). It reports whether the
+// payload changed. Declared tools are otherwise left untouched.
+func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol, fabricate bool) bool {
 	raw, exists := payload["tools"]
-	if !exists {
+	items, isSlice := raw.([]any)
+	if !exists || (isSlice && len(items) == 0) {
+		if !fabricate {
+			return false
+		}
 		payload["tools"] = anonymousToolset(protocol, nil)
 		return true
 	}
-	items, ok := raw.([]any)
-	if !ok {
+	if !isSlice {
 		return false
 	}
 	present := make(map[string]bool, len(items))
@@ -523,24 +587,22 @@ func (g *Gateway) dumpOutboundBodies(route models.Route, bodies map[config.Tier]
 	}
 }
 
-// shapeKeyBody normalizes key-tier free-model wire bodies to agent shape
-// (stream + core tools), mirroring the anonymous lane. Upstream now
-// rejects non-agent-shaped free-tier requests on every lane with 403
-// FreeTierError; paid models keep their original bodies. It reports
-// whether the body changed so the gateway can collapse the SSE stream a
-// non-streaming client receives back.
+// shapeKeyBody forces key-tier free-model wire bodies onto the SSE transport
+// the free tier serves, mirroring the anonymous lane. Paid models keep their
+// original bodies. It reports whether the body changed so the gateway can
+// collapse the SSE stream a non-streaming client receives back.
 func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier) ([]byte, bool) {
 	if !g.catalog.IsFreeModel(route.ID) {
 		return body, false
 	}
-	shaped := prepareAnonymousBody(body, route.ProtocolFor(tier))
+	shaped := shapeAnonymousBody(body, route.ProtocolFor(tier), false)
 	return shaped, !bytes.Equal(shaped, body)
 }
 
 // key. It performs no failover at all — no anonymous lane, no other key and no
 // other tier — so the outcome describes that one key. It also leaves pool state
 // untouched on purpose: a diagnostic request must never cool a production key or
-// evict a proxy, which is exactly what made a bad Playground request degrade
+// evict a lane, which is exactly what made a bad Playground request degrade
 // live traffic before.
 func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, override DebugKeyOverride, attemptOffset int) (*http.Response, error, int) {
 	nodes := g.zenNodes
@@ -563,24 +625,24 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 			meta.Shaped = true
 		}
 	}
-	proxy := nodes.Proxy(node)
-	if proxy == nil {
-		return nil, errors.New("selected upstream key has no proxy binding"), 0
+	egress := nodes.Egress(node)
+	if egress == nil {
+		return nil, errors.New("selected upstream key has no egress binding"), 0
 	}
 	if meta := telemetry.MetaFromContext(ctx); meta != nil {
 		meta.Attempts = attemptOffset + 1
 		meta.Tier = string(override.Tier)
 	}
 	keyID := config.KeyDisplayID(node.key)
-	setRequestCredential(ctx, override.Tier, keyID, "key", false, proxy)
+	setRequestCredential(ctx, override.Tier, keyID, "key", false, egress)
 	req, err := newUpstreamRequest(ctx, baseURL, route.ProtocolFor(override.Tier), body, ids, node.key)
 	if err != nil {
 		return nil, err, 0
 	}
 	started := time.Now()
-	resp, err := doInferenceAttempt(proxy.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+	resp, err := doInferenceAttempt(egress.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
 	duration := time.Since(started)
-	g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+1, keyID, "key", false, proxy, resp, err, duration)
+	g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+1, keyID, "key", false, egress, resp, err, duration)
 	if err != nil {
 		return nil, err, 1
 	}
@@ -639,31 +701,52 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if err != nil {
 			return nil, err, attempts
 		}
-		proxy := nodes.Proxy(node)
-		if proxy == nil {
-			lastErr = errors.New("upstream key has no proxy binding")
+		egress := nodes.Egress(node)
+		if egress == nil {
+			lastErr = errors.New("upstream key has no egress binding")
 			break
 		}
 		keyID := config.KeyDisplayID(node.key)
-		setRequestCredential(ctx, route.Tier, keyID, "key", false, proxy)
+		setRequestCredential(ctx, route.Tier, keyID, "key", false, egress)
 		attemptStarted := time.Now()
-		resp, err := doInferenceAttempt(proxy.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+		resp, err := doInferenceAttempt(egress.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
 		attemptDuration := time.Since(attemptStarted)
 		if ctx.Err() != nil {
 			// The request budget expired while this attempt was in flight. A
-			// cancelled context says nothing about the key or the proxy: without
+			// cancelled context says nothing about the key or the lane: without
 			// this guard the instant DeadlineExceeded would cool a healthy key
-			// and evict a healthy proxy from the pool.
+			// and evict a healthy lane from the pool.
 			lastResponse, lastErr = resp, err
 			if lastErr == nil && lastResponse == nil {
 				lastErr = ctx.Err()
 			}
 			break
 		}
-		g.observeKeyResult(ctx, nodes, node, proxy, resp, err)
-		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, proxy, resp, err, attemptDuration)
+		g.observeKeyResult(ctx, nodes, node, egress, resp, err)
+		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, egress, resp, err, attemptDuration)
+		// Same 403 taxonomy as the anonymous loop: account blocks fail the
+		// tier fast, FreeTier flags park the lane, region blocks cool the
+		// /64. MarkFailure already cooled the lane via cooldownWorthy; the
+		// park/cool here is the additional exit-attributable signal.
+		if err == nil && resp.StatusCode == http.StatusForbidden {
+			verdict := classifyForbidden(peekForbiddenSnippet(resp, 2048))
+			g.logger.Info("upstream returned 403", "component", "upstream", "event", "attempt_forbidden", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "verdict", string(verdict), "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
+			if verdict == forbiddenAccount {
+				return resp, nil, attempts
+			}
+			if verdict == forbiddenFreeTier {
+				g.anonymous.ParkFreitier(egress)
+			}
+			if verdict == forbiddenRegion {
+				g.transports.CoolSubnet(egress.address, forbiddenRegionCooldown)
+				g.transports.pruneSubnetCooldowns()
+			}
+			lastResponse = resp
+			lastErr = err
+			continue
+		}
 		if err == nil && resp.StatusCode/100 == 2 {
-			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", config.RedactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "egress", config.RedactURL(egress.address), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
 		}
 		// Request-shape errors are deterministic and must leave this tier without
@@ -671,15 +754,15 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		// tier in prefer order. Authentication, throttling, server, and transport
 		// failures remain retryable inside this tier.
 		if isNonRetryableClientResponse(resp, err) {
-			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", config.RedactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
 		}
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", config.RedactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
+			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds(), "error", err)
 		} else {
-			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", config.RedactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
 		}
 	}
 	if lastResponse != nil {
@@ -690,17 +773,17 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 
 // Diagnostics use the same routing and transports as production, but must not
 // update cooldowns, health, or bindings, including after successful attempts.
-func (g *Gateway) observeKeyResult(ctx context.Context, nodes *nodePool, node *upstreamNode, proxy *proxyTransport, resp *http.Response, err error) {
+func (g *Gateway) observeKeyResult(ctx context.Context, nodes *nodePool, node *upstreamNode, egress *egressTransport, resp *http.Response, err error) {
 	if isDiagnosticRequest(ctx) {
 		return
 	}
 	status := upstreamStatus(resp)
-	proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
+	egressFailed := g.syncEgressResult(ctx, egress, status, err)
 	if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
 		nodes.MarkSuccess(node)
 		return
 	}
-	if !proxyFailed || nodes.Proxy(node) == proxy {
+	if !egressFailed || nodes.Egress(node) == egress {
 		nodes.MarkFailure(node, resp, err)
 	}
 }
@@ -710,7 +793,7 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 		return
 	}
 	status := upstreamStatus(resp)
-	g.syncProxyResult(ctx, node.proxy, status, err)
+	g.syncEgressResult(ctx, node.egress, status, err)
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
 	} else {
@@ -725,7 +808,7 @@ func upstreamStatus(resp *http.Response) int {
 	return resp.StatusCode
 }
 
-func setRequestCredential(ctx context.Context, tier config.Tier, keyID, channel string, anonymous bool, proxy *proxyTransport) {
+func setRequestCredential(ctx context.Context, tier config.Tier, keyID, channel string, anonymous bool, egress *egressTransport) {
 	meta := telemetry.MetaFromContext(ctx)
 	if meta == nil {
 		return
@@ -734,9 +817,9 @@ func setRequestCredential(ctx context.Context, tier config.Tier, keyID, channel 
 	meta.KeyID = keyID
 	meta.Channel = channel
 	meta.Anonymous = anonymous
-	meta.Proxy = ""
-	if proxy != nil {
-		meta.Proxy = config.RedactURL(proxy.name)
+	meta.Egress = ""
+	if egress != nil {
+		meta.Egress = config.RedactURL(egress.address)
 	}
 }
 
@@ -748,7 +831,7 @@ func requestCredential(ctx context.Context) (string, string, bool) {
 	return meta.KeyID, meta.Channel, meta.Anonymous
 }
 
-func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route, ids identity.RequestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration) {
+func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route, ids identity.RequestIDs, attempt int, keyID, channel string, anonymous bool, egress *egressTransport, resp *http.Response, err error, duration time.Duration) {
 	status := upstreamStatus(resp)
 	success := err == nil && status >= 200 && status < 300
 	outcome := "retryable_failure"
@@ -785,13 +868,13 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 	if g.monitor == nil {
 		return
 	}
-	proxyName := "unavailable"
-	if proxy != nil {
-		proxyName = config.RedactURL(proxy.name)
+	egressName := "unavailable"
+	if egress != nil {
+		egressName = config.RedactURL(egress.address)
 	}
 	g.monitor.RecordAttempt(telemetry.UpstreamAttempt{
 		Time: time.Now().UTC(), RequestID: ids.Request, Model: route.ID, Tier: string(route.Tier), Attempt: attempt,
-		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, Status: status,
+		KeyID: keyID, Channel: channel, Anonymous: anonymous, Egress: egressName, Status: status,
 		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcome,
 	})
 }

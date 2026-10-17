@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-使用 Go 编写的 **OpenCode Zen / Zen Go API 网关**。对外提供 Chat Completions、Responses 和 Anthropic Messages 接口，按上游原生协议转换请求，并统一管理上游 Key 与代理。
+使用 Go 编写的 **OpenCode Zen / Zen Go API 网关**。对外提供 Chat Completions、Responses 和 Anthropic Messages 接口，按上游原生协议转换请求，并统一管理上游 Key 与出口轮换。
 
 WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
 
@@ -12,13 +12,13 @@ WebUI 内嵌在可执行文件中，运行服务无需 Node.js 或数据库。
 - 文本、图片、reasoning、函数工具、工具调用和工具结果；目标协议允许时支持文件内容转换。
 - 独立的 Zen / Go Key 池，可配置优先级、重试和会话亲和性。
 - 使用 OpenCode `public` 凭证的可选 Zen 匿名通道。
-- 直连、HTTP、HTTPS、SOCKS5、SOCKS5H 连接，以及代理文件。
+- IPv6 出口轮换：每条通道绑定一个从配置前缀采样的源地址。
 - 动态模型发现、原生协议与能力信息、磁盘缓存。
 - 独立管理端口，支持配置编辑、Playground、路由诊断、Token 统计和实时日志。
 - 配置热重载：先验证新配置，再切换新请求使用的 Gateway。
 - Go 共享套餐额度看板，显示剩余百分比、重置时间和可用模型。
 - API Key 生成、自定义、命名、启停和删除，变更立即生效。
-- `sota` / `sweet` 分组别名，支持模型排序、故障切换、流式输出保护和状态恢复。
+- `sota` / `sweet` 分组别名，成员按上游目录公布价格自动划分，支持模型排序、故障切换、流式输出保护和状态恢复。
 
 新增页面及调用示例见[管理控制台说明](docs/management.zh-CN.md)。
 
@@ -101,8 +101,6 @@ docker run -d --name opencode2api \
   -v opencode2api-state:/var/lib/opencode2api \
   opencode2api:local
 ```
-
-在 Docker 中使用 `proxyfile` 时，代理文件也需要挂载到容器内配置指定的位置。
 
 ## API 调用
 
@@ -209,19 +207,19 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 路由顺序：
 
-1. 符合条件的模型先尝试匿名通道，每个可用代理最多一次。
+1. 符合条件的模型先尝试匿名通道，每个可用出口通道最多一次。
 2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
 匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发 Key 轮换；其他 4xx 会结束当前 Tier，仍可继续尝试另一个可用 Tier。
 
-每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 代理重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。识别到过期的 Responses reasoning 引用时，可执行一次修复重试；指定 Key 的诊断不会执行该重试。
+每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 出口通道重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。识别到过期的 Responses reasoning 引用时，可执行一次修复重试；指定 Key 的诊断不会执行该重试。
 
 只有匿名通道可用时，`/v1/models` 仅展示符合匿名条件的模型。
 
 ### 免费模型可用性
 
-只探测 ID 含 `free`（不区分大小写），或元数据输入、输出价格均为零且未弃用的模型，按模型原生协议发送简短探测请求。先尝试已启用的匿名通道，再尝试一个配置的 Zen Key；任一通道返回完整有效响应即视为可用，只有所有实际尝试的通道都明确返回模型不存在或已下架时才自动禁用，从模型列表与路由中移除。认证失败、429、超时、网络错误、5xx 和响应格式异常均视为结果不确定，不新增禁用，1 小时后复测。探测不修改生产 Key / 代理的冷却状态，也不计入请求统计，但仍会访问上游并可能消耗免费额度。
+只探测 ID 含 `free`（不区分大小写），或元数据输入、输出价格均为零且未弃用的模型，按模型原生协议发送简短探测请求。先尝试已启用的匿名通道，再尝试一个配置的 Zen Key；任一通道返回完整有效响应即视为可用，只有所有实际尝试的通道都明确返回模型不存在或已下架时才自动禁用，从模型列表与路由中移除。认证失败、429、超时、网络错误、5xx 和响应格式异常均视为结果不确定，不新增禁用，1 小时后复测。探测不修改生产 Key / 出口通道的冷却状态，也不计入请求统计，但仍会访问上游并可能消耗免费额度。
 
 System One 使用原生 `noul` 类型询问“1+1 是否等于 2”，不注入聊天或工具字段。模型列表标明 `native_protocol` 和 `supported_endpoints`；仅在配置 Go Key 且有可用模型时展示轮转别名。升级时解除 v1.3.6 旧探测生成的禁用并立即安排复测，避免非法会话 ID 造成的误判继续保留。
 
@@ -231,13 +229,13 @@ System One 使用原生 `noul` 类型询问“1+1 是否等于 2”，不注入�
 
 管理接口：`GET /api/models/availability` 查看状态；`POST /api/models/restore` 携带 `{"model":"MODEL_ID"}` 恢复。两者均需管理登录，恢复接口还需 CSRF 校验。
 
-### 会话与代理
+### 会话与出口通道
 
-Key 初始化时均衡分配到代理。真实流量可以触发代理检查、Key 重新绑定和失败冷却。已经标记异常的代理，每 15 分钟通过 Cloudflare trace 复查一次。
+Key 初始化时均衡分配到出口通道。真实流量可以触发通道检查、Key 重新绑定和失败冷却。已经标记异常的通道，每 15 分钟通过 Cloudflare trace 复查一次。
 
-服务使用稳定会话哈希选择首选 Key 或匿名代理。建议通过 `x-session-id` 区分独立会话，同时支持 `x-opencode-session`、`x-session-affinity`、`conversation-id`、`conversation_id` 与 `metadata.session_id`。
+服务使用稳定会话哈希选择首选 Key 或匿名通道。建议通过 `x-session-id` 区分独立会话，同时支持 `x-opencode-session`、`x-session-affinity`、`conversation-id`、`conversation_id` 与 `metadata.session_id`。
 
-没有显式会话 ID 时，使用第一条用户消息生成会话标识，因此开场内容相同的会话可能共享亲和性。调整 Key 或代理池成员后，原有会话选择的节点可能变化。
+没有显式会话 ID 时，使用第一条用户消息生成会话标识，因此开场内容相同的会话可能共享亲和性。调整 Key 或通道池成员后，原有会话选择的节点可能变化。
 
 失败冷却按指数增长，最高为 `performance.failure_cooldown_seconds` 的八倍；如果上游的 `Retry-After` 更长，则使用更长时间。所有认证 Key 都处于冷却时，路由仍可能尝试最早结束冷却的 Key；仍在冷却的匿名节点会被跳过。
 
@@ -256,8 +254,9 @@ Key 初始化时均衡分配到代理。真实流量可以触发代理检查、K
 | `prefer`                    | `go`；可选 `go`、`zen`。                                                              |
 | `upstream.zen`              | `https://opencode.ai/zen`。                                                           |
 | `upstream.go`               | `https://opencode.ai/zen/go`。                                                        |
-| `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                             |
-| `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                              |
+| `egress.enable_ipv6`        | `true`。                                                                              |
+| `egress.prefixes`           | `["2001:470:735f::/48"]`；最多 8 个 IPv6 CIDR。                                       |
+| `egress.pool_size`          | `16`；轮换地址池大小，范围 1–128。                                                    |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                                     |
 | `models.protocols`          | `{}`；按模型 ID 覆盖原生协议。                                                        |
 | `reasoning.effort`          | 空（关闭）；可选 `auto`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`none`。 |
@@ -291,18 +290,7 @@ WebUI 的配置中心也提供默认强度和按模型覆盖。管理 API 的 `G
 会返回 `reasoning`，`PUT /api/config` 接受同名对象；省略该字段会保留现有值，
 发送空对象则会清除它。
 
-代理支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`，URL 可包含认证信息。配置内代理先加载，再追加 `proxyfile` 内容，并按首次出现的顺序去重。
-
-代理文件每行一个地址，允许空行和注释：
-
-```text
-# 首选代理
-http://user:password@127.0.0.1:7890
-socks5://127.0.0.1:1080  # 备用代理
-direct
-```
-
-支持 `#`、`;`、`//` 注释标记，标记需要位于行首或空白字符之后。
+每条出口通道绑定一个采样的 IPv6 源地址（关闭 IPv6 轮换时使用 `direct`）。地址在进程启动时从配置前缀采样一次：`/48` 轮换整个 `/64` 子网并随机接口 ID，更宽的前缀均匀抽取主机位并保留网络地址。无法产出 `pool_size` 个唯一地址的前缀会在启动时被拒绝。
 
 ### 超时与连接池
 
@@ -313,12 +301,12 @@ direct
 | `performance.attempt_timeout_seconds`   | `0`    | 每次尝试等待响应头的超时；0 表示使用请求总超时。 |
 | `performance.connect_timeout_seconds`   | `5`    | 建立连接的超时。                                 |
 | `performance.failure_cooldown_seconds`  | `15`   | 失败冷却基数。                                   |
-| `performance.max_idle_conns`            | `2048` | 每个代理 Transport 的空闲连接上限。              |
+| `performance.max_idle_conns`            | `2048` | 每个出口 Transport 的空闲连接上限。              |
 | `performance.max_idle_conns_per_host`   | `256`  | 每个 Transport 对单个主机的空闲连接上限。        |
 | `performance.max_conns_per_host`        | `0`    | 单个主机的连接上限；0 表示不限制。               |
 | `performance.idle_conn_timeout_seconds` | `120`  | 空闲连接保留时间。                               |
 
-单次响应头超时不会超过请求总超时。希望慢节点仍能留出回退时间时，可以将它设为小于总超时的值。请求上下文过期后会停止后续尝试，不会惩罚尚未实际使用的 Key 或代理。
+单次响应头超时不会超过请求总超时。希望慢节点仍能留出回退时间时，可以将它设为小于总超时的值。请求上下文过期后会停止后续尝试，不会惩罚尚未实际使用的 Key 或通道。
 
 ### 日志与管理端
 
@@ -334,7 +322,7 @@ direct
 | `webui.password_hash`         | 自动生成的 Argon2id 哈希，用于替代明文密码。    |
 | `webui.session_ttl_minutes`   | `720`；范围为 5–10,080。                        |
 
-启动时会将初始密码哈希化，并从配置中删除明文；包含初始明文密码的备份也会删除。配置和备份仍包含运行所需的上游 Key、代理凭据，应限制文件访问权限。
+启动时会将初始密码哈希化，并从配置中删除明文；包含初始明文密码的备份也会删除。配置和备份仍包含运行所需的上游 Key，应限制文件访问权限。
 
 请求体日志默认关闭，每份准备好的上游请求体最多输出 64 KiB。已配置的敏感值会脱敏，但对话内容本身仍可能包含敏感信息。
 
@@ -370,7 +358,7 @@ Playground 需要已登录的 Session 和 `X-CSRF-Token`，每个客户端 IP �
 
 服务端强制设置 `stream: false`。需要指定 Key 时，使用 `{"mode":"selected","tier":"zen","id":"KEY_FINGERPRINT"}`，其中指纹来自 `/api/debug/models`。指定 Key 的诊断最多执行一次上游尝试，不进入匿名通道，不轮换 Key，不切换 Tier，也不重放 reasoning 请求。
 
-**自动模式和指定 Key 模式都不会改变生产 Key 的冷却、失败次数，以及代理的健康状态和绑定关系。** 诊断仍会真实访问上游，可能消耗供应商配额，并会计入监控。
+**自动模式和指定 Key 模式都不会改变生产 Key 的冷却、失败次数，以及通道的健康状态和绑定关系。** 诊断仍会真实访问上游，可能消耗供应商配额，并会计入监控。
 
 执行后，管理接口返回 HTTP 200，实际结果位于 `ok`、`http_status`、`request_id`、`route` 和 `response`。指定 Key 时还返回 `selected_key` 与 `key_test`，其值包括 `usable`、`rejected`、`rate_limited`、`transport_error`、`upstream_error`、`request_error`、`unavailable`。管理请求格式、认证、CSRF 和限速错误仍返回各自对应的 HTTP 状态。
 
@@ -378,7 +366,7 @@ Playground 需要已登录的 Session 和 `X-CSRF-Token`，每个客户端 IP �
 
 服务先验证候选配置并创建新的 Gateway，然后保存配置并切换实例。验证或保存失败时，当前 Gateway 继续处理请求；已经开始的请求继续使用原有实例。
 
-Key、代理、上游地址、重试、模型、日志和路由偏好立即对新请求生效。`listen`、`webui.listen`、`webui.enabled` 的修改需要重启进程。保存后的 JSON 会规范化，不保留原有注释。
+Key、出口通道、上游地址、重试、模型、日志和路由偏好立即对新请求生效。`listen`、`webui.listen`、`webui.enabled` 的修改需要重启进程。保存后的 JSON 会规范化，不保留原有注释。
 
 ## 监控与持久化
 
@@ -402,9 +390,9 @@ Token 统计仅使用上游报告的 usage。输入 Token 包含缓存读取和�
 
 ### 健康检查
 
-`/healthz` 不增加监控计数，也不触发网络请求；返回资源数量，不包含 Key 或代理地址。
+`/healthz` 不增加监控计数，也不触发网络请求；返回资源数量，不包含 Key 或源地址。
 
-- HTTP 503：模型目录尚未就绪、当前配置下没有可路由模型，或没有健康代理。
+- HTTP 503：模型目录尚未就绪、当前配置下没有可路由模型，或没有健康出口通道。
 - HTTP 200：服务就绪。可用目录缓存过期时仍返回 200，同时模型状态为 `stale`，整体状态为 `degraded`。
 
 过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。就绪状态检查目录和资源，不会实际验证某个上游 Key 能否完成下一次推理。
@@ -464,16 +452,16 @@ npm run check:web
 
 ## 常见问题
 
-| 现象                          | 排查方向                                           |
-| ----------------------------- | -------------------------------------------------- |
-| API 返回 401                  | 使用配置中的本地 `server_keys`。                   |
-| 健康检查一直为 `starting`     | 查看目录刷新日志和网络连通性，必要时补充协议覆盖。 |
-| 模型列表为空                  | 检查配置的 Tier、匿名资格和原生协议是否受支持。    |
-| 请求返回 502 / 504            | 查看上游尝试、凭据、代理以及请求总超时和单次超时。 |
-| HTTP 200 但生成失败           | 查看 SSE 错误事件和请求结果，不能只看 HTTP 状态。  |
-| Docker 中宿主机配置修改不生效 | 当前配置在状态卷中；重新导入，或通过 WebUI 修改。  |
-| 无法通过容器端口访问          | 检查监听地址、端口映射和状态卷中的实际配置。       |
-| 重启后监控消失                | 监控仅保存在内存，需要外部收集 stdout 日志。       |
+| 现象                          | 排查方向                                               |
+| ----------------------------- | ------------------------------------------------------ |
+| API 返回 401                  | 使用配置中的本地 `server_keys`。                       |
+| 健康检查一直为 `starting`     | 查看目录刷新日志和网络连通性，必要时补充协议覆盖。     |
+| 模型列表为空                  | 检查配置的 Tier、匿名资格和原生协议是否受支持。        |
+| 请求返回 502 / 504            | 查看上游尝试、凭据、出口通道以及请求总超时和单次超时。 |
+| HTTP 200 但生成失败           | 查看 SSE 错误事件和请求结果，不能只看 HTTP 状态。      |
+| Docker 中宿主机配置修改不生效 | 当前配置在状态卷中；重新导入，或通过 WebUI 修改。      |
+| 无法通过容器端口访问          | 检查监听地址、端口映射和状态卷中的实际配置。           |
+| 重启后监控消失                | 监控仅保存在内存，需要外部收集 stdout 日志。           |
 
 ## 致谢
 

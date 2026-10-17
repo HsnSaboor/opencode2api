@@ -146,8 +146,8 @@
             <div class="section">
               <div class="section-head">
                 <div>
-                  <h2>Proxy 节点</h2>
-                  <div class="section-caption">这里显示代理节点，不将其描述为出口 IP。</div>
+                  <h2>出口通道</h2>
+                  <div class="section-caption">这里显示出口源地址轮换池。</div>
                 </div>
               </div>
               <div class="table-wrap">
@@ -159,7 +159,7 @@
                       <th>绑定</th>
                     </tr>
                   </thead>
-                  <tbody id="proxy-table"></tbody>
+                  <tbody id="egress-table"></tbody>
                 </table>
               </div>
             </div>
@@ -455,7 +455,7 @@
               <div>
                 <h2>上游尝试</h2>
                 <div class="section-caption">
-                  Key 尾码、匿名通道与脱敏代理节点；最多展示最近 100 条。
+                  Key 尾码、匿名通道与出口源地址；最多展示最近 100 条。
                 </div>
               </div>
             </div>
@@ -468,7 +468,7 @@
                     <th>模型</th>
                     <th>通道</th>
                     <th>Key 尾码</th>
-                    <th>代理节点</th>
+                    <th>出口地址</th>
                     <th>状态</th>
                     <th>耗时</th>
                   </tr>
@@ -541,21 +541,23 @@
             <div class="section">
               <div class="section-head">
                 <div>
-                  <h2>Proxy 节点</h2>
-                  <div class="section-caption">支持 direct、HTTP(S) 与 SOCKS URL。</div>
+                  <h2>出口源地址</h2>
+                  <div class="section-caption">从 IPv6 前缀采样轮换地址；关闭后使用直连。</div>
                 </div>
               </div>
-              <div id="proxies-chips" class="chips"></div>
               <div class="form-grid">
-                <div class="field">
-                  <label>新增 Proxy（每行一个）</label
-                  ><textarea
-                    id="proxies-new"
-                    placeholder="direct&#10;http://user:pass@host:port"
-                  ></textarea>
+                <div class="field full">
+                  <label class="check-label"
+                    ><input id="c-egress-v6" type="checkbox" />启用 IPv6 出口轮换</label
+                  >
                 </div>
                 <div class="field">
-                  <label>Proxy File</label><input id="c-proxyfile" placeholder="proxies.txt" />
+                  <label>IPv6 前缀（每行一个 CIDR）</label
+                  ><textarea id="c-egress-prefixes" placeholder="2001:470:735f::/48"></textarea>
+                </div>
+                <div class="field">
+                  <label>地址池大小</label
+                  ><input id="c-egress-pool" type="number" min="1" max="128" />
                 </div>
               </div>
             </div>
@@ -564,7 +566,7 @@
                 <div>
                   <h2>上游与协议路由</h2>
                   <div class="section-caption">
-                    anonymous 会耗尽可用 Proxy；显式 protocol 映射优先于模型名称推断。
+                    anonymous 会耗尽可用出口通道；显式 protocol 映射优先于模型名称推断。
                   </div>
                 </div>
               </div>
@@ -789,6 +791,10 @@
               <div class="field">
                 <label for="rotation-timeout">首个有效输出等待上限（秒）</label
                 ><input id="rotation-timeout" type="number" min="1" max="300" value="30" required />
+              </div>
+              <div class="field">
+                <label for="rotation-sota-size">SOTA 组模型数量（按目录价格从高到低自动划分）</label
+                ><input id="rotation-sota-size" type="number" min="1" max="32" value="5" required />
               </div>
               <div class="actions">
                 <button id="rotation-save" class="primary">保存别名与顺序</button>

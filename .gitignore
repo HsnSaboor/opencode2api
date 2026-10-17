@@ -6,6 +6,7 @@ config.json.bak
 opencode/
 /opencode2api
 /opencode2api.exe
+/opencode2api.bak.*
 *.log
 .tmp/
 .gocache/

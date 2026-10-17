@@ -17,7 +17,14 @@ func MaskValue(value string) string {
 	return "••••" + string(runes[len(runes)-5:])
 }
 
+// RedactURL strips credentials from a URL's userinfo for safe logging.
+// Inputs without a "://" scheme (bare egress values such as "direct", IPv6
+// literals, or host:port) carry no userinfo and never survive url.Parse, so
+// they pass through as-is instead of collapsing to "<invalid>".
 func RedactURL(raw string) string {
+	if !strings.Contains(raw, "://") {
+		return raw
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "<invalid>"
@@ -51,17 +58,6 @@ func (r *SecretRedactor) Replace(cfg Config) {
 			values = append(values, value, parsed.User.Username())
 			if password, ok := parsed.User.Password(); ok {
 				values = append(values, password)
-			}
-		}
-	}
-	for _, value := range cfg.RuntimeProxies() {
-		if value != "direct" {
-			values = append(values, value)
-			if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
-				values = append(values, parsed.User.Username())
-				if password, ok := parsed.User.Password(); ok {
-					values = append(values, password)
-				}
 			}
 		}
 	}

@@ -11,8 +11,6 @@ const (
 	anthropicRedactedThinkingPlaceholder = "[redacted thinking]"
 )
 
-var reasoningVendorHints = [...]string{"moonshot", "kimi", "deepseek", "mimo", "xiaomimimo"}
-
 type bridgeBlock struct {
 	Kind          string
 	Text          string

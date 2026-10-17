@@ -59,17 +59,18 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		effective: effectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
 	}
 	manager.metadata = modelcatalog.NewPricingStore(configPath, logger)
-	// models.dev refreshes ride the active runtime's healthy proxy transports
+	// models.dev refreshes ride the active runtime's healthy egress transports
 	// and fall back to the store's direct client when none are available.
 	manager.metadata.SetClientProvider(func() []*http.Client {
 		runtime := manager.current.Load()
 		if runtime == nil || runtime.gateway == nil || runtime.gateway.transports == nil {
 			return nil
 		}
-		clients := make([]*http.Client, 0, len(runtime.gateway.transports.items))
-		for _, proxy := range runtime.gateway.transports.items {
-			if proxy != nil && proxy.healthy.Load() {
-				clients = append(clients, proxy.client)
+		items := runtime.gateway.transports.snapshot()
+		clients := make([]*http.Client, 0, len(items))
+		for _, egress := range items {
+			if egress != nil && egress.healthy.Load() {
+				clients = append(clients, egress.client)
 			}
 		}
 		return clients
@@ -142,10 +143,10 @@ func (m *RuntimeManager) build(cfg config.Config) (*gatewayRuntime, error) {
 
 func (m *RuntimeManager) start(runtime *gatewayRuntime) {
 	// Store the context through a lightweight wrapper so cancel stops catalog
-	// and proxy checks while in-flight HTTP requests continue on the old pools.
+	// and egress checks while in-flight HTTP requests continue on the old pools.
 	runtimeCtx, cancel := context.WithCancel(m.root)
 	runtime.cancel = cancel
-	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
+	runtime.gateway.StartEgressHealthChecks(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
 }
 
@@ -291,7 +292,7 @@ func (m *RuntimeManager) Shutdown() {
 type ResourceSnapshot struct {
 	Models    modelcatalog.CatalogSnapshot  `json:"models"`
 	Keys      []KeyStatus                   `json:"keys"`
-	Proxies   []ProxyStatus                 `json:"proxies"`
+	Egress    []EgressStatus                `json:"egress"`
 	Anonymous bool                          `json:"anonymous"`
 	Metadata  modelcatalog.MetadataSnapshot `json:"metadata"`
 }
@@ -300,12 +301,12 @@ type KeyStatus struct {
 	ID            string     `json:"id"`
 	Tier          string     `json:"tier"`
 	Index         int        `json:"index"`
-	ProxyIndex    int        `json:"proxy_index"`
+	EgressIndex   int        `json:"egress_index"`
 	Failures      uint32     `json:"failures"`
 	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
 }
 
-type ProxyStatus struct {
+type EgressStatus struct {
 	Index     int    `json:"index"`
 	Address   string `json:"address"`
 	Healthy   bool   `json:"healthy"`
@@ -313,6 +314,12 @@ type ProxyStatus struct {
 	ZenKeys   int    `json:"zen_keys"`
 	GoKeys    int    `json:"go_keys"`
 	Anonymous bool   `json:"anonymous"`
+	// ParkedUntil marks a FreeTier-parked lane with its expiry; CoolingUntil
+	// marks an anonymous failure backoff. Both omit when unset. A lane can
+	// report Healthy while parked — health is transport state, park/cool
+	// is selection state.
+	ParkedUntil  *time.Time `json:"parked_until,omitempty"`
+	CoolingUntil *time.Time `json:"cooling_until,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -332,15 +339,34 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	gateway.goNodes.bindingsMu.Lock()
 	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
 	gateway.goNodes.bindingsMu.Unlock()
-	for _, proxy := range gateway.transports.items {
-		status := ProxyStatus{Index: proxy.index, Address: config.RedactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(), Anonymous: gateway.cfg.Anonymous}
-		if proxy.index < len(zenBindings) {
-			status.ZenKeys = zenBindings[proxy.index]
+	cooling := make(map[*egressTransport]int64, len(gateway.anonymous.snapshotNodes()))
+	for _, node := range gateway.anonymous.snapshotNodes() {
+		if node == nil || node.egress == nil {
+			continue
 		}
-		if proxy.index < len(goBindings) {
-			status.GoKeys = goBindings[proxy.index]
+		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
+			if prev, ok := cooling[node.egress]; !ok || until > prev {
+				cooling[node.egress] = until
+			}
 		}
-		result.Proxies = append(result.Proxies, status)
+	}
+	for _, egress := range gateway.transports.snapshot() {
+		status := EgressStatus{Index: egress.index, Address: config.RedactURL(egress.address), Healthy: egress.healthy.Load(), Checking: egress.checking.Load(), Anonymous: gateway.cfg.Anonymous}
+		if until := egress.freitierUntil.Load(); until > time.Now().UnixNano() {
+			value := time.Unix(0, until).UTC()
+			status.ParkedUntil = &value
+		}
+		if until, ok := cooling[egress]; ok {
+			value := time.Unix(0, until).UTC()
+			status.CoolingUntil = &value
+		}
+		if egress.index < len(zenBindings) {
+			status.ZenKeys = zenBindings[egress.index]
+		}
+		if egress.index < len(goBindings) {
+			status.GoKeys = goBindings[egress.index]
+		}
+		result.Egress = append(result.Egress, status)
 	}
 	return result
 }
@@ -440,7 +466,7 @@ func (m *RuntimeManager) DebugRouteForTier(model string, tier config.Tier) (mode
 func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
-		status := KeyStatus{ID: config.KeyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
+		status := KeyStatus{ID: config.KeyDisplayID(node.key), Tier: tier, Index: node.index, EgressIndex: int(node.egressIndex.Load()), Failures: node.failures.Load()}
 		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value

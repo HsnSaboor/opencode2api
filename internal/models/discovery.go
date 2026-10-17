@@ -37,13 +37,39 @@ type capabilityProvider struct {
 }
 
 type capabilityModel struct {
-	ID               string                     `json:"id"`
-	Provider         *capabilityModelProvider   `json:"provider"`
-	Limit            *capabilityModelLimit      `json:"limit"`
-	Reasoning        bool                       `json:"reasoning"`
-	ToolCall         bool                       `json:"tool_call"`
-	StructuredOutput bool                       `json:"structured_output"`
-	Modalities       *capabilityModelModalities `json:"modalities"`
+	ID               string                      `json:"id"`
+	Provider         *capabilityModelProvider    `json:"provider"`
+	Limit            *capabilityModelLimit       `json:"limit"`
+	Cost             *capabilityModelCost        `json:"cost"`
+	Reasoning        bool                        `json:"reasoning"`
+	ReasoningOptions []capabilityModelReasoning  `json:"reasoning_options"`
+	ToolCall         bool                        `json:"tool_call"`
+	StructuredOutput bool                        `json:"structured_output"`
+	Modalities       *capabilityModelModalities  `json:"modalities"`
+	Interleaved      *capabilityModelInterleaved `json:"interleaved"`
+}
+
+// capabilityModelCost is the catalog's published per-million-token price. Both
+// fields are pointers so a zero price (a free model) stays distinguishable from
+// a missing one, which rotation ranking needs.
+type capabilityModelCost struct {
+	Input  *float64 `json:"input"`
+	Output *float64 `json:"output"`
+}
+
+// capabilityModelInterleaved is the catalog's declaration that a model
+// interleaves its reasoning with tool calls in a named wire field. It is the
+// machine-readable form of "this endpoint wants reasoning replayed on
+// tool-call turns"; the gateway previously inferred it from vendor names.
+type capabilityModelInterleaved struct {
+	Field string `json:"field"`
+}
+
+// capabilityModelReasoning is one entry of reasoning_options: either an
+// "effort" ladder of named levels, a "toggle", or a "budget_tokens" range.
+type capabilityModelReasoning struct {
+	Type   string   `json:"type"`
+	Values []string `json:"values"`
 }
 
 type capabilityModelModalities struct {
@@ -59,8 +85,8 @@ type capabilityModelLimit struct {
 
 // Metadata carries the per-model capability fields surfaced through
 // /v1/models so consumers (harnesses like Pi or jcode) get real context
-// windows and feature flags from the catalog instead of guessing. It is
-// purely additive: routing does not depend on any of these fields.
+// windows and feature flags from the catalog instead of guessing. Routing only
+// reads Cost and ReasoningEfforts/InterleavedField; the rest is descriptive.
 type Metadata struct {
 	ContextWindow    int      `json:"context_window,omitempty"`
 	MaxInput         int      `json:"max_input,omitempty"`
@@ -70,6 +96,23 @@ type Metadata struct {
 	StructuredOutput bool     `json:"structured_output,omitempty"`
 	InputModalities  []string `json:"input_modalities,omitempty"`
 	OutputModalities []string `json:"output_modalities,omitempty"`
+	// ReasoningEfforts is the model's own effort ladder, in catalog order. An
+	// empty list means the model does not accept a named effort (toggle or
+	// budget-only models), which is different from an unknown model: requests
+	// must not be given a level the upstream would reject.
+	ReasoningEfforts []string `json:"reasoning_efforts,omitempty"`
+	// InterleavedField names the request field the model uses to replay
+	// reasoning on tool-call turns ("reasoning_content" in the current
+	// catalog). Empty means the model does not interleave.
+	InterleavedField string `json:"interleaved_field,omitempty"`
+	// InputCost and OutputCost are the published per-million-token prices.
+	// Rotation ranks models with them, so they must survive a catalog cache
+	// round trip; nil means the catalog did not price the model at all.
+	InputCost  *float64 `json:"input_cost,omitempty"`
+	OutputCost *float64 `json:"output_cost,omitempty"`
+	// ReleaseDate is the catalog's ISO release date. It breaks ties when two
+	// models share a price, so the newer flagship is preferred.
+	ReleaseDate string `json:"release_date,omitempty"`
 }
 
 func (m *capabilityModel) metadata() Metadata {
@@ -86,6 +129,17 @@ func (m *capabilityModel) metadata() Metadata {
 		md.ContextWindow = m.Limit.Context
 		md.MaxInput = m.Limit.Input
 		md.MaxOutput = m.Limit.Output
+	}
+	if m.Cost != nil {
+		md.InputCost, md.OutputCost = m.Cost.Input, m.Cost.Output
+	}
+	for _, option := range m.ReasoningOptions {
+		if option.Type == "effort" {
+			md.ReasoningEfforts = append(md.ReasoningEfforts, option.Values...)
+		}
+	}
+	if m.Interleaved != nil {
+		md.InterleavedField = m.Interleaved.Field
 	}
 	return md
 }

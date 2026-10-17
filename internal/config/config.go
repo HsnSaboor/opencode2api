@@ -23,8 +23,7 @@ type Config struct {
 	ZenKeys           []string                     `json:"zen_keys"`
 	GoKeys            []string                     `json:"go_keys"`
 	Anonymous         bool                         `json:"anonymous"`
-	Proxies           []string                     `json:"proxies"`
-	ProxyFile         string                       `json:"proxyfile"`
+	Egress            EgressConfig                 `json:"egress"`
 	Upstream          UpstreamConfig               `json:"upstream"`
 	Retry             RetryConfig                  `json:"retry"`
 	Models            ModelsConfig                 `json:"models"`
@@ -33,8 +32,6 @@ type Config struct {
 	WebUI             WebUIConfig                  `json:"webui"`
 	Prefer            Tier                         `json:"prefer"`
 	Reasoning         ReasoningConfig              `json:"reasoning"`
-
-	effectiveProxies []string
 }
 
 // ReasoningConfig forces a thinking level for requests that do not state one.
@@ -133,6 +130,7 @@ func Load(path string) (Config, error) {
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
+		Egress:      defaultEgress(),
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
 	}
@@ -157,8 +155,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
-	cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
-	if err := resolveProxyFiles(path, &cfg); err != nil {
+	cfg.Egress.withDefaults()
+	if err := cfg.Egress.validate(); err != nil {
 		return Config{}, err
 	}
 	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
@@ -227,20 +225,6 @@ func Normalize(path string, cfg Config) (Config, error) {
 			return Config{}, errors.New("webui.session_ttl_minutes must be between 5 and 10080")
 		}
 	}
-	for _, raw := range cfg.RuntimeProxies() {
-		if raw == "direct" {
-			continue
-		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" {
-			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return Config{}, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
-		}
-	}
 	for model, protocol := range cfg.Models.Protocols {
 		if model == "" || !wire.Valid(wire.Protocol(protocol)) {
 			return Config{}, fmt.Errorf("models.protocols contains invalid mapping %q: %q", model, protocol)
@@ -307,23 +291,45 @@ func (cfg Config) ForcedEffort(model string) string {
 	return cfg.Reasoning.Effort
 }
 
-// RuntimeProxies returns the resolved proxy list, including proxyfile entries.
-// Config.Proxies intentionally remains the list stored in config.json so a
-// save never duplicates values loaded from proxyfile.
-func (cfg Config) RuntimeProxies() []string {
-	if len(cfg.effectiveProxies) > 0 {
-		return cfg.effectiveProxies
+// EgressAddresses samples the configured source addresses in rotation.
+//
+// It is a method (rather than a package function) so callers read the
+// resolved pool off the Config they already hold. The sample is fresh per
+// process start, which keeps the egress set stable for the lifetime of one
+// gateway instance while still rotating it across restarts.
+//
+// Call-once: every call re-samples from crypto randomness, so each result is
+// a distinct pool. The single call site is gateway New, which feeds the
+// sampled slice to the shared transport pool. A second call would fork the
+// pool (lanes bound to addresses the transports never dialed), so do not
+// call this again for the same instance — thread the slice through instead.
+// Memoization was deliberately avoided: caching the sample on Config would
+// change Config copy semantics (Clone must still deep-copy plain fields,
+// and a lazy Once field would either share the sample across clones or
+// need explicit invalidation).
+func (cfg Config) EgressAddresses() []string {
+	size := cfg.Egress.PoolSize
+	if size < 1 {
+		size = defaultEgressPoolSize
 	}
-	if len(cfg.Proxies) > 0 {
-		return cfg.Proxies
+	prefixes := cfg.Egress.Prefixes
+	if len(prefixes) == 0 {
+		if !cfg.Egress.EnableIPv6 {
+			return []string{"direct"}
+		}
+		prefixes = []string{defaultEgressPrefix}
 	}
-	return []string{"direct"}
-}
-
-// PasswordForSave ensures resolved-only data is excluded. The method is kept
-// separate to make accidental persistence of effective proxy values obvious.
-func (cfg *Config) PasswordForSave() {
-	cfg.effectiveProxies = nil
+	addrs, err := resolveEgress(prefixes, size)
+	if err != nil {
+		// resolveEgress only fails when the configured prefixes cannot yield
+		// the pool, which Validate/Normalize already rejects. Keep the
+		// gateway startable in the impossible case with a loud direct lane.
+		return []string{"direct"}
+	}
+	if !cfg.Egress.EnableIPv6 {
+		return append([]string{"direct"}, addrs...)
+	}
+	return addrs
 }
 
 func Clone(cfg Config) Config {
@@ -337,8 +343,7 @@ func Clone(cfg Config) Config {
 	cfg.ServerKeyMetadata = metadata
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
-	cfg.Proxies = append([]string(nil), cfg.Proxies...)
-	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
+	cfg.Egress.Prefixes = append([]string(nil), cfg.Egress.Prefixes...)
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))
 		for key, value := range cfg.Models.Protocols {

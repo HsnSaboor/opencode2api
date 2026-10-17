@@ -112,8 +112,7 @@ type ConfigView struct {
 	ZenKeys     []SecretView             `json:"zen_keys"`
 	GoKeys      []SecretView             `json:"go_keys"`
 	Anonymous   bool                     `json:"anonymous"`
-	Proxies     []SecretView             `json:"proxies"`
-	ProxyFile   string                   `json:"proxyfile"`
+	Egress      EgressView               `json:"egress"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
 	Retry       config.RetryConfig       `json:"retry"`
 	Models      config.ModelsConfig      `json:"models"`
@@ -144,14 +143,22 @@ type SecretInput struct {
 	Value string `json:"value,omitempty"`
 }
 
+// EgressView exposes the egress rotation without sampling or leaking the
+// bound addresses: operators see which prefixes feed the pool and how large
+// the pool is, not the sampled literals.
+type EgressView struct {
+	EnableIPv6 bool     `json:"enable_ipv6"`
+	Prefixes   []string `json:"prefixes"`
+	PoolSize   int      `json:"pool_size"`
+}
+
 type ConfigUpdate struct {
 	Listen      string                   `json:"listen"`
 	ServerKeys  []SecretInput            `json:"server_keys"`
 	ZenKeys     []SecretInput            `json:"zen_keys"`
 	GoKeys      []SecretInput            `json:"go_keys"`
 	Anonymous   bool                     `json:"anonymous"`
-	Proxies     []SecretInput            `json:"proxies"`
-	ProxyFile   string                   `json:"proxyfile"`
+	Egress      config.EgressConfig      `json:"egress"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
 	Retry       config.RetryConfig       `json:"retry"`
 	Models      config.ModelsConfig      `json:"models"`
@@ -191,11 +198,6 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_go_keys", err.Error())
 		return
 	}
-	proxies, err := resolveSecrets(update.Proxies, current.Proxies)
-	if err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid_proxies", err.Error())
-		return
-	}
 	reasoning := current.Reasoning
 	if update.Reasoning != nil {
 		reasoning = *update.Reasoning
@@ -203,7 +205,7 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
-		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
+		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Egress: update.Egress,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
@@ -241,7 +243,7 @@ func (a *Server) handleReveal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("sensitive configuration revealed", "component", "auth", "event", "secrets_revealed", "client_ip", clientIP(r))
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxies": cfg.Proxies})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys})
 }
 
 func (a *Server) handleMonitor(w http.ResponseWriter, _ *http.Request) {
@@ -329,8 +331,8 @@ func (a *Server) configView() ConfigView {
 	cfg := a.manager.Config()
 	effective, restart := a.manager.RestartStatus()
 	return ConfigView{
-		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
-		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys), ZenKeys: maskSecrets(cfg.ZenKeys), GoKeys: maskSecrets(cfg.GoKeys), Anonymous: cfg.Anonymous,
+		Egress: EgressView{EnableIPv6: cfg.Egress.EnableIPv6, Prefixes: append([]string(nil), cfg.Egress.Prefixes...), PoolSize: cfg.Egress.PoolSize}, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
@@ -338,14 +340,10 @@ func (a *Server) configView() ConfigView {
 	}
 }
 
-func maskSecrets(values []string, proxy bool) []SecretView {
+func maskSecrets(values []string) []SecretView {
 	result := make([]SecretView, 0, len(values))
 	for _, value := range values {
-		display := config.MaskValue(value)
-		if proxy {
-			display = config.RedactURL(value)
-		}
-		result = append(result, SecretView{ID: config.Fingerprint(value), Display: display})
+		result = append(result, SecretView{ID: config.Fingerprint(value), Display: config.MaskValue(value)})
 	}
 	return result
 }
