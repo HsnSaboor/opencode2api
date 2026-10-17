@@ -255,7 +255,7 @@ Key 初始化时均衡分配到出口通道。真实流量可以触发通道检�
 | `upstream.zen`              | `https://opencode.ai/zen`。                                                           |
 | `upstream.go`               | `https://opencode.ai/zen/go`。                                                        |
 | `egress.enable_ipv6`        | `true`。                                                                              |
-| `egress.prefixes`           | `["2001:470:735f::/48"]`；最多 8 个 IPv6 CIDR。                                       |
+| `egress.prefixes`           | `["2001:470:7331::/48"]`；最多 8 个 IPv6 CIDR。                                       |
 | `egress.pool_size`          | `16`；轮换地址池大小，范围 1–128。                                                    |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                                     |
 | `models.protocols`          | `{}`；按模型 ID 覆盖原生协议。                                                        |

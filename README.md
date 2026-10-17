@@ -255,7 +255,7 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
 | `egress.enable_ipv6`        | `true`.                                                                     |
-| `egress.prefixes`           | `["2001:470:735f::/48"]`; up to 8 IPv6 CIDRs.                               |
+| `egress.prefixes`           | `["2001:470:7331::/48"]`; up to 8 IPv6 CIDRs.                               |
 | `egress.pool_size`          | `16`; range 1–128 source addresses in rotation.                             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |
 | `models.protocols`          | `{}`; per-model native protocol overrides.                                  |

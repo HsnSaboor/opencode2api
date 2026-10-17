@@ -6,7 +6,7 @@
   "anonymous": false,
   "egress": {
     "enable_ipv6": true,
-    "prefixes": ["2001:470:735f::/48"],
+    "prefixes": ["2001:470:7331::/48"],
     "pool_size": 100
   },
   "upstream": {
