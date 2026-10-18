@@ -491,6 +491,11 @@ func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	if md.MaxOutput == 0 {
 		md.MaxOutput = price.MaxOutput
 	}
+	// DeepSeek V4.1 Flash Free empirically accepts 1M (1,048,576) context tokens upstream
+	if model == "deepseek-v4.1-flash-free" {
+		md.ContextWindow = 1048576
+		md.MaxOutput = 384000
+	}
 	return md
 }
 
