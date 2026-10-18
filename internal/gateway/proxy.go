@@ -814,8 +814,7 @@ func (g *Gateway) probeProxyNode(ctx context.Context, node proxypool.Node) proxy
 	body, err := json.Marshal(map[string]any{
 		"model": model,
 		"messages": []any{
-			map[string]any{"role": "system", "content": proxyProbeTitlePrompt},
-			map[string]any{"role": "user", "content": proxyProbeUserPrompt},
+			map[string]any{"role": "user", "content": "ping"},
 		},
 		"max_tokens": 8,
 		"stream":     true,
