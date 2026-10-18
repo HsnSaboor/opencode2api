@@ -147,6 +147,7 @@ func (m *RuntimeManager) start(runtime *gatewayRuntime) {
 	runtimeCtx, cancel := context.WithCancel(m.root)
 	runtime.cancel = cancel
 	runtime.gateway.StartEgressHealthChecks(runtimeCtx)
+	runtime.gateway.StartProxyPlugins(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
 }
 
@@ -295,6 +296,23 @@ type ResourceSnapshot struct {
 	Egress    []EgressStatus                `json:"egress"`
 	Anonymous bool                          `json:"anonymous"`
 	Metadata  modelcatalog.MetadataSnapshot `json:"metadata"`
+	// Proxy reports the multiplexed proxy pool inventory; omitted when the
+	// pool is disabled.
+	Proxy *ProxyStatus `json:"proxy,omitempty"`
+}
+
+// ProxyStatus is the operator-facing view of the proxy pool: how many
+// profile nodes exist, how many the verification sweep has admitted, and how
+// many lanes currently rotate them.
+type ProxyStatus struct {
+	Nodes      int  `json:"nodes"`
+	Lanes      int  `json:"lanes"`
+	Verified   int  `json:"verified"`
+	Available  int  `json:"available"`
+	Cooling    int  `json:"cooling"`
+	Pending    int  `json:"pending"`
+	SocksPort  int  `json:"socks_port"`
+	SocksReady bool `json:"socks_ready"`
 }
 
 type KeyStatus struct {
@@ -314,6 +332,8 @@ type EgressStatus struct {
 	ZenKeys   int    `json:"zen_keys"`
 	GoKeys    int    `json:"go_keys"`
 	Anonymous bool   `json:"anonymous"`
+	// Proxy marks a multiplexed proxy lane whose address is "proxy:<node>".
+	Proxy bool `json:"proxy,omitempty"`
 	// ParkedUntil marks a FreeTier-parked lane with its expiry; CoolingUntil
 	// marks an anonymous failure backoff. Both omit when unset. A lane can
 	// report Healthy while parked — health is transport state, park/cool
@@ -351,7 +371,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		}
 	}
 	for _, egress := range gateway.transports.snapshot() {
-		status := EgressStatus{Index: egress.index, Address: config.RedactURL(egress.address), Healthy: egress.healthy.Load(), Checking: egress.checking.Load(), Anonymous: gateway.cfg.Anonymous}
+		status := EgressStatus{Index: egress.index, Address: config.RedactURL(egress.address), Healthy: egress.healthy.Load(), Checking: egress.checking.Load(), Anonymous: gateway.cfg.Anonymous, Proxy: egress.proxy != nil}
 		if until := egress.freitierUntil.Load(); until > time.Now().UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.ParkedUntil = &value
@@ -367,6 +387,19 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			status.GoKeys = goBindings[egress.index]
 		}
 		result.Egress = append(result.Egress, status)
+	}
+	if gateway.proxies != nil {
+		stats := gateway.proxies.stats()
+		result.Proxy = &ProxyStatus{
+			Nodes:      stats.Nodes,
+			Lanes:      gateway.transports.proxyLaneCount(),
+			Verified:   stats.Verified,
+			Available:  stats.Available,
+			Cooling:    stats.Cooling,
+			Pending:    stats.Pending,
+			SocksPort:  gateway.proxies.cfg.SocksPort,
+			SocksReady: gateway.proxies.mux.Ready(),
+		}
 	}
 	return result
 }

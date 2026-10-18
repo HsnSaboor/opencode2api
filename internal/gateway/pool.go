@@ -17,17 +17,24 @@ import (
 
 	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
+	"opencode2api/internal/proxypool"
 )
 
 // egressTransport is one upstream lane bound to a single source address. The
 // address is either "direct" (no explicit bind, kernel-chosen family),
 // "direct4" (no explicit bind, forced IPv4) or an IPv6 literal sampled from
 // the configured egress prefixes; every lane dials straight to the upstream,
-// so rotating lanes rotates the visible egress.
+// so rotating lanes rotates the visible egress. A proxy lane ("proxy:<node>")
+// instead dials the loopback SOCKS5 multiplexer as one profile node, so its
+// visible egress is that node's exit IP; apart from the dialer the lane is
+// identical — same selection, parks, health, and rotation.
 type egressTransport struct {
-	index    int
-	address  string
-	client   *http.Client
+	index   int
+	address string
+	client  *http.Client
+	// proxy marks a multiplexed proxy lane and carries its node binding.
+	// Set at construction and immutable afterwards.
+	proxy    *proxypool.Node
 	healthy  atomic.Bool
 	checking atomic.Bool
 	// freitierUntil parks a FreeTier-flagged exit while the upstream flag
@@ -56,6 +63,9 @@ type transportPool struct {
 	headerTimeout time.Duration
 	prefixes      []string
 	weights       map[string]int
+	// proxies hands out verified nodes for proxy lanes and is nil when the
+	// proxy pool is disabled. Set once at construction.
+	proxies *proxyManager
 	// prefixMu guards prefixStrikes/prefixCooling, which track FreeTier
 	// verdicts per configured prefix: a prefix whose lanes keep answering
 	// FreeTier is blocked upstream as a unit and leaves replenishment
@@ -71,10 +81,10 @@ type transportPool struct {
 }
 
 // maxPoolLanes caps the live lane count including dynamic replacements:
-// twice the sampled pool, clamped to the validated config ceiling. The
-// /48 holds 65535 usable /64s, so the cap is a memory/socket guard, not
-// address-space exhaustion.
-const maxPoolLanes = 256
+// twice the sampled pool, clamped to the validated config ceiling, plus
+// headroom for proxy lanes. The /48 holds 65535 usable /64s, so the cap is a
+// memory/socket guard, not address-space exhaustion.
+const maxPoolLanes = 512
 
 // anonymousPool gives the shared OpenCode "public" credential an independent
 // cooldown per egress address. Unlike key nodes, anonymous nodes are never
@@ -84,6 +94,9 @@ type anonymousPool struct {
 	nodes    []*anonymousNode
 	next     atomic.Uint64
 	cooldown time.Duration
+	// enabled mirrors the anonymous tier switch: when false the pool holds
+	// no nodes even though the lanes exist for key tiers.
+	enabled bool
 	// transports is the lane source new nodes draw from when the pool
 	// replenishes a parked lane. It aliases the gateway's shared pool.
 	transports *transportPool
@@ -175,7 +188,7 @@ func startForAffinity(next *atomic.Uint64, affinity string, size int) int {
 }
 
 func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Duration, prefixes []string) *anonymousPool {
-	pool := &anonymousPool{cooldown: cooldown, transports: transports, prefixes: append([]string(nil), prefixes...)}
+	pool := &anonymousPool{cooldown: cooldown, enabled: enabled, transports: transports, prefixes: append([]string(nil), prefixes...)}
 	if !enabled || transports == nil {
 		return pool
 	}
@@ -296,17 +309,34 @@ func (p *anonymousPool) replenishPrefixes() []string {
 
 // maybeReplenish appends one fresh node+lane when the pool is below cap. It
 // runs on the request path (a FreeTier park just fired), so sampling failure
-// is silent: the park still holds, and the next park retries regrowth.
+// is silent: the park still holds, and the next park retries regrowth. A
+// parked proxy lane draws its replacement from the verified node set instead
+// of sampling an IPv6 address.
 func (p *anonymousPool) maybeReplenish(parked *egressTransport) {
 	if p == nil || p.transports == nil {
 		return
 	}
-	prefixes := p.replenishPrefixes()
-	if len(prefixes) == 0 {
+	var lane *egressTransport
+	if parked != nil && parked.proxy != nil {
+		lane = p.transports.replenishProxyLane(parked)
+	} else {
+		prefixes := p.replenishPrefixes()
+		if len(prefixes) == 0 {
+			return
+		}
+		lane = p.transports.replenishLane(prefixes, parked)
+	}
+	if lane == nil {
 		return
 	}
-	lane := p.transports.replenishLane(prefixes, parked)
-	if lane == nil {
+	p.addNode(lane)
+}
+
+// addNode appends one lane to rotation. Called on the request path (a park
+// just fired) and by the proxy fill loop, so it is lock-guarded and does no
+// I/O.
+func (p *anonymousPool) addNode(lane *egressTransport) {
+	if p == nil || lane == nil || !p.enabled {
 		return
 	}
 	p.mu.Lock()
@@ -634,6 +664,104 @@ func (p *transportPool) replenishLane(prefixes []string, parked *egressTransport
 	}
 	p.items = append(p.items, egress)
 	return egress
+}
+
+// replenishProxyLane replaces a parked proxy lane with a fresh verified node
+// from the proxy manager. The parked lane's node stays bound to it (it comes
+// back when the park expires, and two lanes must never share one exit IP),
+// so the replacement is a genuinely new node. When none is verified ready
+// the manager is nudged to sweep; sampling failure is silent like the
+// address path, and the next park retries.
+func (p *transportPool) replenishProxyLane(parked *egressTransport) *egressTransport {
+	if p == nil || p.proxies == nil {
+		return nil
+	}
+	_ = parked
+	node, ok := p.proxies.take()
+	if !ok {
+		p.proxies.requestVerify()
+		return nil
+	}
+	lane, err := p.addProxyLane(node)
+	if err != nil {
+		p.proxies.release(node.Index)
+		return nil
+	}
+	return lane
+}
+
+// addProxyLane builds and appends one proxy lane under the replenish lock,
+// enforcing the shared lane cap so address and proxy growth cannot overshoot
+// it together.
+func (p *transportPool) addProxyLane(node proxypool.Node) (*egressTransport, error) {
+	if p == nil {
+		return nil, errors.New("no transport pool")
+	}
+	p.replenishMu.Lock()
+	defer p.replenishMu.Unlock()
+	if p.maxLanes > 0 && len(p.items) >= p.maxLanes {
+		return nil, fmt.Errorf("egress pool is at its %d lane cap", p.maxLanes)
+	}
+	lane, err := p.buildProxyLane(len(p.items), node)
+	if err != nil {
+		return nil, err
+	}
+	p.items = append(p.items, lane)
+	return lane, nil
+}
+
+// proxyLaneCount reports how many live lanes rotate proxy exits.
+func (p *transportPool) proxyLaneCount() int {
+	if p == nil {
+		return 0
+	}
+	count := 0
+	for _, egress := range p.snapshot() {
+		if egress.proxy != nil {
+			count++
+		}
+	}
+	return count
+}
+
+// buildProxyLane constructs one multiplexed proxy lane with the pool's
+// shared budgets, mirroring buildLane so proxy and address lanes stay
+// uniform. The dialer reaches the loopback SOCKS5 endpoint as the node's
+// user; the node's exit IP is what the upstream sees.
+func (p *transportPool) buildProxyLane(index int, node proxypool.Node) (*egressTransport, error) {
+	if p.proxies == nil {
+		return nil, errors.New("proxy pool is not configured")
+	}
+	lanes := max(len(p.items)+1, 1)
+	idle := max(p.perf.MaxIdleConns/lanes, 1)
+	idlePerHost := max(p.perf.MaxIdleConnsPerHost/lanes, 1)
+	maxPerHost := p.perf.MaxConnsPerHost
+	if maxPerHost > 0 {
+		maxPerHost = max(maxPerHost/lanes, 1)
+	}
+	dialer := &proxypool.Dialer{
+		Addr:     p.proxies.socksAddr(),
+		User:     node.User,
+		Password: proxypool.ProxyPassword,
+		Timeout:  time.Duration(p.perf.ConnectTimeoutSeconds) * time.Second,
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = idle
+	transport.MaxIdleConnsPerHost = idlePerHost
+	transport.MaxConnsPerHost = maxPerHost
+	transport.IdleConnTimeout = time.Duration(p.perf.IdleConnTimeoutSeconds) * time.Second
+	transport.ResponseHeaderTimeout = p.headerTimeout
+	transport.ForceAttemptHTTP2 = true
+	transport.DialContext = dialer.DialContext
+	nodeBinding := node
+	egress := &egressTransport{
+		index:   index,
+		address: fmt.Sprintf("proxy:%d", node.Index),
+		client:  &http.Client{Transport: transport},
+		proxy:   &nodeBinding,
+	}
+	egress.healthy.Store(true)
+	return egress, nil
 }
 
 // snapshot returns a point-in-time copy of the lane list for iteration.

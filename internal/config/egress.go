@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"math/big"
 	"net"
+	"path/filepath"
 	"strings"
 )
 
@@ -36,6 +37,39 @@ type EgressConfig struct {
 	PrefixWeights map[string]int `json:"prefix_weights,omitempty"`
 	// PoolSize is the number of source addresses held in rotation.
 	PoolSize int `json:"pool_size"`
+	// Proxies configures the optional sing-box multiplexed SOCKS5 exit
+	// pool: verified profile nodes join the same rotation as source
+	// addresses, one node per lane, with the same park/replenish behavior.
+	Proxies ProxyPoolConfig `json:"proxies,omitempty"`
+}
+
+// ProxyPoolConfig configures the sing-box multiplexed proxy exit pool. Every
+// profile node becomes one egress lane (its own exit IP); a verification
+// loop continuously tests candidate nodes against the upstream gate and only
+// admits nodes that pass, parking and replacing failures exactly like
+// source-address lanes.
+type ProxyPoolConfig struct {
+	// Enabled turns the proxy pool on. When false every other field is
+	// ignored and the gateway rotates source addresses only.
+	Enabled bool `json:"enabled,omitempty"`
+	// Profile is the path to a sing-box outbounds document, the "expanded"
+	// profile shape written by the zen-proxy verification pipeline.
+	Profile string `json:"profile,omitempty"`
+	// Count is the number of proxy lanes held in rotation. Candidates are
+	// verified continuously; the pool fills toward this count as nodes
+	// pass the gate.
+	Count int `json:"count,omitempty"`
+	// SocksPort is the loopback SOCKS5 port the multiplexer listens on.
+	SocksPort int `json:"socks_port,omitempty"`
+	// SingboxBinary is the sing-box executable path.
+	SingboxBinary string `json:"singbox_binary,omitempty"`
+	// LogLevel is sing-box's own log level.
+	LogLevel string `json:"log_level,omitempty"`
+	// StateFile persists verified/cooling node state across restarts.
+	// Defaults to "proxy-state.json" next to the profile.
+	StateFile string `json:"state_file,omitempty"`
+	// VerifyConcurrency bounds concurrent verification probes.
+	VerifyConcurrency int `json:"verify_concurrency,omitempty"`
 }
 
 const (
@@ -46,6 +80,15 @@ const (
 	// maxEgressPrefixWeight caps a single prefix's draw weight; the bound
 	// only keeps typos (e.g. a percentage slipped in as 8000) loud.
 	maxEgressPrefixWeight = 256
+	// Proxy pool bounds. The lane count shares maxPoolLanes with address
+	// lanes, so keep it well below that cap.
+	defaultProxyCount     = 64
+	maxProxyCount         = 256
+	defaultProxySocksPort = 20800
+	defaultProxyLogLevel  = "warn"
+	defaultProxyBinary    = "sing-box"
+	maxVerifyConcurrency  = 32
+	defaultVerifyWorkers  = 16
 )
 
 func defaultEgress() EgressConfig {
@@ -59,6 +102,23 @@ func (e *EgressConfig) withDefaults() {
 	if e.EnableIPv6 && len(e.Prefixes) == 0 {
 		e.Prefixes = []string{defaultEgressPrefix}
 	}
+	if e.Proxies.Enabled {
+		if e.Proxies.Count == 0 {
+			e.Proxies.Count = defaultProxyCount
+		}
+		if e.Proxies.SocksPort == 0 {
+			e.Proxies.SocksPort = defaultProxySocksPort
+		}
+		if e.Proxies.SingboxBinary == "" {
+			e.Proxies.SingboxBinary = defaultProxyBinary
+		}
+		if e.Proxies.LogLevel == "" {
+			e.Proxies.LogLevel = defaultProxyLogLevel
+		}
+		if e.Proxies.VerifyConcurrency == 0 {
+			e.Proxies.VerifyConcurrency = defaultVerifyWorkers
+		}
+	}
 }
 
 func (e EgressConfig) validate() error {
@@ -67,6 +127,9 @@ func (e EgressConfig) validate() error {
 	}
 	if e.IPv4Only && e.EnableIPv6 {
 		return errors.New("egress.ipv4_only requires egress.enable_ipv6 to be false")
+	}
+	if err := e.Proxies.validate(); err != nil {
+		return err
 	}
 	if !e.EnableIPv6 {
 		return nil
@@ -103,6 +166,38 @@ func (e EgressConfig) validate() error {
 		return fmt.Errorf("egress prefixes yield at most %s unique addresses, less than pool_size %d; widen the prefixes or lower egress.pool_size", capacity.String(), e.PoolSize)
 	}
 	return nil
+}
+
+// validate checks the proxy pool shape. It runs whether or not IPv6 lanes
+// are enabled: proxy lanes are independent of source-address sampling, so a
+// misconfigured pool must stay loud even in IPv4-only mode.
+func (p ProxyPoolConfig) validate() error {
+	if !p.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(p.Profile) == "" {
+		return errors.New("egress.proxies.profile is required when the proxy pool is enabled")
+	}
+	if p.Count < 1 || p.Count > maxProxyCount {
+		return fmt.Errorf("egress.proxies.count must be between 1 and %d", maxProxyCount)
+	}
+	if p.SocksPort < 1 || p.SocksPort > 65535 {
+		return errors.New("egress.proxies.socks_port must be a valid TCP port")
+	}
+	if p.VerifyConcurrency < 1 || p.VerifyConcurrency > maxVerifyConcurrency {
+		return fmt.Errorf("egress.proxies.verify_concurrency must be between 1 and %d", maxVerifyConcurrency)
+	}
+	return nil
+}
+
+// ResolveStateFile returns the proxy state file path: the configured
+// StateFile when set, otherwise "proxy-state.json" next to the profile so
+// state follows a moved profile without extra configuration.
+func (p ProxyPoolConfig) ResolveStateFile() string {
+	if trimmed := strings.TrimSpace(p.StateFile); trimmed != "" {
+		return trimmed
+	}
+	return filepath.Join(filepath.Dir(p.Profile), "proxy-state.json")
 }
 
 func parseEgressPrefix(raw string) (*net.IPNet, int, error) {

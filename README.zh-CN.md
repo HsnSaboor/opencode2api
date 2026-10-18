@@ -265,6 +265,13 @@ Key 初始化时均衡分配到出口通道。真实流量可以触发通道检�
 | `egress.prefixes`           | `["2001:470:7331::/48"]`；最多 8 个 IPv6 CIDR。                                       |
 | `egress.prefix_weights`     | `{}`；各前缀抽取权重（默认 1），按规范形式匹配；未配置的前缀条目不生效。              |
 | `egress.pool_size`          | `100`；轮换地址池大小，范围 1–128。                                                   |
+| `egress.proxies.enabled`    | `false`；将已验证的 sing-box 配置文件节点并入与地址通道相同的轮换池。                 |
+| `egress.proxies.profile`    | sing-box outbounds 文档路径；启用时必填。                                             |
+| `egress.proxies.count`      | `64`；保持在轮换中的代理通道数（1–256），与地址通道共享通道上限。                     |
+| `egress.proxies.socks_port` | `20800`；多路复用器监听的本地 SOCKS5 端口。                                          |
+| `egress.proxies.singbox_binary` | `sing-box`；多路复用器可执行文件路径，`log_level` 设置其日志级别（默认 `warn`）。  |
+| `egress.proxies.state_file` | 默认与 profile 同目录的 `proxy-state.json`；跨重启保存准入判定。                     |
+| `egress.proxies.verify_concurrency` | `16`；并发验证探测数（1–32）。                                                |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                                     |
 | `models.protocols`          | `{}`；按模型 ID 覆盖原生协议。                                                        |
 | `reasoning.effort`          | 空（关闭）；可选 `auto`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`none`。 |
@@ -301,6 +308,14 @@ WebUI 的配置中心也提供默认强度和按模型覆盖。管理 API 的 `G
 每条出口通道绑定一个采样的 IPv6 源地址（关闭 IPv6 轮换时使用 `direct`）。地址在进程启动时从配置前缀采样一次：`/48` 轮换整个 `/64` 子网并随机接口 ID，更宽的前缀均匀抽取主机位并保留网络地址。无法产出 `pool_size` 个唯一地址的前缀会在启动时被拒绝。`egress.prefix_weights` 调整各前缀的抽取比例（面对六个权重 1 的前缀时权重 24 大约占 80%），补充通道沿用同一权重，因此主/备比例在出口停用与补充中保持不变。
 
 设置 `egress.ipv4_only: true`（并关闭 `enable_ipv6`）时，地址池只有一条 `direct4` 通道：仍由内核选择源地址，但所有拨号强制使用 `tcp4`。这是有意为之——双栈通道会先经 IPv6 建立连接，而 TCP 层成功的连接不会回退到 IPv4，请求会静默落在被封禁的协议族上。将 `ipv4_only` 与 `enable_ipv6: true` 同时配置会在加载时被拒绝。
+
+### 代理出口（`egress.proxies`）
+
+`egress.proxies` 在地址轮换之外提供第二种相互独立的容量：把经过验证的 sing-box 配置文件节点（"expanded" outbounds 格式）并入同一个通道池。一个节点就是一条通道，其可见出口即该节点的出口 IP，与地址通道共享选择、FreeTier 停用、健康追踪、前缀记账与通道上限——请求路径无法区分两者。网关运行一个受监管的 sing-box 进程，把所有节点多路复用到一个本地 SOCKS5 端口（每个节点一个 `p<N>` 用户、共享密码 `p`），每条代理通道的传输层以对应节点身份拨号。
+
+准入以验证为门槛，因为多数公共节点无法通过免费层闸门：扫描循环以生产流量完全相同的请求形态（流式、匿名指纹、标题配置）经多路复用器探测候选节点，仅准予返回 2xx 的节点。`403 FreeTierError` 与在线流量的停用处理一致，传输失败短暂冷却，且重复失败的冷却时间逐级递增，因此对数千节点的扫描会自然收敛而不会持续冲击被封节点。已准入但未投入通道的节点组成热备池；当某条代理通道因线上流量的 `FreeTierError` 被停用时，下一个已验证节点立即替换它，被停用的通道在停用期满后重新加入轮换。判定结果按配置文件指纹持久化到 `state_file`，重启后直接以热通道恢复而无需重新扫描；当通道数与备用量均满足时扫描完全静默，不再发出任何闸门探测。
+
+配置文件读取失败会阻止启动——启用该池是显式声明，路径错误必须醒目报出。多路复用器启动失败时由监管协程按退避重试，地址通道继续服务，因此缺少 `sing-box` 二进制只会降级而不会致命。多路复用器生成的配置与日志位于 `state_file` 同级的 `multiplexer/` 目录。资源快照（`GET /api/resources`）返回 `proxy` 块，包含 `nodes`/`lanes`/`verified`/`available`/`cooling`/`pending` 计数与 `socks_ready`；代理通道在 `egress` 列表中标有 `"proxy": true`。
 
 ### 超时与连接池
 
@@ -469,6 +484,7 @@ npm run check:web
 | 模型列表为空                  | 检查配置的 Tier、匿名资格和原生协议是否受支持。        |
 | 请求返回 502 / 504            | 查看上游尝试、凭据、出口通道以及请求总超时和单次超时。 |
 | 所有通道均返回 `FreeTierError` | 上游可能对该 IPv6 段处于波动封锁中；出口停用/轮换与探测恢复会自动熬过——保留加权备用段，全部段同时被拒时改用 `egress.ipv4_only`。 |
+| 代理通道始终不出现 | 检查 `egress.proxies.enabled` 与 `profile` 是否可读（路径错误会阻止启动）；查看资源快照中的 `proxy` 块与 `state_file` 同级 `multiplexer/` 目录下的多路复用器日志。 |
 | HTTP 200 但生成失败           | 查看 SSE 错误事件和请求结果，不能只看 HTTP 状态。      |
 | `view_image` / 图片 `Read` 只返回 base64 | 工具结果中的图片会改走后续 user 消息；升级到包含该修复的版本，并为模型声明图片输入。 |
 | Docker 中宿主机配置修改不生效 | 当前配置在状态卷中；重新导入，或通过 WebUI 修改。      |

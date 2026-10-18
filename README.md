@@ -13,6 +13,7 @@ The executable includes the WebUI. Running the service requires no Node.js runti
 - Separate Zen and Go key pools, configurable tier preference, retries, and session affinity.
 - Optional anonymous Zen access with the OpenCode `public` credential.
 - IPv6 egress rotation: each lane binds its own source address sampled from configured /48 (or wider) prefixes, with a single-lane IPv4-only fallback for upstreams that reject IPv6.
+- Optional proxy egress (`egress.proxies`): verified sing-box profile nodes join the same rotation as address lanes — one exit IP per lane, continuous gate verification, warm reserve, park/rotate, and persisted verdicts.
 - Dynamic model discovery, native protocol metadata, and disk caches.
 - A separate management port with configuration editing, a Playground, diagnostics, token statistics, and live logs.
 - Configuration hot reload with validation before switching new requests to a replacement gateway.
@@ -265,6 +266,13 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `egress.prefixes`           | `["2001:470:7331::/48"]`; up to 8 IPv6 CIDRs.                               |
 | `egress.prefix_weights`     | `{}`; per-prefix draw weights (default 1), matched canonically; entries for unconfigured prefixes are inert. |
 | `egress.pool_size`          | `100`; range 1–128 source addresses in rotation.                            |
+| `egress.proxies.enabled`    | `false`; joins verified sing-box profile nodes to the same rotation as address lanes. |
+| `egress.proxies.profile`    | Path to a sing-box outbounds document; required when `enabled`.             |
+| `egress.proxies.count`      | `64`; proxy lanes held in rotation (1–256), sharing the lane cap with address lanes. |
+| `egress.proxies.socks_port` | `20800`; loopback SOCKS5 port the multiplexer listens on.                   |
+| `egress.proxies.singbox_binary` | `sing-box`; multiplexer executable path. `log_level` sets its log level (`warn`). |
+| `egress.proxies.state_file` | `proxy-state.json` next to the profile; persists admission verdicts across restarts. |
+| `egress.proxies.verify_concurrency` | `16`; concurrent verification probes (1–32).                       |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |
 | `models.protocols`          | `{}`; per-model native protocol overrides.                                  |
 | `reasoning.effort`          | Empty (off); `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`. |
@@ -306,6 +314,14 @@ value, while sending an empty object clears it.
 Each egress lane binds one sampled IPv6 source address (or `direct` when IPv6 rotation is disabled). Addresses are sampled once per process start from the configured prefixes: a `/48` rotates whole `/64` subnets with a random interface ID, wider prefixes draw uniform host bits with the network address reserved. Prefixes that cannot yield `pool_size` unique addresses are rejected at startup. `egress.prefix_weights` scales each prefix's share of draws — weight 24 against six weight-1 prefixes draws the first ~80% of the pool — and the same weighting steers replacement lanes, so the primary/reserve mix survives FreeTier parks.
 
 With `egress.ipv4_only: true` (and `enable_ipv6: false`) the pool holds one `direct4` lane instead: it still lets the kernel pick the source address, but every dial forces network `tcp4`. That is deliberate — a dual-stack lane would connect over IPv6 first, and a connection that succeeds at the TCP layer never falls back to IPv4, so requests would silently keep landing on the blocked family. Combining `ipv4_only` with `enable_ipv6: true` is rejected at load time.
+
+### Proxy exits (`egress.proxies`)
+
+`egress.proxies` adds a second, independent kind of capacity beside the address rotation: verified sing-box profile nodes (the "expanded" outbounds shape) joined to the same lane pool. One node is one lane whose visible egress is that node's exit IP, sharing selection, FreeTier parks, health tracking, prefix bookkeeping, and the lane cap with address lanes — the request path cannot tell the two apart. The gateway runs one supervised sing-box process that multiplexes every profile node on a loopback SOCKS5 port (one `p<N>` user per node, shared password `p`), and each proxy lane's transport dials through it as its node.
+
+Admission is verification-gated because most public nodes do not pass the free-tier gate: a sweep probes candidates through the multiplexer with the exact request shape production traffic uses — streaming, anonymous fingerprint, title profile — and admits only 2xx answers. `403 FreeTierError` cools the node like a park, transport failures cool briefly, and every cooldown backs off on repeated failures, so a sweep over thousands of nodes settles instead of hammering blocked ones. Admitted nodes beyond the active lanes form a warm reserve; when a proxy lane is parked by a `FreeTierError` on live traffic, the next verified node replaces it while the parked lane rejoins rotation when its park expires. Verdicts persist to `state_file` keyed by the profile's fingerprint, so a restart resumes with warm lanes instead of re-sweeping; while lanes and reserve are full, the sweep idles and sends no gate probes at all.
+
+A profile that cannot be read fails startup — enabling the pool is an explicit statement, so a broken path must be loud. A multiplexer that cannot start is retried with backoff by its supervisor while address lanes keep serving; a missing `sing-box` binary therefore degrades gracefully. The multiplexer's generated config and log live under `multiplexer/` beside `state_file`. The resource snapshot (`GET /api/resources`) reports a `proxy` block with `nodes`/`lanes`/`verified`/`available`/`cooling`/`pending` counts and `socks_ready`, and proxy lanes carry `"proxy": true` in the `egress` list.
 
 ### Timeouts and connection pools
 
@@ -474,6 +490,7 @@ npm run check:web
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
 | Requests return 502/504              | Inspect upstream attempts, credentials, egress lanes, and total/per-attempt timeouts.     |
 | `FreeTierError` from every lane      | The upstream may be flare-blocking that IPv6 range; park/rotate and prefix probation ride it out — keep a weighted reserve prefix, or `egress.ipv4_only` if every range is blocked at once. |
+| No proxy lanes appear                | Check `egress.proxies.enabled`, that `profile` reads (a bad path fails startup), and the `proxy` block in the resource snapshot; the multiplexer log sits under `multiplexer/` beside `state_file`. |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
 | `view_image` / image `Read` returns base64 | Tool-result images travel in a follow-up user message; update past the tool-result split fix and declare image input for the model. |
 | Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |

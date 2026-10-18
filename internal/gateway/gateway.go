@@ -38,6 +38,9 @@ type Gateway struct {
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
 	availability *models.AvailabilityStore
+	// proxies is nil unless the proxy pool is configured: it owns the
+	// candidate node set, verification state, and multiplexer process.
+	proxies *proxyManager
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
@@ -85,17 +88,33 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	}
 	catalog := models.NewCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
-	return &Gateway{
+	gateway := &Gateway{
 		cfg:        cfg,
 		rotation:   rotationManager,
 		logger:     logger,
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
-		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown, cfg.Egress.Prefixes),
 		catalog:    catalog,
 		monitor:    monitor,
-	}, nil
+	}
+	// The proxy pool is attached before the anonymous pool snapshots the
+	// lane list so seeded proxy lanes become anonymous nodes like any
+	// other; later admissions append via anonymousPool.addNode.
+	if cfg.Egress.Proxies.Enabled {
+		manager, proxyErr := newProxyManager(cfg.Egress.Proxies, logger)
+		if proxyErr != nil {
+			return nil, fmt.Errorf("proxy pool: %w", proxyErr)
+		}
+		gateway.proxies = manager
+		transports.proxies = manager
+		seeded := gateway.seedProxyLanes()
+		if logger != nil {
+			logger.Info("proxy pool ready", "component", "egress", "event", "proxy_pool_ready", "nodes", len(manager.profile.Nodes), "lanes", seeded, "count", manager.cfg.Count, "socks_port", manager.cfg.SocksPort, "state_file", manager.statePath)
+		}
+	}
+	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, cfg.Egress.Prefixes)
+	return gateway, nil
 }
 
 func (g *Gateway) Handler() http.Handler {

@@ -9,11 +9,26 @@
   // forced to IPv4 (tcp4): use it when the upstream answers 403 FreeTierError
   // to IPv6 traffic while accepting the same request over IPv4. It requires
   // enable_ipv6=false and ignores prefixes until rotation is re-enabled.
+  // The optional proxies block joins verified sing-box profile nodes to the
+  // same rotation as address lanes (one node = one exit IP, continuously
+  // re-verified against the upstream gate, parked and replaced like any
+  // other lane). It requires the sing-box binary on PATH; disabled by
+  // default, and profile/state paths are only read when enabled.
   "egress": {
     "enable_ipv6": true,
     "ipv4_only": false,
     "prefixes": ["2001:470:7331::/48", "2001:470:1f0b:cf4::/64"],
-    "pool_size": 100
+    "pool_size": 100,
+    "proxies": {
+      "enabled": false,
+      "profile": "/home/ubuntu/.local/share/o2a/proxies/expanded_verified.json",
+      "count": 64,
+      "socks_port": 20800,
+      "singbox_binary": "sing-box",
+      "log_level": "warn",
+      "state_file": "/home/ubuntu/.local/share/o2a/proxies/proxy-state.json",
+      "verify_concurrency": 16
+    }
   },
   "upstream": {
     "zen": "https://opencode.ai/inference",

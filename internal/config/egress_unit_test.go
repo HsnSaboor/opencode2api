@@ -168,3 +168,53 @@ func TestCloneCopiesPrefixWeights(t *testing.T) {
 		t.Fatalf("Clone aliased PrefixWeights (original = %d, want 24)", got)
 	}
 }
+
+// The proxy pool fills sensible defaults when enabled, resolves its state
+// file next to the profile by default, and rejects impossible shapes loudly;
+// a disabled pool stays inert no matter what the other fields hold.
+func TestProxyPoolDefaultsAndValidation(t *testing.T) {
+	cfg := EgressConfig{EnableIPv6: false, PoolSize: 4, Proxies: ProxyPoolConfig{Enabled: true, Profile: "/tmp/nodes.json"}}
+	cfg.withDefaults()
+	if cfg.Proxies.Count != defaultProxyCount || cfg.Proxies.SocksPort != defaultProxySocksPort ||
+		cfg.Proxies.SingboxBinary != defaultProxyBinary || cfg.Proxies.LogLevel != defaultProxyLogLevel ||
+		cfg.Proxies.VerifyConcurrency != defaultVerifyWorkers {
+		t.Fatalf("defaults = %+v", cfg.Proxies)
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate defaults: %v", err)
+	}
+	if got := cfg.Proxies.ResolveStateFile(); got != "/tmp/proxy-state.json" {
+		t.Fatalf("ResolveStateFile = %q, want /tmp/proxy-state.json", got)
+	}
+	explicit := cfg.Proxies
+	explicit.StateFile = "/var/lib/o2a/state.json"
+	if got := explicit.ResolveStateFile(); got != "/var/lib/o2a/state.json" {
+		t.Fatalf("ResolveStateFile = %q, want explicit path", got)
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*ProxyPoolConfig)
+		wantErr bool
+	}{
+		{"missing profile", func(p *ProxyPoolConfig) { p.Profile = "  " }, true},
+		{"zero count", func(p *ProxyPoolConfig) { p.Count = 0 }, true},
+		{"count over max", func(p *ProxyPoolConfig) { p.Count = maxProxyCount + 1 }, true},
+		{"port out of range", func(p *ProxyPoolConfig) { p.SocksPort = 70000 }, true},
+		{"zero workers", func(p *ProxyPoolConfig) { p.VerifyConcurrency = 0 }, true},
+		{"workers over max", func(p *ProxyPoolConfig) { p.VerifyConcurrency = maxVerifyConcurrency + 1 }, true},
+		{"valid", func(p *ProxyPoolConfig) {}, false},
+	}
+	for _, tc := range cases {
+		candidate := cfg
+		tc.mutate(&candidate.Proxies)
+		if err := candidate.validate(); (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, wantErr = %v", tc.name, err, tc.wantErr)
+		}
+	}
+
+	disabled := EgressConfig{EnableIPv6: false, PoolSize: 4, Proxies: ProxyPoolConfig{Count: 0, SocksPort: 70000}}
+	if err := disabled.validate(); err != nil {
+		t.Fatalf("disabled proxy pool must not validate fields: %v", err)
+	}
+}
