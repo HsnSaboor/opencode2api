@@ -22,6 +22,7 @@ type Config struct {
 	ServerKeyMetadata map[string]ServerKeyMetadata `json:"server_key_metadata,omitempty"`
 	ZenKeys           []string                     `json:"zen_keys"`
 	GoKeys            []string                     `json:"go_keys"`
+	Providers         []ProviderConfig             `json:"providers,omitempty"`
 	Anonymous         bool                         `json:"anonymous"`
 	Egress            EgressConfig                 `json:"egress"`
 	Upstream          UpstreamConfig               `json:"upstream"`
@@ -171,12 +172,15 @@ func Normalize(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
+	if err := normalizeProviders(&cfg); err != nil {
+		return Config{}, err
+	}
 	cfg.Egress.withDefaults()
 	if err := cfg.Egress.validate(); err != nil {
 		return Config{}, err
 	}
-	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
-		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
+	if !cfg.HasTier(cfg.Prefer) {
+		return Config{}, errors.New("prefer must name a configured tier: \"zen\", \"go\", or a provider")
 	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
@@ -195,8 +199,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.FirstEnabledServerKey() == "" {
 		return Config{}, errors.New("至少保留一个启用的 API Key")
 	}
-	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
+	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 && len(cfg.Providers) == 0 {
+		return Config{}, errors.New("zen_keys, go_keys, or providers must contain at least one upstream key unless anonymous is enabled")
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
@@ -365,6 +369,14 @@ func Clone(cfg Config) Config {
 	cfg.ServerKeyMetadata = metadata
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
+	if cfg.Providers != nil {
+		providers := make([]ProviderConfig, len(cfg.Providers))
+		for i, provider := range cfg.Providers {
+			provider.APIKeys = append([]string(nil), provider.APIKeys...)
+			providers[i] = provider
+		}
+		cfg.Providers = providers
+	}
 	cfg.Egress.Prefixes = append([]string(nil), cfg.Egress.Prefixes...)
 	if cfg.Egress.PrefixWeights != nil {
 		weights := make(map[string]int, len(cfg.Egress.PrefixWeights))

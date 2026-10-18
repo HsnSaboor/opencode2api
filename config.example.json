@@ -34,6 +34,23 @@
     "zen": "https://opencode.ai/inference",
     "go": "https://opencode.ai/inference/go"
   },
+  // providers adds OpenAI-compatible upstreams as extra routing tiers. Each
+  // provider name becomes a tier: its keys join the same rotation, node
+  // pools, and failover machinery as zen/go, and the models it advertises on
+  // GET /v1/models are served through the same HTTP endpoints. No other
+  // upstream field applies: the base URL is the OpenAI-compatible root and
+  // api_keys are tried in order. model_suffix appends a fixed suffix to every
+  // discovered model ID (tokenharbor's free routes are addressed as
+  // "mimo-v2.5:free"). A provider stays out of routing until its first
+  // successful model discovery.
+  "providers": [
+    {
+      "name": "tokenharbor",
+      "base_url": "https://tokenharbor.ai",
+      "model_suffix": ":free",
+      "api_keys": ["sk-replace-with-provider-key"]
+    }
+  ],
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 300

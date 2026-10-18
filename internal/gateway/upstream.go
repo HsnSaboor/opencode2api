@@ -224,7 +224,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	}
 
 	keyTiers := route.KeyTiers
-	if !route.Anonymous && len(keyTiers) == 0 && (route.Tier == config.TierZen || route.Tier == config.TierGo) {
+	if !route.Anonymous && len(keyTiers) == 0 && g.channel(route.Tier) != nil {
 		keyTiers = []config.Tier{route.Tier}
 	}
 	for _, tier := range keyTiers {
@@ -315,7 +315,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, route.Protocol, body, ids, anonymousZenKey)
+		req, err := newUpstreamRequest(ctx, g.channel(config.TierZen).upstream, true, route.Protocol, body, ids, anonymousZenKey)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -688,15 +688,18 @@ func (g *Gateway) dumpOutboundBodies(route models.Route, bodies map[config.Tier]
 	}
 }
 
-// shapeKeyBody forces key-tier free-model wire bodies onto the SSE transport
-// the free tier serves, mirroring the anonymous lane. Paid models keep their
-// original bodies. It reports whether the body changed so the gateway can
-// collapse the SSE stream a non-streaming client receives back.
-func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier) ([]byte, bool) {
-	if !g.catalog.IsFreeModel(route.ID) {
+// shapeKeyBody forces OpenCode key-tier free-model wire bodies onto the SSE
+// transport the free tier serves, mirroring the anonymous lane. Paid models
+// keep their original bodies. Provider channels are never shaped: the free
+// gate's profiles are an OpenCode contract, and a provider that happens to
+// name a model "free" must not inherit them. It reports whether the body
+// changed so the gateway can collapse the SSE stream a non-streaming client
+// receives back.
+func (g *Gateway) shapeKeyBody(channel *channel, body []byte, route models.Route) ([]byte, bool) {
+	if !channel.opencode || !g.catalog.IsFreeModel(route.ID) {
 		return body, false
 	}
-	shaped := shapeAnonymousBody(body, route.ProtocolFor(tier))
+	shaped := shapeAnonymousBody(body, route.ProtocolFor(channel.tier))
 	return shaped, !bytes.Equal(shaped, body)
 }
 
@@ -706,13 +709,11 @@ func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier
 // evict a lane, which is exactly what made a bad Playground request degrade
 // live traffic before.
 func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, override DebugKeyOverride, attemptOffset int) (*http.Response, error, int) {
-	nodes := g.zenNodes
-	baseURL := g.cfg.Upstream.Zen
-	if override.Tier == config.TierGo {
-		nodes = g.goNodes
-		baseURL = g.cfg.Upstream.Go
+	channel := g.channel(override.Tier)
+	if channel == nil {
+		return nil, fmt.Errorf("selected %s key tier is no longer configured", override.Tier), 0
 	}
-	node := nodes.NodeByID(override.KeyID)
+	node := channel.nodes.NodeByID(override.KeyID)
 	if node == nil {
 		return nil, fmt.Errorf("selected %s key is no longer configured", override.Tier), 0
 	}
@@ -720,13 +721,13 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", override.Tier), 0
 	}
-	if shaped, changed := g.shapeKeyBody(body, route, override.Tier); changed {
+	if shaped, changed := g.shapeKeyBody(channel, body, route); changed {
 		body = shaped
 		if meta := telemetry.MetaFromContext(ctx); meta != nil {
 			meta.Shaped = true
 		}
 	}
-	egress := nodes.Egress(node)
+	egress := channel.nodes.Egress(node)
 	if egress == nil {
 		return nil, errors.New("selected upstream key has no egress binding"), 0
 	}
@@ -736,7 +737,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	}
 	keyID := config.KeyDisplayID(node.key)
 	setRequestCredential(ctx, override.Tier, keyID, "key", false, egress)
-	req, err := newUpstreamRequest(ctx, baseURL, route.ProtocolFor(override.Tier), body, ids, node.key)
+	req, err := newUpstreamRequest(ctx, channel.upstream, channel.opencode, route.ProtocolFor(override.Tier), body, ids, node.key)
 	if err != nil {
 		return nil, err, 0
 	}
@@ -753,12 +754,11 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
-	nodes := g.zenNodes
-	baseURL := g.cfg.Upstream.Zen
-	if route.Tier == config.TierGo {
-		nodes = g.goNodes
-		baseURL = g.cfg.Upstream.Go
+	channel := g.channel(route.Tier)
+	if channel == nil {
+		return nil, fmt.Errorf("no %s tier is configured", route.Tier), 0
 	}
+	nodes := channel.nodes
 	cursor := nodes.CursorFor(ids.Session)
 	if nodes.Len() == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
@@ -768,7 +768,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
 	}
-	if shaped, changed := g.shapeKeyBody(body, route, route.Tier); changed {
+	if shaped, changed := g.shapeKeyBody(channel, body, route); changed {
 		body = shaped
 		if meta := telemetry.MetaFromContext(ctx); meta != nil {
 			meta.Shaped = true
@@ -798,7 +798,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
+		req, err := newUpstreamRequest(ctx, channel.upstream, channel.opencode, route.Protocol, body, ids, node.key)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -823,13 +823,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			}
 			break
 		}
-		g.observeKeyResult(ctx, nodes, node, egress, resp, err)
+		g.observeKeyResult(ctx, channel, node, egress, resp, err)
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, egress, resp, err, attemptDuration)
 		// Same 403 taxonomy as the anonymous loop: account blocks fail the
 		// tier fast, FreeTier flags park the lane, region blocks cool the
 		// /64. MarkFailure already cooled the lane via cooldownWorthy; the
-		// park/cool here is the additional exit-attributable signal.
-		if err == nil && resp.StatusCode == http.StatusForbidden {
+		// park/cool here is the additional exit-attributable signal. It is an
+		// OpenCode gate contract: provider verdicts never touch lane state.
+		if channel.opencode && err == nil && resp.StatusCode == http.StatusForbidden {
 			verdict := classifyForbidden(peekForbiddenSnippet(resp, 2048))
 			g.logger.Info("upstream returned 403", "component", "upstream", "event", "attempt_forbidden", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "verdict", string(verdict), "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
 			if verdict == forbiddenAccount {
@@ -874,18 +875,29 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 
 // Diagnostics use the same routing and transports as production, but must not
 // update cooldowns, health, or bindings, including after successful attempts.
-func (g *Gateway) observeKeyResult(ctx context.Context, nodes *nodePool, node *upstreamNode, egress *egressTransport, resp *http.Response, err error) {
+func (g *Gateway) observeKeyResult(ctx context.Context, channel *channel, node *upstreamNode, egress *egressTransport, resp *http.Response, err error) {
 	if isDiagnosticRequest(ctx) {
 		return
 	}
 	status := upstreamStatus(resp)
-	egressFailed := g.syncEgressResult(ctx, egress, status, err)
-	if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
-		nodes.MarkSuccess(node)
+	if !channel.opencode {
+		// A provider shares the egress lanes with OpenCode traffic but its
+		// verdicts describe the key, not the exit: cool the key, never the
+		// lane.
+		if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
+			channel.nodes.MarkSuccess(node)
+			return
+		}
+		channel.nodes.MarkFailure(node, resp, err)
 		return
 	}
-	if !egressFailed || nodes.Egress(node) == egress {
-		nodes.MarkFailure(node, resp, err)
+	egressFailed := g.syncEgressResult(ctx, egress, status, err)
+	if err == nil && status/100 == 2 || isNonRetryableClientResponse(resp, err) {
+		channel.nodes.MarkSuccess(node)
+		return
+	}
+	if !egressFailed || channel.nodes.Egress(node) == egress {
+		channel.nodes.MarkFailure(node, resp, err)
 	}
 }
 
@@ -980,8 +992,27 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 	})
 }
 
-func newUpstreamRequest(ctx context.Context, baseURL string, protocol wire.Protocol, body []byte, ids identity.RequestIDs, key string) (*http.Request, error) {
-	endpoint := strings.TrimRight(baseURL, "/") + wire.Path(protocol)
+// upstreamPath returns the protocol endpoint under an upstream base. OpenCode
+// inference bases use the vendor-scoped contract from wire.Path; providers
+// are plain OpenAI-compatible APIs that keep the /v1/* routes.
+func upstreamPath(protocol wire.Protocol, opencode bool) string {
+	if opencode {
+		return wire.Path(protocol)
+	}
+	switch protocol {
+	case wire.Responses:
+		return "/v1/responses"
+	case wire.Anthropic:
+		return "/v1/messages"
+	case wire.SystemOne:
+		return "/v1/systemone"
+	default:
+		return "/v1/chat/completions"
+	}
+}
+
+func newUpstreamRequest(ctx context.Context, upstream string, opencode bool, protocol wire.Protocol, body []byte, ids identity.RequestIDs, key string) (*http.Request, error) {
+	endpoint := strings.TrimRight(upstream, "/") + upstreamPath(protocol, opencode)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

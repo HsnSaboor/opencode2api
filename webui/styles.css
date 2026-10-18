@@ -636,6 +636,31 @@ textarea {
   font-weight: 900;
   padding: 0;
 }
+.provider-card {
+  border: 1px solid var(--line);
+  background: var(--paper2);
+  padding: 10px 12px;
+  margin: 8px 0;
+}
+.provider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.provider-head strong {
+  font:
+    700 10px ui-monospace,
+    monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #56635e;
+}
+.provider-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
 .actions {
   display: flex;
   justify-content: flex-end;

@@ -73,9 +73,9 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if !g.catalog.IsFreeModel(model) {
 		return probeResult{reason: "not_free"}
 	}
-	d := g.catalog.Diagnostic(model, wire.Chat, g.zenNodes.Len() > 0, false, g.cfg.Anonymous)
+	d := g.catalog.Diagnostic(model, wire.Chat, g.keyAvailability(), g.cfg.Anonymous)
 	protocol := d.NativeProtocols[config.TierZen]
-	if !d.AvailableZen || !g.catalog.Supported(model) {
+	if !d.Available[string(config.TierZen)] || !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
 	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: identity.ProjectID("")}
@@ -97,9 +97,10 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 			lanes = append(lanes, lane{anonymousZenKey, "anonymous", node.egress.client})
 		}
 	}
-	cursor := g.zenNodes.CursorFor(ids.Session)
+	zenChannel := g.channel(config.TierZen)
+	cursor := zenChannel.nodes.CursorFor(ids.Session)
 	if node := cursor.Next(); node != nil {
-		if egress := g.zenNodes.Egress(node); egress != nil {
+		if egress := zenChannel.nodes.Egress(node); egress != nil {
 			lanes = append(lanes, lane{node.key, "zen", egress.client})
 		}
 	}
@@ -163,7 +164,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, key,
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	ids.Request = identity.RandomID("req", 16)
-	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, protocol, b, ids, key)
+	req, err := newUpstreamRequest(ctx, g.channel(config.TierZen).upstream, true, protocol, b, ids, key)
 	if err != nil {
 		return probeResult{reason: "request_creation_error"}
 	}

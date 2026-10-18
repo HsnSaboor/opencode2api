@@ -167,28 +167,97 @@ function fillConfig(value) {
   $("#c-ring").value = value.logging.ring_size;
   $("#c-dump-bodies").checked = !!value.logging.dump_request_bodies;
   ["server_keys", "zen_keys", "go_keys"].forEach(renderChips);
+  renderProviders(value.providers || []);
   const notice = $("#restart-notice");
   if (value.restart_required_fields?.length) {
     notice.textContent = `已保存但尚未生效：${value.restart_required_fields.join(", ")}。当前 API ${value.effective.listen}、WebUI ${value.effective.webui_listen}。请重启进程。`;
     notice.classList.remove("hidden");
   } else notice.classList.add("hidden");
 }
+function secretChip(item) {
+  const chip = document.createElement("span"),
+    text = document.createElement("span"),
+    remove = document.createElement("button");
+  chip.className = "chip";
+  chip.dataset.id = item.id;
+  text.textContent = item.display;
+  remove.type = "button";
+  remove.title = "移除";
+  remove.textContent = "×";
+  remove.onclick = () => chip.remove();
+  chip.append(text, remove);
+  return chip;
+}
 function renderChips(name) {
   const host = $(`#${name}-chips`);
   host.replaceChildren();
-  (config[name] || []).forEach((item) => {
-    const chip = document.createElement("span"),
-      text = document.createElement("span"),
-      remove = document.createElement("button");
-    chip.className = "chip";
-    chip.dataset.id = item.id;
-    text.textContent = item.display;
-    remove.type = "button";
-    remove.title = "移除";
-    remove.textContent = "×";
-    remove.onclick = () => chip.remove();
-    chip.append(text, remove);
-    host.appendChild(chip);
+  (config[name] || []).forEach((item) => host.appendChild(secretChip(item)));
+}
+function providerField(label, className, value) {
+  const field = document.createElement("div"),
+    name = document.createElement("label"),
+    input = document.createElement("input");
+  field.className = "field";
+  name.textContent = label;
+  input.className = className;
+  input.value = value;
+  field.append(name, input);
+  return field;
+}
+function providerCard(provider) {
+  const card = document.createElement("div"),
+    head = document.createElement("div"),
+    title = document.createElement("strong"),
+    remove = document.createElement("button"),
+    grid = document.createElement("div"),
+    keys = document.createElement("div"),
+    keysLabel = document.createElement("label"),
+    chips = document.createElement("div"),
+    area = document.createElement("textarea");
+  card.className = "provider-card";
+  head.className = "provider-head";
+  title.textContent = "Provider";
+  remove.type = "button";
+  remove.className = "ghost";
+  remove.textContent = "移除";
+  remove.onclick = () => card.remove();
+  head.append(title, remove);
+  grid.className = "provider-grid";
+  grid.append(
+    providerField("名称（Tier）", "provider-name", provider.name || ""),
+    providerField("Base URL", "provider-url", provider.base_url || ""),
+    providerField("模型后缀（可选，如 :free）", "provider-suffix", provider.model_suffix || ""),
+  );
+  keys.className = "field";
+  keysLabel.textContent = "API Keys";
+  chips.className = "chips provider-keys-chips";
+  (provider.api_keys || []).forEach((item) => chips.appendChild(secretChip(item)));
+  area.className = "provider-keys-new";
+  area.placeholder = "每行新增一个 key";
+  keys.append(keysLabel, chips, area);
+  card.append(head, grid, keys);
+  return card;
+}
+function renderProviders(providers) {
+  const host = $("#providers-list");
+  host.replaceChildren();
+  providers.forEach((provider) => host.appendChild(providerCard(provider)));
+}
+function providerInputs() {
+  return [...$("#providers-list").children].map((card) => {
+    const kept = [...card.querySelectorAll(".provider-keys-chips .chip")].map((node) => ({ id: node.dataset.id }));
+    const added = card
+      .querySelector(".provider-keys-new")
+      .value.split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((value) => ({ value }));
+    return {
+      name: card.querySelector(".provider-name").value.trim(),
+      base_url: card.querySelector(".provider-url").value.trim(),
+      model_suffix: card.querySelector(".provider-suffix").value.trim(),
+      api_keys: kept.concat(added),
+    };
   });
 }
 function secretInputs(name) {
@@ -201,6 +270,7 @@ function secretInputs(name) {
   return kept.concat(added);
 }
 const number = (id) => Number($(id).value);
+$("#provider-add").onclick = () => $("#providers-list").appendChild(providerCard({}));
 $("#config-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -209,6 +279,7 @@ $("#config-form").addEventListener("submit", async (event) => {
       server_keys: secretInputs("server_keys"),
       zen_keys: secretInputs("zen_keys"),
       go_keys: secretInputs("go_keys"),
+      providers: providerInputs(),
       anonymous: $("#c-anonymous").checked,
       egress: {
         enable_ipv6: $("#c-egress-v6").checked,
@@ -341,7 +412,10 @@ function renderResources(resources) {
           ? ["冷却中", "warn"]
           : ["正常", "ok"];
     appendCell(row, state[0], `status ${state[1]}`);
-    appendCell(row, `Z ${lane.zen_keys} · G ${lane.go_keys} · A ${lane.anonymous ? "开" : "关"}`);
+    const bound = Object.entries(lane.keys || {})
+      .map(([tier, count]) => `${tier} ${count}`)
+      .join(" · ");
+    appendCell(row, `${bound ? bound + " · " : ""}A ${lane.anonymous ? "开" : "关"}`);
     lanes.appendChild(row);
   });
   if (!lanes.children.length) emptyRow(lanes, 3);
@@ -409,8 +483,9 @@ function renderGuide() {
     ["配置本地 Key", "客户端使用 Server Key 访问 Gateway。", (config.server_keys || []).length > 0],
     [
       "选择上游通道",
-      "至少有 Zen / Go Key，或启用匿名通道。",
-      (config.zen_keys || []).length + (config.go_keys || []).length > 0 || config.anonymous,
+      "至少有 Zen / Go / Provider Key，或启用匿名通道。",
+      (config.zen_keys || []).length + (config.go_keys || []).length + (config.providers || []).length > 0 ||
+        config.anonymous,
     ],
     [
       "检查出口通道",
@@ -527,14 +602,10 @@ function renderPlayKeys() {
   auto.textContent = "自动路由（匿名 / Tier 回退 / Key 轮询）";
   select.appendChild(auto);
   const keys = debugData?.keys || {};
-  [
-    ["zen", "Zen Keys"],
-    ["go", "Go Keys"],
-  ].forEach(([tier, label]) => {
-    const items = keys[tier] || [];
+  Object.entries(keys).forEach(([tier, items]) => {
     if (!items.length) return;
     const group = document.createElement("optgroup");
-    group.label = label;
+    group.label = `${tier} Keys`;
     items.forEach((item) => {
       const option = document.createElement("option");
       option.value = `${tier}:${item.id}`;
@@ -1173,7 +1244,7 @@ $("#api-key-form").onsubmit = async (event) => {
     // Offer a rotation alias first: it is the gateway's stable abstraction and
     // keeps working as the catalog changes. Fall back to the first model the Go
     // tier serves, then the first catalog model. Nothing is hardcoded.
-    const goModels = (debugData?.models || []).filter((item) => item.available_go);
+    const goModels = (debugData?.models || []).filter((item) => item.available_tiers?.go);
     const allModels = debugData?.models || [];
     const model =
       (debugData?.aliases || [])[0] || goModels[0]?.model || allModels[0]?.model || "YOUR_MODEL";

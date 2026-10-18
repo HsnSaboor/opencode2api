@@ -22,22 +22,20 @@ type healthResponse struct {
 }
 
 type healthModels struct {
-	Status            string     `json:"status"`
-	Total             int        `json:"total"`
-	Exposed           int        `json:"exposed"`
-	Zen               int        `json:"zen"`
-	Go                int        `json:"go"`
-	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
-	StaleAfterSeconds int        `json:"stale_after_seconds"`
-	CacheSource       string     `json:"cache_source,omitempty"`
-	Stale             bool       `json:"stale"`
+	Status            string         `json:"status"`
+	Total             int            `json:"total"`
+	Exposed           int            `json:"exposed"`
+	Tiers             map[string]int `json:"tiers"`
+	LastRefresh       *time.Time     `json:"last_refresh,omitempty"`
+	StaleAfterSeconds int            `json:"stale_after_seconds"`
+	CacheSource       string         `json:"cache_source,omitempty"`
+	Stale             bool           `json:"stale"`
 }
 
 type healthKeys struct {
-	Zen       int  `json:"zen"`
-	Go        int  `json:"go"`
-	Total     int  `json:"total"`
-	Anonymous bool `json:"anonymous"`
+	Tiers     map[string]int `json:"tiers"`
+	Total     int            `json:"total"`
+	Anonymous bool           `json:"anonymous"`
 }
 
 type healthEgress struct {
@@ -55,7 +53,12 @@ type healthEgress struct {
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, models := g.availableModels()
 	egressTotal, egressHealthy, egressParked, egressCooling, egressSelectable := g.egressStatus()
-	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
+	keyCounts := make(map[string]int, len(g.channels))
+	totalKeys := 0
+	for tier, channel := range g.channels {
+		keyCounts[string(tier)] = channel.nodes.Len()
+		totalKeys += channel.nodes.Len()
+	}
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
 	modelStatus := "ready"
@@ -75,7 +78,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			issues = append(issues, "model_catalog_stale")
 		}
 	}
-	if zenKeys+goKeys == 0 && !g.cfg.Anonymous {
+	if totalKeys == 0 && !g.cfg.Anonymous {
 		issues = append(issues, "no_upstream_keys")
 	}
 	if egressHealthy == 0 {
@@ -114,14 +117,13 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Status:            modelStatus,
 			Total:             models.Total,
 			Exposed:           models.Exposed,
-			Zen:               models.Zen,
-			Go:                models.Go,
+			Tiers:             models.Tiers,
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
+		Keys: healthKeys{Tiers: keyCounts, Total: totalKeys, Anonymous: g.cfg.Anonymous},
 		Egress: healthEgress{
 			Total:     egressTotal,
 			Healthy:   egressHealthy,
@@ -156,7 +158,7 @@ func (g *Gateway) egressStatus() (total, healthy, parked, cooling, selectable in
 }
 
 func (g *Gateway) availableModels() ([]modelcatalog.Route, modelcatalog.CatalogSnapshot) {
-	return g.catalog.AvailableModels(g.zenNodes.Len() > 0, g.goNodes.Len() > 0, g.cfg.Anonymous)
+	return g.catalog.AvailableModels(g.keyAvailability(), g.cfg.Anonymous)
 }
 
 func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -168,8 +170,14 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		// Tier-scoped metadata: the advertised context window must match
 		// the tier that will serve the request (anonymous ⇒ Zen).
 		md := g.catalog.MetadataForTier(model, route.Tier)
+		// Provider models are owned by their provider; the built-in OpenCode
+		// channels keep the historical "opencode" owner.
+		ownedBy := "opencode"
+		if channel := g.channel(route.Tier); channel != nil && !channel.opencode {
+			ownedBy = string(route.Tier)
+		}
 		entry := map[string]any{
-			"id": model, "object": "model", "created": now, "owned_by": "opencode",
+			"id": model, "object": "model", "created": now, "owned_by": ownedBy,
 			"metadata":        md,
 			"native_protocol": route.Protocol,
 		}
@@ -203,12 +211,12 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		data = append(data, entry)
 	}
 	for _, group := range g.rotation.Snapshot().Groups {
-		if g.goNodes.Len() == 0 {
+		if g.channel(config.TierGo).nodes.Len() == 0 {
 			continue
 		}
 		available := false
 		for _, model := range group.Order {
-			if route, err := g.catalog.RouteForTier(model, config.TierGo, false, true); err == nil && route.Protocol != wire.SystemOne {
+			if route, err := g.catalog.RouteForTier(model, config.TierGo, g.keyAvailability()); err == nil && route.Protocol != wire.SystemOne {
 				available = true
 				break
 			}

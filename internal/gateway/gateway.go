@@ -28,13 +28,31 @@ const maxRequestBody = 32 << 20
 
 const anonymousZenKey = "public"
 
+// channel is one authenticated upstream family: a base URL with its own key
+// pool and wire dialect. Zen and Go are the built-in OpenCode channels; every
+// configured provider is one more channel under its own name.
+type channel struct {
+	tier     config.Tier
+	upstream string
+	// opencode marks an OpenCode inference upstream: vendor-scoped protocol
+	// paths, the free-tier request shaping, and egress verdicts shared with
+	// the anonymous lane. Provider channels are plain OpenAI-compatible APIs
+	// that reuse the same pool machinery without the gate semantics.
+	opencode bool
+	// suffix is appended to every discovered model ID before it enters the
+	// catalog, so a provider whose free routes carry a name suffix is
+	// addressable by the exact ID its upstream accepts.
+	suffix string
+	nodes  *nodePool
+}
+
 type Gateway struct {
 	rotation     *rotation.Manager
 	cfg          config.Config
 	logger       *slog.Logger
 	transports   *transportPool
-	zenNodes     *nodePool
-	goNodes      *nodePool
+	channels     map[config.Tier]*channel
+	order        []config.Tier
 	anonymous    *anonymousPool
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
@@ -92,23 +110,30 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		logger.Info("egress pool warmed", "component", "egress", "event", "egress_pool_warmed", "warmed", warmed, "total", len(results))
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := newNodePool(cfg.ZenKeys, transports, cooldown)
-	if err != nil {
-		return nil, fmt.Errorf("zen node pool: %w", err)
+	tiers := cfg.Tiers()
+	channels := make(map[config.Tier]*channel, len(tiers))
+	for _, tier := range tiers {
+		nodes, err := newNodePool(cfg.TierKeys(tier), transports, cooldown)
+		if err != nil {
+			return nil, fmt.Errorf("%s node pool: %w", tier, err)
+		}
+		channels[tier] = &channel{
+			tier:     tier,
+			upstream: cfg.TierUpstream(tier),
+			opencode: tier == config.TierZen || tier == config.TierGo,
+			suffix:   cfg.TierModelSuffix(tier),
+			nodes:    nodes,
+		}
 	}
-	goNodes, err := newNodePool(cfg.GoKeys, transports, cooldown)
-	if err != nil {
-		return nil, fmt.Errorf("go node pool: %w", err)
-	}
-	catalog := models.NewCatalog(cfg.Prefer, cfg.Models.Protocols)
+	catalog := models.NewCatalog(cfg.Prefer, tiers, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	gateway := &Gateway{
 		cfg:        cfg,
 		rotation:   rotationManager,
 		logger:     logger,
 		transports: transports,
-		zenNodes:   zenNodes,
-		goNodes:    goNodes,
+		channels:   channels,
+		order:      tiers,
 		catalog:    catalog,
 		monitor:    monitor,
 	}
@@ -129,6 +154,35 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 	}
 	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, prefixes)
 	return gateway, nil
+}
+
+// channel returns the authenticated channel for one tier, or nil when the
+// tier is not configured.
+func (g *Gateway) channel(tier config.Tier) *channel {
+	return g.channels[tier]
+}
+
+// orderedChannels returns every channel in configuration order (zen, go,
+// then providers).
+func (g *Gateway) orderedChannels() []*channel {
+	channels := make([]*channel, 0, len(g.order))
+	for _, tier := range g.order {
+		if channel := g.channels[tier]; channel != nil {
+			channels = append(channels, channel)
+		}
+	}
+	return channels
+}
+
+// keyAvailability reports which tiers hold at least one key. It is the single
+// routing input for tier selection, so a tier's eligibility always matches
+// the pool that would serve it.
+func (g *Gateway) keyAvailability() map[config.Tier]bool {
+	availability := make(map[config.Tier]bool, len(g.channels))
+	for tier, channel := range g.channels {
+		availability[tier] = channel.nodes.Len() > 0
+	}
+	return availability
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -200,11 +254,11 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 			return
 		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+		route, err := g.catalog.Route(model, g.keyAvailability(), g.cfg.Anonymous)
 		if override, selected := debugKeyOverrideFrom(r.Context()); selected {
 			// A per-key diagnostic must not silently be served by another key,
 			// another tier or the anonymous lane.
-			route, err = g.catalog.RouteForTier(model, override.Tier, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0)
+			route, err = g.catalog.RouteForTier(model, override.Tier, g.keyAvailability())
 		}
 		if err != nil {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
@@ -361,7 +415,7 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 		return
 	}
-	route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+	route, err := g.catalog.Route(model, g.keyAvailability(), g.cfg.Anonymous)
 	if err != nil {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 		return
@@ -450,7 +504,7 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 	tiers := make([]config.Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[config.Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier config.Tier) {
-		if tier != config.TierZen && tier != config.TierGo || seen[tier] {
+		if _, known := g.channels[tier]; !known || seen[tier] {
 			return
 		}
 		seen[tier] = true

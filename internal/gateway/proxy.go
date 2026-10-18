@@ -837,7 +837,7 @@ func (g *Gateway) probeProxyNode(ctx context.Context, node proxypool.Node) proxy
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, proxyProbeTimeout)
 	defer cancel()
-	req, err := newUpstreamRequest(probeCtx, g.cfg.Upstream.Zen, wire.Chat, body, ids, anonymousZenKey)
+	req, err := newUpstreamRequest(probeCtx, g.channel(config.TierZen).upstream, true, wire.Chat, body, ids, anonymousZenKey)
 	if err != nil {
 		return proxyOutcomeInconclusive
 	}

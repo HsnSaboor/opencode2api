@@ -74,33 +74,38 @@ func (g *Gateway) verifyEgressAfterError(ctx context.Context, egress *egressTran
 	}()
 }
 
-func (g *Gateway) rebindFailedEgress(egress *egressTransport) (zenMoved, goMoved int) {
+func (g *Gateway) rebindFailedEgress(egress *egressTransport) (moved int) {
 	if egress == nil {
-		return 0, 0
+		return 0
 	}
 	wasHealthy := egress.healthy.Swap(false)
 	return g.rebindUnavailableEgress(egress, wasHealthy)
 }
 
-func (g *Gateway) rebindUnavailableEgress(egress *egressTransport, wasHealthy bool) (zenMoved, goMoved int) {
-	zenMoved = g.zenNodes.RebindEgress(egress.index)
-	goMoved = g.goNodes.RebindEgress(egress.index)
-	if wasHealthy || zenMoved+goMoved > 0 {
-		g.logger.Warn("egress lane became unavailable", "component", "egress", "event", "egress_unavailable", "egress", config.RedactURL(egress.address), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+// rebindUnavailableEgress moves every key bound to a lane off it, across all
+// channels: a dead egress lane carries no tier's keys, so the whole pool
+// reacts once.
+func (g *Gateway) rebindUnavailableEgress(egress *egressTransport, wasHealthy bool) (moved int) {
+	for _, channel := range g.channels {
+		moved += channel.nodes.RebindEgress(egress.index)
 	}
-	return zenMoved, goMoved
+	if wasHealthy || moved > 0 {
+		g.logger.Warn("egress lane became unavailable", "component", "egress", "event", "egress_unavailable", "egress", config.RedactURL(egress.address), "keys_moved", moved)
+	}
+	return moved
 }
 
-func (g *Gateway) restoreEgress(egress *egressTransport) (zenMoved, goMoved int) {
+func (g *Gateway) restoreEgress(egress *egressTransport) (moved int) {
 	if egress == nil {
-		return 0, 0
+		return 0
 	}
-	zenMoved = g.zenNodes.RestoreEgress(egress.index)
-	goMoved = g.goNodes.RestoreEgress(egress.index)
-	if zenMoved+goMoved > 0 {
-		g.logger.Info("egress connectivity restored", "component", "egress", "event", "egress_restored", "egress", config.RedactURL(egress.address), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+	for _, channel := range g.channels {
+		moved += channel.nodes.RestoreEgress(egress.index)
 	}
-	return zenMoved, goMoved
+	if moved > 0 {
+		g.logger.Info("egress connectivity restored", "component", "egress", "event", "egress_restored", "egress", config.RedactURL(egress.address), "keys_moved", moved)
+	}
+	return moved
 }
 
 func (g *Gateway) StartEgressHealthChecks(ctx context.Context) {
@@ -137,9 +142,9 @@ func (g *Gateway) applyEgressHealthResult(result egressHealthResult, source stri
 		return
 	}
 	if g.transports.hasHealthy() {
-		zenMoved, goMoved := g.rebindUnavailableEgress(result.egress, result.wasHealthy)
-		if result.wasHealthy || zenMoved+goMoved > 0 {
-			g.logger.Warn("egress health check failed", "component", "egress", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "egress", config.RedactURL(result.egress.address), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
+		moved := g.rebindUnavailableEgress(result.egress, result.wasHealthy)
+		if result.wasHealthy || moved > 0 {
+			g.logger.Warn("egress health check failed", "component", "egress", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "egress", config.RedactURL(result.egress.address), "keys_moved", moved, "error", result.err)
 			return
 		}
 	}
@@ -241,7 +246,7 @@ func (g *Gateway) probeCoolingPrefix(ctx context.Context, prefix, model string) 
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, prefixProbationTimeout)
 	defer cancel()
-	req, err := newUpstreamRequest(probeCtx, g.cfg.Upstream.Zen, wire.Chat, body, ids, anonymousZenKey)
+	req, err := newUpstreamRequest(probeCtx, g.channel(config.TierZen).upstream, true, wire.Chat, body, ids, anonymousZenKey)
 	if err != nil {
 		return
 	}
@@ -269,13 +274,22 @@ func (g *Gateway) probeCoolingPrefix(ctx context.Context, prefix, model string) 
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	g.startPrefixProbation(ctx)
 	refresh := func() {
-		var zen, goModels []string
+		channels := g.orderedChannels()
+		modelLists := make([][]string, len(channels))
 		var capabilities modelcatalog.Capabilities
 		var capabilitiesErr error
 		var wg sync.WaitGroup
-		wg.Add(3)
-		go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
-		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
+		wg.Add(len(channels) + 1)
+		for i, ch := range channels {
+			go func(i int, ch *channel) {
+				defer wg.Done()
+				if ch.tier == config.TierZen {
+					modelLists[i] = g.refreshZen(ctx)
+					return
+				}
+				modelLists[i] = g.refreshTier(ctx, ch)
+			}(i, ch)
+		}
 		go func() {
 			defer wg.Done()
 			capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -289,16 +303,50 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 		if capabilitiesErr != nil {
 			g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "error", capabilitiesErr)
 		}
-		if zen != nil || goModels != nil {
-			g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
-			g.syncRotation()
-			if ctx.Err() == nil {
-				if err := g.catalog.SaveCache(); err != nil {
-					g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "error", err)
+		models := make(map[config.Tier][]string, len(channels))
+		providerProtocols := make(map[config.Tier]map[string]wire.Protocol, len(channels))
+		for i, channel := range channels {
+			if modelLists[i] == nil {
+				continue
+			}
+			listed := modelLists[i]
+			installed := listed
+			if channel.suffix != "" {
+				installed = make([]string, 0, len(listed))
+				for _, model := range listed {
+					installed = append(installed, model+channel.suffix)
 				}
 			}
-			g.logger.Info("model catalog refreshed", "component", "models", "event", "catalog_refreshed", "models", len(g.catalog.List()))
+			models[channel.tier] = installed
+			if !channel.opencode {
+				// A provider's wire shape is known without a capability
+				// catalog: every model it advertises is Chat-native.
+				protocols := make(map[string]wire.Protocol, len(installed))
+				for _, model := range installed {
+					protocols[model] = wire.Chat
+				}
+				providerProtocols[channel.tier] = protocols
+			}
 		}
+		if len(models) == 0 {
+			return
+		}
+		if len(providerProtocols) > 0 {
+			if capabilities.Protocols == nil {
+				capabilities.Protocols = map[config.Tier]map[string]wire.Protocol{}
+			}
+			for tier, protocols := range providerProtocols {
+				capabilities.Protocols[tier] = protocols
+			}
+		}
+		g.catalog.ReplaceWithCapabilities(models, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+		g.syncRotation()
+		if ctx.Err() == nil {
+			if err := g.catalog.SaveCache(); err != nil {
+				g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "error", err)
+			}
+		}
+		g.logger.Info("model catalog refreshed", "component", "models", "event", "catalog_refreshed", "models", len(g.catalog.List()))
 	}
 	go func() {
 		refresh()
@@ -338,13 +386,14 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog
 }
 
 func (g *Gateway) refreshZen(ctx context.Context) []string {
-	if models := g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes); models != nil {
+	channel := g.channel(config.TierZen)
+	if models := g.refreshTier(ctx, channel); models != nil {
 		return models
 	}
 	if !g.cfg.Anonymous {
 		return nil
 	}
-	return g.refreshAnonymousTier(ctx, g.cfg.Upstream.Zen)
+	return g.refreshAnonymousTier(ctx, channel.upstream)
 }
 
 func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []string {
@@ -370,7 +419,12 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 	return nil
 }
 
-func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool) []string {
+// refreshTier discovers one authenticated channel's model list through its
+// own key pool. OpenCode channels report egress verdicts from the refresh
+// call; provider channels leave lane health to OpenCode traffic and only cool
+// the key that failed.
+func (g *Gateway) refreshTier(ctx context.Context, channel *channel) []string {
+	nodes := channel.nodes
 	cursor := nodes.Cursor()
 	for attempt := 0; attempt < g.cfg.Retry.MaxAttempts; attempt++ {
 		node := cursor.Next()
@@ -383,16 +437,18 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool)
 			cancel()
 			return nil
 		}
-		models, status, err := modelcatalog.FetchModels(refreshCtx, egress.client, base, node.key)
-		g.syncEgressResult(refreshCtx, egress, status, err)
+		models, status, err := modelcatalog.FetchModels(refreshCtx, egress.client, channel.upstream, node.key)
+		if channel.opencode {
+			g.syncEgressResult(refreshCtx, egress, status, err)
+		}
 		cancel()
 		if err == nil {
 			nodes.MarkSuccess(node)
 			return models
 		}
 		nodes.MarkFailure(node, nil, err)
-		g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt+1, "error", err)
+		g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "tier", channel.tier, "upstream", config.RedactURL(channel.upstream), "attempt", attempt+1, "error", err)
 	}
-	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", config.RedactURL(base))
+	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "tier", channel.tier, "upstream", config.RedactURL(channel.upstream))
 	return nil
 }

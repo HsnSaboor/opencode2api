@@ -17,15 +17,16 @@ import (
 	wire "opencode2api/internal/protocol"
 )
 
-const modelCatalogCacheSchemaVersion = 3
+const modelCatalogCacheSchemaVersion = 4
 
 var modelCatalogCacheWriteMu sync.Mutex
 
 type modelCatalogCache struct {
-	SchemaVersion   int                                      `json:"schema_version"`
-	UpdatedAt       time.Time                                `json:"updated_at"`
-	Zen             []string                                 `json:"zen"`
-	Go              []string                                 `json:"go"`
+	SchemaVersion int       `json:"schema_version"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	// Tiers maps every tier (zen, go, and each provider by name) to the model
+	// IDs its upstream reported.
+	Tiers           map[config.Tier][]string                 `json:"tiers"`
 	NativeProtocols map[config.Tier]map[string]wire.Protocol `json:"native_protocols"`
 	Unsupported     map[config.Tier]map[string]bool          `json:"unsupported"`
 	Metadata        map[config.Tier]map[string]Metadata      `json:"metadata,omitempty"`
@@ -39,9 +40,18 @@ func (c *Catalog) LoadCache(path string) error {
 	if err != nil {
 		return err
 	}
+	advertised := newTierSets(c.order)
+	for tier, ids := range cache.Tiers {
+		target, known := advertised[tier]
+		if !known {
+			continue
+		}
+		for _, model := range ids {
+			target[model] = true
+		}
+	}
 	c.mu.Lock()
-	c.zen = toSet(cache.Zen)
-	c.goModels = toSet(cache.Go)
+	c.advertised = advertised
 	c.nativeProtocols = cloneTierProtocols(cache.NativeProtocols)
 	c.unsupported = cloneTierBools(cache.Unsupported)
 	c.modelMeta = cloneModelMeta(cache.Metadata)
@@ -61,11 +71,14 @@ func (c *Catalog) LoadCache(path string) error {
 func (c *Catalog) SaveCache() error {
 	c.mu.RLock()
 	path := c.cachePath
+	tiers := make(map[config.Tier][]string, len(c.order))
+	for _, tier := range c.order {
+		tiers[tier] = sortedSetKeys(c.advertised[tier])
+	}
 	cache := modelCatalogCache{
 		SchemaVersion:   modelCatalogCacheSchemaVersion,
 		UpdatedAt:       c.updatedAt.UTC(),
-		Zen:             sortedSetKeys(c.zen),
-		Go:              sortedSetKeys(c.goModels),
+		Tiers:           tiers,
 		NativeProtocols: cloneTierProtocols(c.nativeProtocols),
 		Unsupported:     cloneTierBools(c.unsupported),
 		Metadata:        cloneModelMeta(c.modelMeta),
@@ -111,11 +124,19 @@ func loadModelCatalogCache(path string) (modelCatalogCache, error) {
 	if cache.UpdatedAt.IsZero() {
 		return modelCatalogCache{}, errors.New("model catalog cache is missing updated_at")
 	}
-	cache.Zen = normalizeModelIDs(cache.Zen)
-	cache.Go = normalizeModelIDs(cache.Go)
-	if len(cache.Zen) == 0 && len(cache.Go) == 0 {
+	normalized := make(map[config.Tier][]string, len(cache.Tiers))
+	total := 0
+	for tier, ids := range cache.Tiers {
+		if strings.TrimSpace(string(tier)) == "" {
+			return modelCatalogCache{}, errors.New("model catalog cache contains an empty tier name")
+		}
+		normalized[tier] = normalizeModelIDs(ids)
+		total += len(normalized[tier])
+	}
+	if total == 0 {
 		return modelCatalogCache{}, errors.New("model catalog cache is empty")
 	}
+	cache.Tiers = normalized
 	if err := validateCatalogCapabilities(cache.NativeProtocols, cache.Unsupported); err != nil {
 		return modelCatalogCache{}, err
 	}
@@ -145,8 +166,8 @@ func normalizeModelIDs(items []string) []string {
 
 func validateCatalogCapabilities(native map[config.Tier]map[string]wire.Protocol, unsupported map[config.Tier]map[string]bool) error {
 	for tier, protocols := range native {
-		if tier != config.TierZen && tier != config.TierGo {
-			return fmt.Errorf("model catalog cache contains unknown tier %q", tier)
+		if strings.TrimSpace(string(tier)) == "" {
+			return errors.New("model catalog cache contains an empty tier name")
 		}
 		for model, protocol := range protocols {
 			if model == "" || !wire.Valid(protocol) {
@@ -155,8 +176,8 @@ func validateCatalogCapabilities(native map[config.Tier]map[string]wire.Protocol
 		}
 	}
 	for tier, models := range unsupported {
-		if tier != config.TierZen && tier != config.TierGo {
-			return fmt.Errorf("model catalog cache contains unknown tier %q", tier)
+		if strings.TrimSpace(string(tier)) == "" {
+			return errors.New("model catalog cache contains an empty tier name")
 		}
 		for model := range models {
 			if strings.TrimSpace(model) == "" {

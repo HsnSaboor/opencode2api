@@ -44,7 +44,7 @@ func (g *Gateway) rotationMembership() rotation.Membership {
 	}
 	candidates := make([]candidate, 0, len(models))
 	for _, model := range models {
-		route, err := g.catalog.RouteForTier(model, config.TierGo, false, g.goNodes.Len() > 0)
+		route, err := g.catalog.RouteForTier(model, config.TierGo, g.keyAvailability())
 		if err != nil || route.Protocol == wire.SystemOne {
 			continue
 		}
@@ -110,7 +110,7 @@ func (m *RuntimeManager) RotationAliases() []string {
 	aliases := make([]string, 0, len(snapshot.Groups))
 	for _, group := range snapshot.Groups {
 		for _, model := range group.Order {
-			if route, err := runtime.gateway.catalog.RouteForTier(model, config.TierGo, false, runtime.gateway.goNodes.Len() > 0); err == nil && route.Protocol != wire.SystemOne {
+			if route, err := runtime.gateway.catalog.RouteForTier(model, config.TierGo, runtime.gateway.keyAvailability()); err == nil && route.Protocol != wire.SystemOne {
 				aliases = append(aliases, group.Alias)
 				break
 			}
@@ -212,7 +212,7 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 			break
 		}
 		visited[token.Model] = true
-		route, err := g.catalog.RouteForTier(token.Model, config.TierGo, false, g.goNodes.Len() > 0)
+		route, err := g.catalog.RouteForTier(token.Model, config.TierGo, g.keyAvailability())
 		if err != nil {
 			continue
 		}
@@ -312,8 +312,9 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		result.reason = "request_conversion_error"
 		return result
 	}
-	body, shaped := g.shapeKeyBody(bodies[config.TierGo], route, config.TierGo)
-	cursor := g.goNodes.CursorFor(ids.Session)
+	goChannel := g.channel(config.TierGo)
+	body, shaped := g.shapeKeyBody(goChannel, bodies[config.TierGo], route)
+	cursor := goChannel.nodes.CursorFor(ids.Session)
 	var node *upstreamNode
 	// Each group attempt is exactly one HTTP call. Key selection may change,
 	// but there is no nested retry, stale-reasoning replay, or model-wide key ban.
@@ -324,12 +325,12 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		result.err = errors.New("no Go key")
 		return result
 	}
-	egress := g.goNodes.Egress(node)
+	egress := goChannel.nodes.Egress(node)
 	if egress == nil {
 		result.err = errors.New("no egress lane")
 		return result
 	}
-	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Go, route.Protocol, body, ids, node.key)
+	req, err := newUpstreamRequest(ctx, goChannel.upstream, goChannel.opencode, route.Protocol, body, ids, node.key)
 	if err != nil {
 		result.err = err
 		return result

@@ -2,7 +2,6 @@
 package models
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -31,27 +30,34 @@ type Route struct {
 }
 
 type RouteDiagnostic struct {
-	Model                string                        `json:"model"`
-	RequestedProtocol    wire.Protocol                 `json:"requested_protocol,omitempty"`
-	NativeProtocol       wire.Protocol                 `json:"native_protocol"`
-	NativeProtocols      map[config.Tier]wire.Protocol `json:"native_protocols,omitempty"`
-	ProtocolSource       string                        `json:"protocol_source"`
-	AvailableZen         bool                          `json:"available_zen"`
-	AvailableGo          bool                          `json:"available_go"`
-	Tier                 config.Tier                   `json:"tier,omitempty"`
-	Anonymous            bool                          `json:"anonymous"`
-	KeyID                string                        `json:"key_id,omitempty"`
-	Channel              string                        `json:"channel,omitempty"`
-	Attempts             int                           `json:"attempts,omitempty"`
-	KeyTiers             []config.Tier                 `json:"key_tiers,omitempty"`
-	AnonymousEligibility AnonymousDecision             `json:"anonymous_eligibility"`
-	RouteError           string                        `json:"route_error,omitempty"`
+	Model             string                        `json:"model"`
+	RequestedProtocol wire.Protocol                 `json:"requested_protocol,omitempty"`
+	NativeProtocol    wire.Protocol                 `json:"native_protocol"`
+	NativeProtocols   map[config.Tier]wire.Protocol `json:"native_protocols,omitempty"`
+	ProtocolSource    string                        `json:"protocol_source"`
+	// Available reports, per configured tier, whether that tier advertises the
+	// model. Zen and Go keep their historical JSON keys ("zen"/"go"); provider
+	// tiers appear under their own names.
+	Available            map[string]bool   `json:"available_tiers"`
+	Tier                 config.Tier       `json:"tier,omitempty"`
+	Anonymous            bool              `json:"anonymous"`
+	KeyID                string            `json:"key_id,omitempty"`
+	Channel              string            `json:"channel,omitempty"`
+	Attempts             int               `json:"attempts,omitempty"`
+	KeyTiers             []config.Tier     `json:"key_tiers,omitempty"`
+	AnonymousEligibility AnonymousDecision `json:"anonymous_eligibility"`
+	RouteError           string            `json:"route_error,omitempty"`
 }
 
 type Catalog struct {
-	mu        sync.RWMutex
-	zen       map[string]bool
-	goModels  map[string]bool
+	mu sync.RWMutex
+	// advertised maps every tier to the model IDs its upstream reported. The
+	// built-in tiers are keyed by TierZen/TierGo; each provider uses its own
+	// name as the tier key.
+	advertised map[config.Tier]map[string]bool
+	// order is the canonical tier order (zen, go, then providers). Routing
+	// consults it whenever several tiers serve the same model.
+	order     []config.Tier
 	protocols map[string]wire.Protocol
 	// nativeProtocols is populated from OpenCode's public model capability
 	// catalog. protocols remains the user-configured override map.
@@ -69,26 +75,54 @@ type Catalog struct {
 }
 
 type CatalogSnapshot struct {
-	Zen         int       `json:"zen"`
-	Go          int       `json:"go"`
-	Total       int       `json:"total"`
-	Exposed     int       `json:"exposed"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
-	CacheSource string    `json:"cache_source,omitempty"`
-	Stale       bool      `json:"stale"`
+	Tiers       map[string]int `json:"tiers"`
+	Total       int            `json:"total"`
+	Exposed     int            `json:"exposed"`
+	UpdatedAt   time.Time      `json:"updated_at,omitempty"`
+	CacheSource string         `json:"cache_source,omitempty"`
+	Stale       bool           `json:"stale"`
 }
 
-func NewCatalog(prefer config.Tier, overrides map[string]string) *Catalog {
+func NewCatalog(prefer config.Tier, tiers []config.Tier, overrides map[string]string) *Catalog {
 	protocols := make(map[string]wire.Protocol, len(overrides))
 	for model, protocol := range overrides {
 		protocols[model] = wire.Protocol(protocol)
 	}
+	order := append([]config.Tier(nil), tiers...)
 	return &Catalog{
-		zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols,
-		nativeProtocols: map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}},
-		unsupported:     map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}}, prefer: prefer,
-		cacheSource: "none",
+		advertised:      newTierSets(order),
+		order:           order,
+		protocols:       protocols,
+		nativeProtocols: newTierMaps[wire.Protocol](order),
+		unsupported:     newTierMaps[bool](order),
+		prefer:          prefer,
+		cacheSource:     "none",
 	}
+}
+
+// newTierSets builds one empty model set per tier.
+func newTierSets(tiers []config.Tier) map[config.Tier]map[string]bool {
+	sets := make(map[config.Tier]map[string]bool, len(tiers))
+	for _, tier := range tiers {
+		sets[tier] = map[string]bool{}
+	}
+	return sets
+}
+
+// newTierMaps builds one empty per-tier value map per tier.
+func newTierMaps[V any](tiers []config.Tier) map[config.Tier]map[string]V {
+	maps := make(map[config.Tier]map[string]V, len(tiers))
+	for _, tier := range tiers {
+		maps[tier] = map[string]V{}
+	}
+	return maps
+}
+
+// TierList reports the configured tier order, including tiers that never
+// advertised a model (a configured provider is a tier from construction on,
+// so its pool, status and key diagnostics exist before first discovery).
+func (c *Catalog) TierList() []config.Tier {
+	return append([]config.Tier(nil), c.order...)
 }
 
 // SetPricingStore connects routing decisions to the shared pricing metadata.
@@ -127,31 +161,36 @@ func (c *Catalog) SetRefreshInterval(interval time.Duration) {
 	c.mu.Unlock()
 }
 
-func (c *Catalog) Replace(zen, goModels []string) {
-	c.ReplaceWithCapabilities(zen, goModels, nil, nil, nil)
-}
-
-func (c *Catalog) ReplaceWithCapabilities(zen, goModels []string, native map[config.Tier]map[string]wire.Protocol, unsupported map[config.Tier]map[string]bool, metadata map[config.Tier]map[string]Metadata) {
+// ReplaceWithCapabilities installs one discovery round. models holds the
+// per-tier model lists just discovered; a nil list keeps that tier's previous
+// models, so one provider's failed refresh cannot blank its catalog. native,
+// unsupported, and metadata follow the same optional update rule.
+func (c *Catalog) ReplaceWithCapabilities(models map[config.Tier][]string, native map[config.Tier]map[string]wire.Protocol, unsupported map[config.Tier]map[string]bool, metadata map[config.Tier]map[string]Metadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if zen != nil {
-		c.zen = toSet(zen)
-	}
-	if goModels != nil {
-		c.goModels = toSet(goModels)
+	for tier, ids := range models {
+		if ids == nil {
+			continue
+		}
+		if _, known := c.advertised[tier]; !known {
+			continue
+		}
+		c.advertised[tier] = toSet(ids)
 	}
 	if native != nil {
-		for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-			if protocols, ok := native[tier]; ok {
-				c.nativeProtocols[tier] = cloneProtocols(protocols)
+		for tier, protocols := range native {
+			if _, known := c.nativeProtocols[tier]; !known {
+				continue
 			}
+			c.nativeProtocols[tier] = cloneProtocols(protocols)
 		}
 	}
 	if unsupported != nil {
-		for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-			if models, ok := unsupported[tier]; ok {
-				c.unsupported[tier] = cloneBools(models)
+		for tier, values := range unsupported {
+			if _, known := c.unsupported[tier]; !known {
+				continue
 			}
+			c.unsupported[tier] = cloneBools(values)
 		}
 	}
 	if metadata != nil {
@@ -167,22 +206,30 @@ func (c *Catalog) CopyState(source *Catalog) {
 		return
 	}
 	source.mu.RLock()
-	zen := make(map[string]bool, len(source.zen))
-	goModels := make(map[string]bool, len(source.goModels))
-	for model, available := range source.zen {
-		zen[model] = available
-	}
-	for model, available := range source.goModels {
-		goModels[model] = available
-	}
-	native := map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}}
-	unsupported := map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}}
-	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-		for model, protocol := range source.nativeProtocols[tier] {
-			native[tier][model] = protocol
+	advertised := newTierSets(c.order)
+	for tier, ids := range source.advertised {
+		target, known := advertised[tier]
+		if !known {
+			continue
 		}
-		for model, value := range source.unsupported[tier] {
-			unsupported[tier][model] = value
+		for model, available := range ids {
+			target[model] = available
+		}
+	}
+	native := newTierMaps[wire.Protocol](c.order)
+	unsupported := newTierMaps[bool](c.order)
+	for tier, protocols := range source.nativeProtocols {
+		if target, known := native[tier]; known {
+			for model, protocol := range protocols {
+				target[model] = protocol
+			}
+		}
+	}
+	for tier, values := range source.unsupported {
+		if target, known := unsupported[tier]; known {
+			for model, value := range values {
+				target[model] = value
+			}
 		}
 	}
 	meta := cloneModelMeta(source.modelMeta)
@@ -191,29 +238,29 @@ func (c *Catalog) CopyState(source *Catalog) {
 	stale := source.stale
 	source.mu.RUnlock()
 	c.mu.Lock()
-	c.zen, c.goModels, c.nativeProtocols, c.unsupported, c.updatedAt = zen, goModels, native, unsupported, updatedAt
+	c.advertised, c.nativeProtocols, c.unsupported, c.updatedAt = advertised, native, unsupported, updatedAt
 	c.modelMeta = meta
 	c.cacheSource, c.stale = cacheSource, stale
 	c.mu.Unlock()
 }
 
-func (c *Catalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (Route, error) {
+func (c *Catalog) Route(model string, hasKeys map[config.Tier]bool, hasAnonymous bool) (Route, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.routeLocked(model, hasZenKeys, hasGoKeys, hasAnonymous)
+	return c.routeLocked(model, hasKeys, hasAnonymous)
 }
 
-func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (Route, error) {
+func (c *Catalog) routeLocked(model string, hasKeys map[config.Tier]bool, hasAnonymous bool) (Route, error) {
 	if c.availability != nil && c.availability.Disabled(model) {
 		return Route{}, fmt.Errorf("model %q is disabled after a failed availability check; restore it in the WebUI or wait for the next probe", model)
 	}
-	keyTiers := c.keyTierOrderLocked(model, hasZenKeys, hasGoKeys)
+	keyTiers := c.keyTierOrderLocked(model, hasKeys)
 	// OpenCode's public credential is a Zen-only lane. Every free model starts
 	// there, even if the current catalog only advertises it on Go: an upstream
 	// rejection will move the request into the authenticated fallback plan.
 	decision := c.anonymousDecision(model)
 	if hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model]) {
+		(c.zenGoPendingLocked() || c.advertised[config.TierZen][model] || c.advertised[config.TierGo][model]) {
 		protocols := c.protocolsForLocked(model, keyTiers, true)
 		return Route{ID: model, Tier: config.TierZen, Protocol: protocols[config.TierZen], Protocols: protocols, Anonymous: true, KeyTiers: keyTiers}, nil
 	}
@@ -221,7 +268,21 @@ func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous 
 		protocols := c.protocolsForLocked(model, keyTiers, false)
 		return Route{ID: model, Tier: keyTiers[0], Protocol: protocols[keyTiers[0]], Protocols: protocols, KeyTiers: keyTiers}, nil
 	}
-	return Route{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+	return Route{}, fmt.Errorf("model %q is not served by any configured tier", model)
+}
+
+// tierPendingLocked reports whether a tier has not reported a model list yet.
+// Before a tier's first successful discovery nothing can contradict it, which
+// keeps that tier's keys usable through a transient refresh failure.
+func (c *Catalog) tierPendingLocked(tier config.Tier) bool {
+	return len(c.advertised[tier]) == 0
+}
+
+// zenGoPendingLocked reports whether neither OpenCode channel has reported a
+// model list yet. Anonymous eligibility counts Zen and Go only: the public
+// lane dials Zen, so provider discovery must never widen it.
+func (c *Catalog) zenGoPendingLocked() bool {
+	return len(c.advertised[config.TierZen]) == 0 && len(c.advertised[config.TierGo]) == 0
 }
 
 func (r Route) ProtocolFor(tier config.Tier) wire.Protocol {
@@ -255,25 +316,24 @@ func (c *Catalog) protocolForLocked(model string, tier config.Tier) wire.Protoco
 	return wire.Chat
 }
 
-// keyTierOrderLocked builds an authenticated route in prefer order. A tier is
-// included only when it has a key and advertises the model. Before the first
-// successful catalog refresh, configured key pools remain usable so temporary
-// discovery failures do not take the gateway offline.
-func (c *Catalog) keyTierOrderLocked(model string, hasZenKeys, hasGoKeys bool) []config.Tier {
-	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
+// keyTierOrderLocked builds an authenticated route in prefer order: the
+// preferred tier first, then every other configured tier in canonical order.
+// A tier is included only when it has a key and serves the model. Before a
+// tier's first successful catalog refresh it stays usable, so temporary
+// discovery failures do not take that tier offline.
+func (c *Catalog) keyTierOrderLocked(model string, hasKeys map[config.Tier]bool) []config.Tier {
 	available := func(tier config.Tier) bool {
-		switch tier {
-		case config.TierZen:
-			return hasZenKeys && (catalogPending || c.zen[model]) && c.tierSupportedLocked(model, config.TierZen)
-		case config.TierGo:
-			return hasGoKeys && (catalogPending || c.goModels[model]) && c.tierSupportedLocked(model, config.TierGo)
-		default:
-			return false
-		}
+		pending := c.tierPendingLocked(tier)
+		return hasKeys[tier] && (pending || c.advertised[tier][model]) && c.tierSupportedLocked(model, tier)
 	}
-	order := []config.Tier{config.TierZen, config.TierGo}
-	if c.prefer == config.TierGo {
-		order[0], order[1] = order[1], order[0]
+	order := make([]config.Tier, 0, len(c.order))
+	if c.prefer != "" {
+		order = append(order, c.prefer)
+	}
+	for _, tier := range c.order {
+		if tier != c.prefer {
+			order = append(order, tier)
+		}
 	}
 	result := make([]config.Tier, 0, len(order))
 	for _, tier := range order {
@@ -288,15 +348,8 @@ func (c *Catalog) keyTierOrderLocked(model string, hasZenKeys, hasGoKeys bool) [
 // per-key diagnostics. It never selects the anonymous lane and never adds a
 // fallback tier: the operator asked to exercise one configured key, so the
 // result describes that key and nothing else.
-func (c *Catalog) RouteForTier(model string, tier config.Tier, hasZenKeys, hasGoKeys bool) (Route, error) {
-	if tier != config.TierZen && tier != config.TierGo {
-		return Route{}, errors.New("selected key tier must be zen or go")
-	}
-	hasKeys := hasZenKeys
-	if tier == config.TierGo {
-		hasKeys = hasGoKeys
-	}
-	if !hasKeys {
+func (c *Catalog) RouteForTier(model string, tier config.Tier, hasKeys map[config.Tier]bool) (Route, error) {
+	if !hasKeys[tier] {
 		return Route{}, fmt.Errorf("no %s key is configured", tier)
 	}
 	c.mu.RLock()
@@ -304,12 +357,7 @@ func (c *Catalog) RouteForTier(model string, tier config.Tier, hasZenKeys, hasGo
 	if c.availability != nil && c.availability.Disabled(model) {
 		return Route{}, fmt.Errorf("model %q is disabled after a failed availability check", model)
 	}
-	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
-	advertised := c.zen[model]
-	if tier == config.TierGo {
-		advertised = c.goModels[model]
-	}
-	if !catalogPending && !advertised {
+	if !c.tierPendingLocked(tier) && !c.advertised[tier][model] {
 		return Route{}, fmt.Errorf("model %q is not available in the selected %s key tier", model, tier)
 	}
 	if !c.tierSupportedLocked(model, tier) {
@@ -339,21 +387,25 @@ func (c *Catalog) IsFreeModel(model string) bool {
 	return c.anonymousDecision(model).Allowed
 }
 
-func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, hasGoKeys, hasAnonymous bool) RouteDiagnostic {
+func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasKeys map[config.Tier]bool, hasAnonymous bool) RouteDiagnostic {
 	c.mu.RLock()
 	configured, explicit := c.protocols[model]
-	zen, goModel := c.zen[model], c.goModels[model]
-	nativeProtocols := map[config.Tier]wire.Protocol{
-		config.TierZen: c.protocolForLocked(model, config.TierZen),
-		config.TierGo:  c.protocolForLocked(model, config.TierGo),
+	available := make(map[string]bool, len(c.order))
+	nativeProtocols := make(map[config.Tier]wire.Protocol, len(c.order))
+	known := false
+	for _, tier := range c.order {
+		available[string(tier)] = c.advertised[tier][model]
+		nativeProtocols[tier] = c.protocolForLocked(model, tier)
+		if _, ok := c.nativeProtocols[tier][model]; ok {
+			known = true
+		}
 	}
-	_, zenKnown := c.nativeProtocols[config.TierZen][model]
-	_, goKnown := c.nativeProtocols[config.TierGo][model]
+	prefer, order := c.prefer, c.order
 	c.mu.RUnlock()
 	source := "configured"
 	if !explicit {
 		source = "default"
-		if zenKnown || goKnown {
+		if known {
 			source = "upstream"
 		}
 	}
@@ -361,16 +413,16 @@ func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasZenKeys, 
 	if protocol == "" {
 		// Route() below selects the preferred available tier. This is only the
 		// fallback shown when no route can currently be built.
-		protocol = nativeProtocols[config.TierZen]
-		if c.prefer == config.TierGo {
-			protocol = nativeProtocols[config.TierGo]
+		protocol = nativeProtocols[prefer]
+		if protocol == "" && len(order) > 0 {
+			protocol = nativeProtocols[order[0]]
 		}
 	}
 	diagnostic := RouteDiagnostic{
 		Model: model, RequestedProtocol: requested, NativeProtocol: protocol, NativeProtocols: nativeProtocols, ProtocolSource: source,
-		AvailableZen: zen, AvailableGo: goModel, AnonymousEligibility: c.anonymousDecision(model),
+		Available: available, AnonymousEligibility: c.anonymousDecision(model),
 	}
-	route, err := c.Route(model, hasZenKeys, hasGoKeys, hasAnonymous)
+	route, err := c.Route(model, hasKeys, hasAnonymous)
 	if err != nil {
 		diagnostic.RouteError = err.Error()
 		return diagnostic
@@ -400,12 +452,11 @@ func (c *Catalog) List() []string {
 }
 
 func (c *Catalog) modelIDsLocked() []string {
-	seen := make(map[string]bool, len(c.zen)+len(c.goModels))
-	for model := range c.zen {
-		seen[model] = true
-	}
-	for model := range c.goModels {
-		seen[model] = true
+	seen := make(map[string]bool)
+	for _, tier := range c.order {
+		for model := range c.advertised[tier] {
+			seen[model] = true
+		}
 	}
 	return sortedSetKeys(seen)
 }
@@ -418,7 +469,7 @@ func (c *Catalog) Snapshot() CatalogSnapshot {
 
 // AvailableModels provides discovery and readiness with the same route
 // filtering, including configured key tiers and anonymous eligibility.
-func (c *Catalog) AvailableModels(hasZenKeys, hasGoKeys, hasAnonymous bool) ([]Route, CatalogSnapshot) {
+func (c *Catalog) AvailableModels(hasKeys map[config.Tier]bool, hasAnonymous bool) ([]Route, CatalogSnapshot) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	ids := c.modelIDsLocked()
@@ -427,7 +478,7 @@ func (c *Catalog) AvailableModels(hasZenKeys, hasGoKeys, hasAnonymous bool) ([]R
 		if !c.supportedLocked(model) {
 			continue
 		}
-		if route, err := c.routeLocked(model, hasZenKeys, hasGoKeys, hasAnonymous); err == nil {
+		if route, err := c.routeLocked(model, hasKeys, hasAnonymous); err == nil {
 			routes = append(routes, route)
 		}
 	}
@@ -447,8 +498,12 @@ func (c *Catalog) snapshotLocked(ids []string) CatalogSnapshot {
 	if !c.updatedAt.IsZero() && c.refreshAfter > 0 {
 		stale = stale || time.Since(c.updatedAt) > max(2*c.refreshAfter, time.Minute)
 	}
+	tiers := make(map[string]int, len(c.order))
+	for _, tier := range c.order {
+		tiers[string(tier)] = len(c.advertised[tier])
+	}
 	return CatalogSnapshot{
-		Zen: len(c.zen), Go: len(c.goModels), Total: len(ids), Exposed: exposed,
+		Tiers: tiers, Total: len(ids), Exposed: exposed,
 		UpdatedAt: c.updatedAt, CacheSource: c.cacheSource, Stale: stale,
 	}
 }
@@ -500,14 +555,13 @@ func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 }
 
 func (c *Catalog) supportedLocked(model string) bool {
-	if len(c.zen) == 0 && len(c.goModels) == 0 {
-		return true
-	}
-	if c.zen[model] && c.tierSupportedLocked(model, config.TierZen) {
-		return true
-	}
-	if c.goModels[model] && c.tierSupportedLocked(model, config.TierGo) {
-		return true
+	for _, tier := range c.order {
+		if !c.tierPendingLocked(tier) && !c.advertised[tier][model] {
+			continue
+		}
+		if c.tierSupportedLocked(model, tier) {
+			return true
+		}
 	}
 	return false
 }
@@ -522,9 +576,10 @@ func (c *Catalog) tierSupportedLocked(model string, tier config.Tier) bool {
 	if c.nativeProtocols[tier][model] != "" {
 		return true
 	}
-	// A pending catalog has no upstream capability snapshot to contradict a
-	// configured key, so retain the pre-refresh compatibility behavior.
-	return len(c.zen) == 0 && len(c.goModels) == 0
+	// A tier that has not reported a model list yet has no upstream capability
+	// snapshot to contradict a configured key, so retain the pre-refresh
+	// compatibility behavior for that tier alone.
+	return c.tierPendingLocked(tier)
 }
 
 func toSet(items []string) map[string]bool {
@@ -552,11 +607,13 @@ func cloneBools(source map[string]bool) map[string]bool {
 }
 
 func cloneModelMeta(source map[config.Tier]map[string]Metadata) map[config.Tier]map[string]Metadata {
-	result := map[config.Tier]map[string]Metadata{config.TierZen: {}, config.TierGo: {}}
-	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-		for id, md := range source[tier] {
-			result[tier][id] = md
+	result := make(map[config.Tier]map[string]Metadata, len(source))
+	for tier, models := range source {
+		meta := make(map[string]Metadata, len(models))
+		for id, md := range models {
+			meta[id] = md
 		}
+		result[tier] = meta
 	}
 	return result
 }
@@ -573,21 +630,17 @@ func sortedSetKeys(source map[string]bool) []string {
 }
 
 func cloneTierProtocols(source map[config.Tier]map[string]wire.Protocol) map[config.Tier]map[string]wire.Protocol {
-	result := map[config.Tier]map[string]wire.Protocol{config.TierZen: {}, config.TierGo: {}}
-	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-		if protocols, ok := source[tier]; ok {
-			result[tier] = cloneProtocols(protocols)
-		}
+	result := make(map[config.Tier]map[string]wire.Protocol, len(source))
+	for tier, protocols := range source {
+		result[tier] = cloneProtocols(protocols)
 	}
 	return result
 }
 
 func cloneTierBools(source map[config.Tier]map[string]bool) map[config.Tier]map[string]bool {
-	result := map[config.Tier]map[string]bool{config.TierZen: {}, config.TierGo: {}}
-	for _, tier := range []config.Tier{config.TierZen, config.TierGo} {
-		if models, ok := source[tier]; ok {
-			result[tier] = cloneBools(models)
-		}
+	result := make(map[config.Tier]map[string]bool, len(source))
+	for tier, models := range source {
+		result[tier] = cloneBools(models)
 	}
 	return result
 }

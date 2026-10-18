@@ -25,3 +25,4 @@ coverage.out
 
 # Local research and reference clones
 .devdocs/
+/opencode2api.bak-*

@@ -331,13 +331,14 @@ type KeyStatus struct {
 }
 
 type EgressStatus struct {
-	Index     int    `json:"index"`
-	Address   string `json:"address"`
-	Healthy   bool   `json:"healthy"`
-	Checking  bool   `json:"checking"`
-	ZenKeys   int    `json:"zen_keys"`
-	GoKeys    int    `json:"go_keys"`
-	Anonymous bool   `json:"anonymous"`
+	Index    int    `json:"index"`
+	Address  string `json:"address"`
+	Healthy  bool   `json:"healthy"`
+	Checking bool   `json:"checking"`
+	// Keys reports how many keys of each tier are currently bound to this
+	// lane, keyed by tier name.
+	Keys      map[string]int `json:"keys,omitempty"`
+	Anonymous bool           `json:"anonymous"`
 	// Proxy marks a multiplexed proxy lane whose address is "proxy:<node>".
 	Proxy bool `json:"proxy,omitempty"`
 	// ParkedUntil marks a FreeTier-parked lane with its expiry; CoolingUntil
@@ -357,14 +358,14 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	_, models := gateway.availableModels()
 	result := ResourceSnapshot{Models: models, Anonymous: gateway.cfg.Anonymous}
 	result.Metadata = gateway.catalog.MetadataSnapshot()
-	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
-	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
-	gateway.zenNodes.bindingsMu.Lock()
-	zenBindings := append([]int(nil), gateway.zenNodes.bindingCount...)
-	gateway.zenNodes.bindingsMu.Unlock()
-	gateway.goNodes.bindingsMu.Lock()
-	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
-	gateway.goNodes.bindingsMu.Unlock()
+	channels := gateway.orderedChannels()
+	bindings := make(map[config.Tier][]int, len(channels))
+	for _, channel := range channels {
+		result.Keys = append(result.Keys, keyStatuses(string(channel.tier), channel.nodes)...)
+		channel.nodes.bindingsMu.Lock()
+		bindings[channel.tier] = append([]int(nil), channel.nodes.bindingCount...)
+		channel.nodes.bindingsMu.Unlock()
+	}
 	cooling := make(map[*egressTransport]int64, len(gateway.anonymous.snapshotNodes()))
 	for _, node := range gateway.anonymous.snapshotNodes() {
 		if node == nil || node.egress == nil {
@@ -386,11 +387,14 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			value := time.Unix(0, until).UTC()
 			status.CoolingUntil = &value
 		}
-		if egress.index < len(zenBindings) {
-			status.ZenKeys = zenBindings[egress.index]
-		}
-		if egress.index < len(goBindings) {
-			status.GoKeys = goBindings[egress.index]
+		for tier, counts := range bindings {
+			if egress.index >= len(counts) || counts[egress.index] == 0 {
+				continue
+			}
+			if status.Keys == nil {
+				status.Keys = make(map[string]int, len(bindings))
+			}
+			status.Keys[string(tier)] = counts[egress.index]
 		}
 		result.Egress = append(result.Egress, status)
 	}
@@ -424,7 +428,7 @@ func (m *RuntimeManager) DebugModels() ([]modelcatalog.RouteDiagnostic, modelcat
 	models := gateway.catalog.List()
 	result := make([]modelcatalog.RouteDiagnostic, 0, len(models))
 	for _, model := range models {
-		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous))
+		result = append(result, gateway.catalog.Diagnostic(model, "", gateway.keyAvailability(), gateway.cfg.Anonymous))
 	}
 	metadata := gateway.catalog.MetadataSnapshot()
 	return result, metadata
@@ -436,7 +440,7 @@ func (m *RuntimeManager) DebugRoute(model string, requested protocol.Protocol) m
 		return modelcatalog.RouteDiagnostic{Model: model, RequestedProtocol: requested, RouteError: "gateway runtime is unavailable"}
 	}
 	gateway := runtime.gateway
-	return gateway.catalog.Diagnostic(model, requested, len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous)
+	return gateway.catalog.Diagnostic(model, requested, gateway.keyAvailability(), gateway.cfg.Anonymous)
 }
 
 // DebugKeyView is the operator-facing view of one configured upstream key. It
@@ -453,7 +457,7 @@ type DebugKeyView struct {
 // DebugKeys lists every configured upstream key per tier so the Playground can
 // offer an explicit per-key test target.
 func (m *RuntimeManager) DebugKeys() map[string][]DebugKeyView {
-	result := map[string][]DebugKeyView{"zen": {}, "go": {}}
+	result := map[string][]DebugKeyView{}
 	runtime := m.current.Load()
 	if runtime == nil {
 		return result
@@ -471,8 +475,9 @@ func (m *RuntimeManager) DebugKeys() map[string][]DebugKeyView {
 			result[string(tier)] = append(result[string(tier)], view)
 		}
 	}
-	appendKeys(config.TierZen, runtime.gateway.zenNodes.nodes)
-	appendKeys(config.TierGo, runtime.gateway.goNodes.nodes)
+	for _, channel := range runtime.gateway.orderedChannels() {
+		appendKeys(channel.tier, channel.nodes.nodes)
+	}
 	return result
 }
 
@@ -493,9 +498,9 @@ func (m *RuntimeManager) DebugRouteForTier(model string, tier config.Tier) (mode
 		return modelcatalog.RouteDiagnostic{Model: model, RouteError: "gateway runtime is unavailable"}, fmt.Errorf("gateway runtime is unavailable")
 	}
 	gateway := runtime.gateway
-	hasZen, hasGo := len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0
-	diagnostic := gateway.catalog.Diagnostic(model, "", hasZen, hasGo, false)
-	route, err := gateway.catalog.RouteForTier(model, tier, hasZen, hasGo)
+	hasKeys := gateway.keyAvailability()
+	diagnostic := gateway.catalog.Diagnostic(model, "", hasKeys, false)
+	route, err := gateway.catalog.RouteForTier(model, tier, hasKeys)
 	if err != nil {
 		diagnostic.RouteError = err.Error()
 		return diagnostic, err

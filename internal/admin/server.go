@@ -111,6 +111,7 @@ type ConfigView struct {
 	ServerKeys  []SecretView             `json:"server_keys"`
 	ZenKeys     []SecretView             `json:"zen_keys"`
 	GoKeys      []SecretView             `json:"go_keys"`
+	Providers   []ProviderView           `json:"providers"`
 	Anonymous   bool                     `json:"anonymous"`
 	Egress      EgressView               `json:"egress"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
@@ -143,6 +144,22 @@ type SecretInput struct {
 	Value string `json:"value,omitempty"`
 }
 
+// ProviderView is the operator-facing view of one configured provider. The
+// name and base URL are public; the keys are masked like every other secret.
+type ProviderView struct {
+	Name        config.Tier  `json:"name"`
+	BaseURL     string       `json:"base_url"`
+	ModelSuffix string       `json:"model_suffix,omitempty"`
+	APIKeys     []SecretView `json:"api_keys"`
+}
+
+type ProviderInput struct {
+	Name        string        `json:"name"`
+	BaseURL     string        `json:"base_url"`
+	ModelSuffix string        `json:"model_suffix,omitempty"`
+	APIKeys     []SecretInput `json:"api_keys"`
+}
+
 // EgressView exposes the egress rotation without sampling or leaking the
 // bound addresses: operators see which prefixes feed the pool and how large
 // the pool is, not the sampled literals.
@@ -153,10 +170,14 @@ type EgressView struct {
 }
 
 type ConfigUpdate struct {
-	Listen      string                   `json:"listen"`
-	ServerKeys  []SecretInput            `json:"server_keys"`
-	ZenKeys     []SecretInput            `json:"zen_keys"`
-	GoKeys      []SecretInput            `json:"go_keys"`
+	Listen     string        `json:"listen"`
+	ServerKeys []SecretInput `json:"server_keys"`
+	ZenKeys    []SecretInput `json:"zen_keys"`
+	GoKeys     []SecretInput `json:"go_keys"`
+	// A nil providers list keeps the current providers, so an older WebUI
+	// that does not know the field cannot wipe them. An explicit empty list
+	// removes every provider.
+	Providers   []ProviderInput          `json:"providers,omitempty"`
 	Anonymous   bool                     `json:"anonymous"`
 	Egress      config.EgressConfig      `json:"egress"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
@@ -198,6 +219,14 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_go_keys", err.Error())
 		return
 	}
+	providers := current.Providers
+	if update.Providers != nil {
+		providers, err = resolveProviders(update.Providers, current.Providers)
+		if err != nil {
+			writeAdminError(w, http.StatusBadRequest, "invalid_providers", err.Error())
+			return
+		}
+	}
 	reasoning := current.Reasoning
 	if update.Reasoning != nil {
 		reasoning = *update.Reasoning
@@ -205,7 +234,7 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
-		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Egress: update.Egress,
+		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Providers: providers, Anonymous: update.Anonymous, Egress: update.Egress,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
@@ -243,7 +272,11 @@ func (a *Server) handleReveal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("sensitive configuration revealed", "component", "auth", "event", "secrets_revealed", "client_ip", clientIP(r))
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys})
+	providers := make(map[config.Tier][]string, len(cfg.Providers))
+	for _, provider := range cfg.Providers {
+		providers[config.Tier(provider.Name)] = provider.APIKeys
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "providers": providers})
 }
 
 func (a *Server) handleMonitor(w http.ResponseWriter, _ *http.Request) {
@@ -330,8 +363,12 @@ func (a *Server) sessionTokenValid(token string) bool {
 func (a *Server) configView() ConfigView {
 	cfg := a.manager.Config()
 	effective, restart := a.manager.RestartStatus()
+	providers := make([]ProviderView, 0, len(cfg.Providers))
+	for _, provider := range cfg.Providers {
+		providers = append(providers, ProviderView{Name: config.Tier(provider.Name), BaseURL: provider.BaseURL, ModelSuffix: provider.ModelSuffix, APIKeys: maskSecrets(provider.APIKeys)})
+	}
 	return ConfigView{
-		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys), ZenKeys: maskSecrets(cfg.ZenKeys), GoKeys: maskSecrets(cfg.GoKeys), Anonymous: cfg.Anonymous,
+		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys), ZenKeys: maskSecrets(cfg.ZenKeys), GoKeys: maskSecrets(cfg.GoKeys), Providers: providers, Anonymous: cfg.Anonymous,
 		Egress: EgressView{EnableIPv6: cfg.Egress.EnableIPv6, Prefixes: append([]string(nil), cfg.Egress.Prefixes...), PoolSize: cfg.Egress.PoolSize}, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
@@ -367,6 +404,26 @@ func resolveSecrets(inputs []SecretInput, existing []string) ([]string, error) {
 		default:
 			return nil, errors.New("each item must contain id or value")
 		}
+	}
+	return result, nil
+}
+
+// resolveProviders applies the same secret-keeping rules as every other key
+// list, scoped per provider name: a masked key can only stay inside the
+// provider it came from.
+func resolveProviders(inputs []ProviderInput, existing []config.ProviderConfig) ([]config.ProviderConfig, error) {
+	known := make(map[config.Tier][]string, len(existing))
+	for _, provider := range existing {
+		known[config.Tier(provider.Name)] = provider.APIKeys
+	}
+	result := make([]config.ProviderConfig, 0, len(inputs))
+	for _, input := range inputs {
+		name := config.Tier(strings.TrimSpace(input.Name))
+		keys, err := resolveSecrets(input.APIKeys, known[name])
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", name, err)
+		}
+		result = append(result, config.ProviderConfig{Name: string(name), BaseURL: strings.TrimSpace(input.BaseURL), ModelSuffix: strings.TrimSpace(input.ModelSuffix), APIKeys: keys})
 	}
 	return result, nil
 }
