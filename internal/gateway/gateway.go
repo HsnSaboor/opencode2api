@@ -58,7 +58,13 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		return nil, err
 	}
 	addresses := cfg.EgressAddresses()
-	transports, err := newTransportPool(addresses, cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second), cfg.Egress.Prefixes, cfg.Egress.PrefixWeights)
+	prefixes := cfg.Egress.Prefixes
+	prefixWeights := cfg.Egress.PrefixWeights
+	if cfg.Egress.IPv4Only || !cfg.Egress.EnableIPv6 {
+		prefixes = nil
+		prefixWeights = nil
+	}
+	transports, err := newTransportPool(addresses, cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second), prefixes, prefixWeights)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +72,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		// The sampled pool is fresh per process start, so one startup line
 		// names what this instance actually rotates. Full literals stay at
 		// debug: a pool of 128 addresses would spam the default log level.
-		logger.Info("egress pool ready", "component", "egress", "event", "egress_pool_ready", "prefixes", cfg.Egress.Prefixes, "pool_size", len(addresses))
+		logger.Info("egress pool ready", "component", "egress", "event", "egress_pool_ready", "prefixes", prefixes, "pool_size", len(addresses))
 		logger.Debug("egress pool addresses", "component", "egress", "event", "egress_pool_addresses", "addresses", addresses)
 	}
 	// Pre-dial every lane against the same neutral target the scheduled
@@ -121,7 +127,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 			logger.Info("proxy pool ready", "component", "egress", "event", "proxy_pool_ready", "nodes", len(manager.profile.Nodes), "lanes", seeded, "count", manager.cfg.Count, "socks_port", manager.cfg.SocksPort, "state_file", manager.statePath)
 		}
 	}
-	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, cfg.Egress.Prefixes)
+	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, prefixes)
 	return gateway, nil
 }
 

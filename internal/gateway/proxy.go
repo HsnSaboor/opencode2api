@@ -189,6 +189,13 @@ func (m *proxyManager) socksAddr() string {
 	return m.mux.SocksAddr()
 }
 
+func (m *proxyManager) laneTarget() int {
+	if m == nil {
+		return 0
+	}
+	return m.cfg.Count
+}
+
 // take claims the next verified, unused node for a lane. Callers that fail to
 // build the lane must release it.
 func (m *proxyManager) take() (proxypool.Node, bool) {

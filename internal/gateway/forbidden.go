@@ -34,7 +34,10 @@ func classifyForbidden(snippet string) forbiddenVerdict {
 	switch {
 	case strings.Contains(snippet, "user_blocked"):
 		return forbiddenAccount
-	case strings.Contains(snippet, "FreeTierError"):
+	case strings.Contains(snippet, "FreeTierError"),
+		strings.Contains(snippet, "Abuse Traffic"),
+		strings.Contains(snippet, "Detect Abuse Traffic"),
+		strings.Contains(snippet, "abuse_traffic"):
 		return forbiddenFreeTier
 	case strings.Contains(snippet, "RegionError"):
 		return forbiddenRegion

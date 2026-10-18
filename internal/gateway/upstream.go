@@ -354,7 +354,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 					g.logger.Info("anonymous FreeTier verdict attributed to configured prefix", "component", "upstream", "event", "anonymous_prefix_strike", "request_id", ids.Request, "prefix", prefix, "strikes", strikes, "cooling", cooling)
 				}
 				freitierParks++
-				if freitierParks >= freitierScanLimit {
+				scanLimit := freitierScanLimit
+				if g.proxies != nil {
+					if target := g.proxies.laneTarget(); target > scanLimit {
+						scanLimit = target
+					}
+				}
+				if freitierParks >= scanLimit {
 					// The fate-interleaved scan has now sampled every class
 					// the pool holds — the configured prefixes and the proxy
 					// exits — without a success. Ask a verified exit whether

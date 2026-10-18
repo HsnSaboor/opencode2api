@@ -198,6 +198,10 @@ func (g *Gateway) probeCoolingPrefixes(ctx context.Context) {
 // model exercises the same FreeTier gate, and the request is capped at a
 // single token.
 func (g *Gateway) probationModel() string {
+	const preferred = "deepseek-v4.1-flash-free"
+	if g.catalog.IsFreeModel(preferred) {
+		return preferred
+	}
 	for _, model := range g.catalog.List() {
 		if g.catalog.IsFreeModel(model) {
 			return model
