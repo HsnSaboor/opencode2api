@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -312,10 +313,7 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 			listed := modelLists[i]
 			installed := listed
 			if channel.suffix != "" {
-				installed = make([]string, 0, len(listed))
-				for _, model := range listed {
-					installed = append(installed, model+channel.suffix)
-				}
+				installed = applyModelSuffix(listed, channel.suffix)
 			}
 			models[channel.tier] = installed
 			if !channel.opencode {
@@ -383,6 +381,27 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (modelcatalog
 		lastErr = errors.New("no healthy egress lane available for OpenCode capability catalog")
 	}
 	return modelcatalog.Capabilities{}, lastErr
+}
+
+// applyModelSuffix appends one tier's model suffix to every discovered ID.
+// IDs that already carry the suffix are left alone and duplicates collapse:
+// some providers list a free route under its suffixed name (for example
+// "mimo-v2.5:free") alongside the plain ID, and appending the suffix anyway
+// used to install unreachable "…:free:free" catalog entries.
+func applyModelSuffix(listed []string, suffix string) []string {
+	installed := make([]string, 0, len(listed))
+	seen := make(map[string]bool, len(listed))
+	for _, model := range listed {
+		if !strings.HasSuffix(model, suffix) {
+			model += suffix
+		}
+		if seen[model] {
+			continue
+		}
+		seen[model] = true
+		installed = append(installed, model)
+	}
+	return installed
 }
 
 func (g *Gateway) refreshZen(ctx context.Context) []string {
