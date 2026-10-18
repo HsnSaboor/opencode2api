@@ -669,6 +669,9 @@ func (g *Gateway) proxyFillLoop(ctx context.Context) {
 			}
 			g.anonymous.addNode(lane)
 			g.warmProxyLane(lane)
+			// New lanes must be able to take keys immediately, or a cold
+			// start keeps every keyed request on the pre-fill address.
+			g.rebalanceEgressKeys()
 			if g.logger != nil {
 				g.logger.Info("proxy egress lane admitted", "component", "egress", "event", "proxy_lane_admitted", "egress", config.RedactURL(lane.address), "node", node.Index, "type", node.Type, "lanes", g.transports.proxyLaneCount(), "target", manager.cfg.Count)
 			}

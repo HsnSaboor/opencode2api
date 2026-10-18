@@ -109,12 +109,31 @@ func (g *Gateway) restoreEgress(egress *egressTransport) (moved int) {
 	return moved
 }
 
+// rebalanceEgressKeys spreads every channel's keys across lanes that
+// arrived after the key pools were built and off non-proxy lanes while
+// proxy exits exist: key pools bind at construction, proxy lanes seed after
+// them and keep filling to the target, and failover can park a key on the
+// direct lane, so the distribution is re-asserted whenever the pool admits
+// a lane or finishes a health round.
+func (g *Gateway) rebalanceEgressKeys() (moved int) {
+	for _, channel := range g.channels {
+		moved += channel.nodes.RebalanceEgress()
+	}
+	if moved > 0 && g.logger != nil {
+		g.logger.Info("egress keys rebalanced across lanes", "component", "egress", "event", "egress_keys_rebalanced", "keys_moved", moved)
+	}
+	return moved
+}
+
 func (g *Gateway) StartEgressHealthChecks(ctx context.Context) {
 	check := func() {
 		results := g.transports.CheckHealth(ctx, egressHealthCheckURL, egressHealthCheckTimeout)
 		for _, result := range results {
 			g.applyEgressHealthResult(result, "scheduled health check", 0)
 		}
+		// Failover can land a key back on a non-proxy lane; re-assert the
+		// spread once a health round has settled lane state.
+		g.rebalanceEgressKeys()
 	}
 	go func() {
 		ticker := time.NewTicker(egressHealthCheckInterval)

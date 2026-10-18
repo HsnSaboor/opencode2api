@@ -153,6 +153,10 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		}
 	}
 	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, prefixes)
+	// Key pools bound before proxy lanes seeded, so spread them now: the
+	// seeded lanes would otherwise idle keyless while one address carries
+	// every account of a keyed provider.
+	gateway.rebalanceEgressKeys()
 	return gateway, nil
 }
 

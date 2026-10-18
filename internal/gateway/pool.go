@@ -450,6 +450,27 @@ func freitierParked(egress *egressTransport) bool {
 	return egress != nil && egress.freitierUntil.Load() > time.Now().UnixNano()
 }
 
+// dedicatedLane reports whether the lane egresses through a pinned source
+// address — an address drawn from a configured egress prefix — rather than
+// the host's own route ("direct"/"direct4") or a proxy exit. Dedicated lanes
+// are the preferred home for keys: each draw carries its own network
+// identity upstream, so accounts spread across them answer from distinct
+// addresses instead of stacking behind one.
+func dedicatedLane(egress *egressTransport) bool {
+	if egress == nil || egress.proxy != nil {
+		return false
+	}
+	return egress.address != "direct" && egress.address != "direct4"
+}
+
+// directLane reports whether the lane dials from the host's own address.
+// That lane is the worst home for a keyed account: every account it carries
+// answers upstream from the same host address, which is what providers flag
+// as many accounts sharing one network address.
+func directLane(egress *egressTransport) bool {
+	return egress != nil && egress.proxy == nil && (egress.address == "direct" || egress.address == "direct4")
+}
+
 // CoolSubnet cools the /64 holding addr for d. It mirrors zen-proxy's
 // subnet-level region handling: the flag is corroborated upstream by the
 // caller deciding to cool, and the map stays small because keys are /64s of
@@ -1126,7 +1147,8 @@ func (p *nodePool) Egress(node *upstreamNode) *egressTransport {
 // least-loaded healthy lane. Empty lanes are selected in configuration order;
 // otherwise one of the least-loaded lanes is chosen at random. If every
 // alternative is currently unhealthy, it still attempts the least-loaded
-// alternative.
+// alternative. Benched lanes — parked by a FreeTier flag or cooled under a
+// region block — are never chosen, since selection would only skip them.
 func (p *nodePool) RebindEgress(failedEgress int) int {
 	if p == nil || p.transports == nil {
 		return 0
@@ -1161,6 +1183,144 @@ func (p *nodePool) RebindEgress(failedEgress int) int {
 	return moved
 }
 
+// RebalanceEgress spreads keys from lanes carrying several of them onto
+// empty healthy lanes, preferring dedicated source-address lanes first,
+// proxy exits second, and the host's own route last; a second pass moves
+// keys off the host's address and off proxy exits while empty dedicated
+// lanes remain, then drains host-address keys onto proxy exits when no
+// dedicated lane is left. Benched lanes — parked by a FreeTier flag or
+// cooled under a region block — are never chosen as a home, since selection
+// would only skip them. Key pools bind against the lanes that exist when
+// they are built, while proxy lanes seed afterwards and keep arriving until
+// the pool reaches its target, so without this pass every account keeps
+// answering from the egress address that happened to exist at boot. Moved
+// keys adopt the target as their preferred lane so a later lane recovery
+// does not drag them back into the crowd.
+func (p *nodePool) RebalanceEgress() int {
+	if p == nil || p.transports == nil || len(p.nodes) == 0 {
+		return 0
+	}
+	items := p.transports.snapshot()
+	n := len(items)
+	if n < 2 {
+		return 0
+	}
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+	p.ensureBindingsLocked(n)
+
+	benched := func(egress *egressTransport) bool {
+		return freitierParked(egress) || p.transports.subnetCooled(egress.address)
+	}
+	empty := func(want func(*egressTransport) bool) int {
+		for i := 0; i < n; i++ {
+			if p.bindingCount[i] != 0 || !items[i].healthy.Load() || benched(items[i]) {
+				continue
+			}
+			if want == nil || want(items[i]) {
+				return i
+			}
+		}
+		return -1
+	}
+	withKeys := func(want func(*egressTransport) bool) int {
+		for i := 0; i < n; i++ {
+			if p.bindingCount[i] > 0 && (want == nil || want(items[i])) {
+				return i
+			}
+		}
+		return -1
+	}
+	proxyLane := func(egress *egressTransport) bool { return egress.proxy != nil }
+	pickEmpty := func(kind int) int {
+		// 0: dedicated lanes only; 1: dedicated, then proxy exits; 2: any.
+		if kind < 2 {
+			if target := empty(dedicatedLane); target >= 0 {
+				return target
+			}
+		}
+		if kind == 0 {
+			return -1
+		}
+		if kind == 1 {
+			return empty(proxyLane)
+		}
+		return empty(nil)
+	}
+	carrierOn := func(lane int) *upstreamNode {
+		for _, node := range p.nodes {
+			if int(node.egressIndex.Load()) == lane {
+				return node
+			}
+		}
+		return nil
+	}
+	moved := 0
+	move := func(source, target int, carrier *upstreamNode) {
+		p.bindingCount[source]--
+		p.bindingCount[target]++
+		carrier.egressIndex.Store(int64(target))
+		carrier.preferredEgress = target
+		moved++
+	}
+
+	// Pass one: no lane keeps a second key while an empty healthy lane can
+	// take it.
+	for range p.nodes {
+		target := pickEmpty(1)
+		if target < 0 {
+			target = pickEmpty(2)
+		}
+		if target < 0 {
+			break
+		}
+		source, sourceCount := -1, 1
+		for i := 0; i < n; i++ {
+			if p.bindingCount[i] > sourceCount {
+				source, sourceCount = i, p.bindingCount[i]
+			}
+		}
+		if source < 0 {
+			break
+		}
+		carrier := carrierOn(source)
+		if carrier == nil {
+			break
+		}
+		move(source, target, carrier)
+	}
+	// Pass two: dedicated lanes are the preferred home. Move keys off the
+	// host's address first, then off proxy exits, while empty dedicated
+	// lanes remain; with no dedicated lane left, keep draining the host's
+	// address onto proxy exits — one host address answering for a whole
+	// account set is what a provider sees as one network address.
+	for range p.nodes {
+		target := pickEmpty(0)
+		source := -1
+		if target >= 0 {
+			source = withKeys(directLane)
+			if source < 0 {
+				source = withKeys(proxyLane)
+			}
+		} else {
+			target = empty(proxyLane)
+			if target < 0 {
+				break
+			}
+			source = withKeys(directLane)
+		}
+		if source < 0 {
+			break
+		}
+		carrier := carrierOn(source)
+		if carrier == nil {
+			break
+		}
+		move(source, target, carrier)
+	}
+	return moved
+}
+
 // ensureBindingsLocked grows bindingCount to cover n lanes. Callers hold
 // bindingsMu. Replacement lanes arrive after construction, so the count
 // slice must track the pool, not the initial size.
@@ -1176,6 +1336,12 @@ func (p *nodePool) replacementLocked(failedEgress int, healthyOnly bool) int {
 	candidates := make([]int, 0, len(items)-1)
 	for i := range items {
 		if i == failedEgress || healthyOnly && !items[i].healthy.Load() {
+			continue
+		}
+		// A benched lane is not a home: selection prefers to skip parked
+		// and region-cooled lanes, so a key moved there would sit out until
+		// the bench expires.
+		if freitierParked(items[i]) || p.transports.subnetCooled(items[i].address) {
 			continue
 		}
 		count := 0
