@@ -287,3 +287,73 @@ func TestProxyStaleVerifiedCount(t *testing.T) {
 		t.Fatalf("stale = %d, want 1 (in-use node excluded)", got)
 	}
 }
+
+// A canary-confirmed gate rejection pauses candidate sweeps so failing
+// probes cannot charge healthy nodes; the hold expires on its own and never
+// shrinks under a later, shorter request.
+func TestProxyManagerGateHold(t *testing.T) {
+	manager := testProxyManager(t, 2)
+	if held, _ := manager.sweepHold(); held {
+		t.Fatal("fresh manager must not be held")
+	}
+	manager.holdSweep(60 * time.Millisecond)
+	if held, until := manager.sweepHold(); !held || until.IsZero() {
+		t.Fatal("holdSweep did not register a hold")
+	}
+	if _, ok := manager.nextCandidate(); ok {
+		t.Fatal("held sweep must not hand out candidates")
+	}
+	manager.holdSweep(time.Second)
+	manager.holdSweep(10 * time.Millisecond)
+	if _, until := manager.sweepHold(); time.Until(until) < 500*time.Millisecond {
+		t.Fatal("a shorter hold must not shorten an existing one")
+	}
+	time.Sleep(70 * time.Millisecond)
+	if held, _ := manager.sweepHold(); !held {
+		t.Fatal("extended hold expired early")
+	}
+	manager.mu.Lock()
+	manager.gateHoldUntil = time.Now().Add(-time.Second)
+	manager.mu.Unlock()
+	if held, _ := manager.sweepHold(); held {
+		t.Fatal("expired hold still reported")
+	}
+	if _, ok := manager.nextCandidate(); !ok {
+		t.Fatal("sweep did not resume after the hold expired")
+	}
+}
+
+// The canary probes the most recently verified node: it is the best
+// available evidence of what the gate currently admits.
+func TestProxyManagerControlNodePrefersFreshVerified(t *testing.T) {
+	manager := testProxyManager(t, 3, 0, 1, 2)
+	manager.state[0].lastVerified = time.Now().Add(-3 * time.Hour)
+	manager.state[1].lastVerified = time.Now().Add(-2 * time.Hour)
+	manager.state[2].lastVerified = time.Now().Add(-time.Minute)
+	node, ok := manager.controlNode()
+	if !ok || node.Index != 2 {
+		t.Fatalf("control = %+v/%v, want node 2", node, ok)
+	}
+	if manager.state[2].inUse {
+		t.Fatal("control probe must not claim the node")
+	}
+	if _, ok := testProxyManager(t, 2).controlNode(); ok {
+		t.Fatal("a manager without verified nodes has no control")
+	}
+}
+
+// Gate policy verdicts are canary-checked before they are charged to a node;
+// transport deaths are not, because a request-scoped wave cannot make an
+// exit unreachable.
+func TestProxyGateFailureClassification(t *testing.T) {
+	for _, outcome := range []proxyProbeOutcome{proxyOutcomeFreitier, proxyOutcomeRateLimited, proxyOutcomeRejected} {
+		if !proxyGateFailure(outcome) {
+			t.Fatalf("%v must be canary-checked", outcome)
+		}
+	}
+	for _, outcome := range []proxyProbeOutcome{proxyOutcomeVerified, proxyOutcomeDead, proxyOutcomeInconclusive} {
+		if proxyGateFailure(outcome) {
+			t.Fatalf("%v must not be canary-checked", outcome)
+		}
+	}
+}

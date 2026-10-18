@@ -43,6 +43,19 @@ const (
 	// this window is treated as a candidate again (zen-proxy revalidated
 	// daily; public nodes churn faster, so this runs every six hours).
 	proxyReverifyInterval = 6 * time.Hour
+	// proxyCanaryTTL bounds how long one canary verdict is trusted; a single
+	// canonical-profile probe per window is enough to tell a request-scoped
+	// gate rejection from an exit-scoped one even under load.
+	proxyCanaryTTL = 30 * time.Second
+	// proxyCanaryTimeout bounds the canary probe a failing request or
+	// candidate runs. The canonical profile answers in seconds when the gate
+	// has an opinion at all; nothing waits the full probe budget inline.
+	proxyCanaryTimeout = 15 * time.Second
+	// proxyGateHold pauses candidate sweeps after a canary proves the gate
+	// refuses the canonical request profile everywhere. Probing through a
+	// request-scoped wave would charge failures to healthy nodes, so the
+	// sweep waits the wave out and resumes on its own.
+	proxyGateHold = 3 * time.Minute
 	// proxyStateSaveInterval paces state persistence.
 	proxyStateSaveInterval = 15 * time.Second
 	// Verification cooldowns. Dead exits retry soon and escalate with
@@ -129,6 +142,10 @@ type proxyManager struct {
 	state  []proxyNodeState
 	cursor int
 	dirty  bool
+	// gateHoldUntil pauses candidate probes after a canary showed the gate
+	// refusing the canonical profile from a verified exit: during a
+	// request-scoped wave every probe would be charged to a healthy node.
+	gateHoldUntil time.Time
 	// wake nudges the fill and verify loops when the pool wants a node and
 	// none is ready. Buffered so a signal left while no loop is listening
 	// is not lost.
@@ -227,6 +244,12 @@ func (m *proxyManager) nextCandidate() (proxypool.Node, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
+	if now.Before(m.gateHoldUntil) {
+		// A canary-confirmed gate rejection is in force: every probe would
+		// be charged to a healthy node, so the sweep stays quiet until the
+		// hold expires.
+		return proxypool.Node{}, false
+	}
 	for offset := 0; offset < len(m.state); offset++ {
 		index := (m.cursor + offset) % len(m.state)
 		state := &m.state[index]
@@ -351,6 +374,61 @@ type proxyPoolStats struct {
 	Available int
 	Cooling   int
 	Pending   int
+}
+
+// controlNode returns the verified node a canary probe should test: the most
+// recently verified node is the best available evidence of what the gate
+// currently admits, and it is never a candidate the caller is about to
+// judge (candidates are unverified or stale). The node is not claimed and
+// carries no verdict of its own.
+func (m *proxyManager) controlNode() (proxypool.Node, bool) {
+	if m == nil || len(m.state) == 0 {
+		return proxypool.Node{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	best := -1
+	for i := range m.state {
+		if !m.state[i].verified {
+			continue
+		}
+		if best < 0 || m.state[i].lastVerified.After(m.state[best].lastVerified) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return proxypool.Node{}, false
+	}
+	return m.profile.Nodes[best], true
+}
+
+// holdSweep pauses candidate probes until now+d, never shortening a hold
+// already in force. It is set when the canary proves the gate refuses the
+// canonical request profile from a verified exit: recording failures during
+// such a wave would cool healthy nodes for a decision they cannot change.
+func (m *proxyManager) holdSweep(d time.Duration) {
+	if m == nil || d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if until := time.Now().Add(d); until.After(m.gateHoldUntil) {
+		m.gateHoldUntil = until
+	}
+	m.mu.Unlock()
+}
+
+// sweepHold reports whether a canary-detected gate rejection is currently
+// pausing candidate sweeps, and until when.
+func (m *proxyManager) sweepHold() (bool, time.Time) {
+	if m == nil {
+		return false, time.Time{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if time.Now().Before(m.gateHoldUntil) {
+		return true, m.gateHoldUntil
+	}
+	return false, time.Time{}
 }
 
 func (m *proxyManager) stats() proxyPoolStats {
@@ -626,6 +704,18 @@ func (g *Gateway) proxyVerifyLoop(ctx context.Context) {
 			go func(node proxypool.Node) {
 				defer func() { <-sem }()
 				outcome := g.probeProxyNode(ctx, node)
+				if proxyGateFailure(outcome) {
+					// A gate verdict may describe the request profile rather
+					// than this exit (a global wave answers every exit with
+					// the same 403, as the abbreviated-prompt incident did).
+					// The canary probe distinguishes the two: when a freshly
+					// verified exit is refused the same way, every exit would
+					// have been refused, so the verdict is inconclusive and
+					// sweeps pause until the wave passes.
+					if rejected, decisive := g.proxyGateRejectsRequest(ctx); decisive && rejected {
+						outcome = proxyOutcomeInconclusive
+					}
+				}
 				manager.completeVerify(node.Index, outcome)
 			}(node)
 		}
@@ -758,6 +848,68 @@ func (g *Gateway) probeProxyNode(ctx context.Context, node proxypool.Node) proxy
 	default:
 		return proxyOutcomeRejected
 	}
+}
+
+// proxyGateFailure reports whether a probe verdict describes the gate's
+// policy (FreeTier, rate limit, rejection) rather than the exit's transport.
+// Policy verdicts are request-sensitive — a global wave answers them from
+// every exit — so they are canary-checked before they are charged to a node;
+// dead exits never are.
+func proxyGateFailure(outcome proxyProbeOutcome) bool {
+	switch outcome {
+	case proxyOutcomeFreitier, proxyOutcomeRateLimited, proxyOutcomeRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+// proxyGateRejectsRequest decides whether a burst of gate verdicts describes
+// the request rather than the exits: it probes the most recently verified
+// node with the exact canonical request profile and reports whether that
+// exit was refused too. Results are cached for proxyCanaryTTL so a wave
+// costs one canary probe per window instead of one per failing attempt, and
+// a confirmed rejection holds candidate sweeps (see proxyManager.holdSweep).
+// The second return distinguishes a decisive verdict from "no verified exit
+// to ask" or a transport-inconclusive canary, where callers must keep the
+// conservative (exit-scoped) accounting.
+func (g *Gateway) proxyGateRejectsRequest(ctx context.Context) (bool, bool) {
+	if g.proxies == nil {
+		return false, false
+	}
+	g.proxyCanaryMu.Lock()
+	if !g.proxyCanaryAt.IsZero() && time.Since(g.proxyCanaryAt) < proxyCanaryTTL {
+		rejected := !g.proxyCanaryOK
+		g.proxyCanaryMu.Unlock()
+		return rejected, true
+	}
+	g.proxyCanaryMu.Unlock()
+	node, ok := g.proxies.controlNode()
+	if !ok {
+		return false, false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, proxyCanaryTimeout)
+	defer cancel()
+	var rejected, decisive bool
+	switch g.probeProxyNode(probeCtx, node) {
+	case proxyOutcomeVerified:
+		rejected, decisive = false, true
+	case proxyOutcomeFreitier, proxyOutcomeRejected, proxyOutcomeRateLimited:
+		rejected, decisive = true, true
+	}
+	if !decisive {
+		return false, false
+	}
+	g.proxyCanaryMu.Lock()
+	g.proxyCanaryAt, g.proxyCanaryOK = time.Now(), !rejected
+	g.proxyCanaryMu.Unlock()
+	if rejected {
+		g.proxies.holdSweep(proxyGateHold)
+		if g.logger != nil {
+			g.logger.Warn("gate rejected the canonical profile from a verified exit; holding sweeps", "component", "egress", "event", "proxy_gate_hold", "node", node.Index, "hold_s", int(proxyGateHold.Seconds()))
+		}
+	}
+	return rejected, decisive
 }
 
 // seedProxyLanes admits stored-verified nodes at construction so a restart

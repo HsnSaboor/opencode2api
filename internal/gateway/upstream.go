@@ -254,13 +254,14 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 }
 
 // freitierScanLimit bounds how many lanes one request may park on a FreeTier
-// verdict before the scan concludes the verdict is request-scoped. The gate
-// usually returns the same 403 body for the same request on every exit of a
-// flagged prefix, so a tight budget would surface the 403 to the client even
-// when the pool holds lanes outside that prefix. Ten attempts reach a
-// reserve lane in a weighted primary/reserve pool (~80/20) ~89% of the time
-// (1-0.8^10); during a space-wide flare every attempt parks a genuinely
-// flagged lane, so the extra scans are not wasted work.
+// verdict before the scan concludes the verdict is request-scoped. The cursor
+// interleaves fate classes (configured prefixes and proxy exits), so ten
+// parks cover every independent class a healthy-sized pool holds; a wave that
+// flags one prefix — or one day's worth of proxy nodes — cannot exhaust the
+// budget before an independent lane is tried. When the cap is reached anyway,
+// a canary probe through a verified exit decides whether the verdicts
+// described the request (parks restored, request fails) or the exits (parks
+// stand, request fails), so the pool survives global rejections intact.
 const freitierScanLimit = 10
 
 // doAnonymousUpstream tries every currently available egress lane at most
@@ -276,6 +277,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	limit := g.anonymous.Len()
 	attempts := 0
 	freitierParks := 0
+	// requestParks records the lanes this request parked on FreeTier
+	// verdicts. If the scan's cap is reached and the canary shows the
+	// verdicts were request-scoped, these parks are restored: they were
+	// charged to exits the gate never actually refused.
+	var requestParks []*egressTransport
 	body := bodies[config.TierZen]
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
@@ -343,11 +349,29 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			if verdict == forbiddenFreeTier {
 				g.anonymous.ParkFreitier(node.egress)
+				requestParks = append(requestParks, node.egress)
 				if prefix, strikes, cooling := g.transports.StrikePrefix(node.egress.address); prefix != "" {
 					g.logger.Info("anonymous FreeTier verdict attributed to configured prefix", "component", "upstream", "event", "anonymous_prefix_strike", "request_id", ids.Request, "prefix", prefix, "strikes", strikes, "cooling", cooling)
 				}
 				freitierParks++
 				if freitierParks >= freitierScanLimit {
+					// The fate-interleaved scan has now sampled every class
+					// the pool holds — the configured prefixes and the proxy
+					// exits — without a success. Ask a verified exit whether
+					// the gate still serves the canonical request profile: a
+					// refused canary means the verdict describes the request,
+					// not the exits, so the parks this request charged are
+					// restored and the wave may leave every lane selectable
+					// for the requests that follow.
+					if rejected, decisive := g.proxyGateRejectsRequest(ctx); decisive && rejected {
+						for _, parked := range requestParks {
+							g.anonymous.UnparkFreitier(parked)
+						}
+						g.logger.Warn("anonymous FreeTier verdict repeated across fate classes; restoring request-scoped parks", "component", "upstream", "event", "anonymous_freitier_request_scoped", "request_id", ids.Request, "attempts", attempts, "parks", len(requestParks))
+						lastResponse = resp
+						lastErr = err
+						break
+					}
 					// The same verdict from every lane means the gate rejects
 					// the request itself, not the exit: another park would
 					// drain the pool for a decision no lane can change.

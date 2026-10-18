@@ -313,6 +313,12 @@ type ProxyStatus struct {
 	Pending    int  `json:"pending"`
 	SocksPort  int  `json:"socks_port"`
 	SocksReady bool `json:"socks_ready"`
+	// SweepHeld reports a canary-confirmed gate rejection: the canonical
+	// request profile was refused from a verified exit, so candidate sweeps
+	// are paused instead of charging failures to healthy nodes.
+	SweepHeld bool `json:"sweep_held,omitempty"`
+	// SweepHeldUntil carries the moment the hold expires.
+	SweepHeldUntil *time.Time `json:"sweep_held_until,omitempty"`
 }
 
 type KeyStatus struct {
@@ -399,6 +405,11 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			Pending:    stats.Pending,
 			SocksPort:  gateway.proxies.cfg.SocksPort,
 			SocksReady: gateway.proxies.mux.Ready(),
+		}
+		if held, until := gateway.proxies.sweepHold(); held {
+			result.Proxy.SweepHeld = true
+			value := until.UTC()
+			result.Proxy.SweepHeldUntil = &value
 		}
 	}
 	return result

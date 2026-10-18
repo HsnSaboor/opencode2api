@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -41,6 +42,13 @@ type Gateway struct {
 	// proxies is nil unless the proxy pool is configured: it owns the
 	// candidate node set, verification state, and multiplexer process.
 	proxies *proxyManager
+	// proxyCanary caches the most recent gate-canary verdict (see
+	// proxyGateRejectsRequest): one canonical-profile probe per TTL decides
+	// whether a burst of FreeTier verdicts describes the requests or the
+	// exits, on both the request and verification paths.
+	proxyCanaryMu sync.Mutex
+	proxyCanaryAt time.Time
+	proxyCanaryOK bool
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {

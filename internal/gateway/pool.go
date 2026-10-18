@@ -218,11 +218,98 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	if len(nodes) == 0 {
 		return anonymousCursor{pool: p}
 	}
-	return anonymousCursor{pool: p, nodes: nodes, start: startForAffinity(&p.next, affinity, len(nodes))}
+	// The scan order interleaves the pool's fate classes — one per
+	// configured prefix, plus one shared by the multiplexed proxy exits —
+	// so a flag or outage that covers one class cannot swallow a whole
+	// request's attempts. The affinity-chosen lane stays first, so prompt
+	// caches and per-session placement keep working; every lane still
+	// appears exactly once.
+	return anonymousCursor{pool: p, nodes: interleaveByFate(p, nodes, startForAffinity(&p.next, affinity, len(nodes)))}
 }
 
-// Next visits each healthy, non-cooling, non-parked egress address at most
-// once per cursor.
+// interleaveByFate reorders one cursor snapshot: the affinity-chosen lane
+// leads, then the remaining lanes round-robin by fate class. With the pool's
+// typical composition (many address lanes behind one tunnel, a handful of
+// independent proxy exits) a contiguous walk could spend every attempt of a
+// request inside a single blocked prefix; the interleaved order instead
+// samples another prefix or a proxy node within its first few attempts.
+func interleaveByFate(pool *anonymousPool, nodes []*anonymousNode, start int) []*anonymousNode {
+	size := len(nodes)
+	if size < 2 {
+		return nodes
+	}
+	if start < 0 || start >= size {
+		start = 0
+	}
+	first := nodes[start]
+	order := make([]string, 0, 8)
+	buckets := make(map[string][]*anonymousNode, 8)
+	for offset := 1; offset < size; offset++ {
+		node := nodes[(start+offset)%size]
+		key := pool.fateKey(node.egress)
+		if _, seen := buckets[key]; !seen {
+			order = append(order, key)
+		}
+		buckets[key] = append(buckets[key], node)
+	}
+	out := make([]*anonymousNode, 0, size)
+	out = append(out, first)
+	// The leading lane's class moves to the end of the round-robin: the
+	// attempts that follow sample the other classes first, so a flag over
+	// the leading lane's class cannot shadow them in the first round.
+	firstKey := pool.fateKey(first.egress)
+	lead := -1
+	for i, key := range order {
+		if key == firstKey {
+			lead = i
+			break
+		}
+	}
+	if lead >= 0 {
+		order = append(order[lead+1:], order[:lead+1]...)
+	} else {
+		order = append(order, firstKey)
+	}
+	for len(out) < size {
+		progress := false
+		for _, key := range order {
+			bucket := buckets[key]
+			if len(bucket) == 0 {
+				continue
+			}
+			out = append(out, bucket[0])
+			buckets[key] = bucket[1:]
+			progress = true
+		}
+		if !progress {
+			break
+		}
+	}
+	return out
+}
+
+// fateKey names the upstream fate a lane shares with its siblings: the
+// configured prefix for address lanes, one shared class for every
+// multiplexed proxy exit (they are individually addressed, but jointly a
+// separate fate from the tunnel prefixes), and "direct" for everything else.
+// Nil-safe: a nil pool has no prefixes and a nil lane matches nothing.
+func (p *anonymousPool) fateKey(egress *egressTransport) string {
+	if egress == nil {
+		return "none"
+	}
+	if egress.proxy != nil {
+		return "proxy"
+	}
+	if p != nil {
+		if key := config.PrefixKeyFor(p.prefixes, egress.address); key != "" {
+			return key
+		}
+	}
+	return "direct"
+}
+
+// Next visits each healthy, non-cooling, non-parked egress lane at most once
+// per cursor.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if len(c.nodes) == 0 {
 		return nil
@@ -231,9 +318,10 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	for c.offset < len(c.nodes) {
 		node := c.nodes[(c.start+c.offset)%len(c.nodes)]
 		c.offset++
-		if node.egress.healthy.Load() && node.cooldownUntil.Load() <= now && node.egress.freitierUntil.Load() <= now {
-			return node
+		if !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
+			continue
 		}
+		return node
 	}
 	return nil
 }
@@ -293,6 +381,18 @@ func (p *anonymousPool) ParkFreitier(egress *egressTransport) {
 	egress.totalFreitiers.Add(1)
 	egress.freitierUntil.Store(time.Now().Add(freitierCooldown).UnixNano())
 	p.maybeReplenish(egress)
+}
+
+// UnparkFreitier returns a lane parked on a FreeTier verdict to selection.
+// The request path restores parks when the verdict is request-scoped (see
+// gateway.doAnonymousUpstream): the gate kept refusing a request its own
+// canonical profile showed it serves, so the exits were never the problem,
+// and benching them would only shrink capacity for every later request.
+func (p *anonymousPool) UnparkFreitier(egress *egressTransport) {
+	if egress == nil {
+		return
+	}
+	egress.freitierUntil.Store(0)
 }
 
 // replenishPrefixes returns the configured egress CIDRs available for
