@@ -296,29 +296,73 @@ const freitierScanLimit = 10
 // so a total wave costs at most one canary round and one budget per request.
 const freitierScanExtendedLimit = 24
 
-// anonymousRetryAfter is the delay advertised when the anonymous tier has no
-// usable egress. Proxy lanes are seeded before the multiplexer answers SOCKS,
-// so the first requests after a restart can fail with transport errors; a
-// short retry lets the client wait for the pool to warm up instead of
-// surfacing an abuse verdict from a direct lane.
-const anonymousRetryAfter = 10 * time.Second
+const (
+	// anonymousRetryAfter is the delay advertised when the anonymous tier has
+	// no usable egress. The mux is spawned after the HTTP listener, so the
+	// first requests after a restart can fail with transport errors; a short
+	// retry lets the client wait for the pool to warm up instead of surfacing
+	// an abuse verdict from a direct lane.
+	anonymousRetryAfter = 5 * time.Second
+	// anonymousWarmupGrace is how long an anonymous request waits for a
+	// restarting multiplexer to bind before it is answered with a retryable
+	// 503. The first spawn binds in about a second, so this hides the common
+	// restart window from clients entirely.
+	anonymousWarmupGrace = 2 * time.Second
+)
 
 // anonymousUnavailableResponse builds the retryable 503 the anonymous tier
 // returns when its egress is not ready. Direct lanes are hard-parked, so
 // there is nothing healthy to fall through to; a 503 with Retry-After tells
 // clients to try again instead of forwarding an upstream 403 that reads like
 // an account-level refusal.
-func anonymousUnavailableResponse() *http.Response {
+func anonymousUnavailableResponse(retryAfter time.Duration) *http.Response {
+	if retryAfter <= 0 {
+		retryAfter = anonymousRetryAfter
+	}
 	body := []byte(`{"error":{"type":"service_unavailable","message":"anonymous egress pool is warming up; retry shortly"}}`)
 	header := make(http.Header, 2)
 	header.Set("Content-Type", "application/json")
-	header.Set("Retry-After", strconv.Itoa(int(anonymousRetryAfter/time.Second)))
+	header.Set("Retry-After", strconv.Itoa(int(retryAfter/time.Second)))
 	return &http.Response{
 		StatusCode: http.StatusServiceUnavailable,
 		Status:     "503 Service Unavailable",
 		Header:     header,
 		Body:       io.NopCloser(bytes.NewReader(body)),
 	}
+}
+
+// waitForAnonymousEgress gives a restarting multiplexer a brief chance to
+// bind before answering. It returns false when the grace expires or the
+// request budget ends. A nil proxy manager (no proxy pool configured) is
+// always ready: address lanes are then the intended egress.
+func (g *Gateway) waitForAnonymousEgress(ctx context.Context) bool {
+	if !g.anonymousEgressDown() {
+		return true
+	}
+	deadline := time.Now().Add(anonymousWarmupGrace)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if !g.anonymousEgressDown() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// freeTierForbidden reports whether an upstream 403 is an exit-attributable
+// FreeTier/abuse verdict. The body is left readable for callers that still
+// need it.
+func freeTierForbidden(resp *http.Response) bool {
+	return resp != nil && resp.StatusCode == http.StatusForbidden &&
+		classifyForbidden(peekForbiddenSnippet(resp, 2048)) == forbiddenFreeTier
 }
 
 // anonymousEgressDown reports whether the anonymous tier depends on the proxy
@@ -355,9 +399,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
 	}
-	if g.anonymousEgressDown() {
+	if !g.waitForAnonymousEgress(ctx) {
+		if ctx.Err() != nil {
+			return nil, ctx.Err(), 0
+		}
 		g.logger.Warn("anonymous egress is not ready; returning a retryable 503", "component", "upstream", "event", "anonymous_egress_unavailable", "request_id", ids.Request, "retry_after_s", int(anonymousRetryAfter/time.Second))
-		return anonymousUnavailableResponse(), nil, 0
+		return anonymousUnavailableResponse(anonymousRetryAfter), nil, 0
 	}
 	// The anonymous free tier serves SSE only — non-streaming wire bodies are
 	// rejected with 403 FreeTierError — so streaming is forced here and the
@@ -509,6 +556,21 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 	}
 	if lastResponse != nil {
+		if freeTierForbidden(lastResponse) {
+			// The exit-attributable abuse verdict is internal routing state,
+			// not something a client can act on. Never forward it: replace
+			// the terminal verdict with the same retryable signal used for a
+			// cold pool. This is the last line of defence for configs where a
+			// direct lane is still selectable or a proxy exit gets flagged.
+			httpx.DrainAndClose(lastResponse.Body)
+			g.logger.Warn("suppressed terminal FreeTier verdict; returning a retryable 503", "component", "upstream", "event", "anonymous_freitier_suppressed", "request_id", ids.Request, "attempts", attempts, "retry_after_s", int(anonymousRetryAfter/time.Second))
+			return anonymousUnavailableResponse(anonymousRetryAfter), nil, attempts
+		}
+		if lastResponse.StatusCode == http.StatusTooManyRequests && lastResponse.Header.Get("Retry-After") == "" {
+			// Upstream 429s rarely carry Retry-After; give clients a bounded
+			// backoff instead of an immediate retry storm against the pool.
+			lastResponse.Header.Set("Retry-After", strconv.Itoa(int(anonymousRetryAfter/time.Second)))
+		}
 		return lastResponse, nil, attempts
 	}
 	if ctx.Err() != nil {
@@ -521,7 +583,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	if attempts == 0 || g.anonymousEgressDown() {
 		g.logger.Warn("anonymous egress has no usable lanes; returning a retryable 503", "component", "upstream", "event", "anonymous_egress_unavailable", "request_id", ids.Request, "attempts", attempts, "retry_after_s", int(anonymousRetryAfter/time.Second))
-		return anonymousUnavailableResponse(), nil, attempts
+		return anonymousUnavailableResponse(anonymousRetryAfter), nil, attempts
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no healthy anonymous egress lanes available")

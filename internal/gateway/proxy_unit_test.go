@@ -212,16 +212,48 @@ func TestMaybeReplenishProxyBranch(t *testing.T) {
 	}
 	pool.proxies = manager
 	anon := newAnonymousPool(true, pool, time.Second, nil)
+	// With a proxy pool configured the anonymous rotation is proxy-only, so
+	// the direct lane in the shared pool must not become a node.
+	if nodes := anon.snapshotNodes(); len(nodes) != 0 {
+		t.Fatalf("anonymous nodes = %d, want 0 (direct lanes are keyed-only)", len(nodes))
+	}
 	node := manager.profile.Nodes[0]
 	parked := &egressTransport{address: "proxy:0", proxy: &node}
 	anon.maybeReplenish(parked)
 	nodes := anon.snapshotNodes()
-	if len(nodes) != 2 {
-		t.Fatalf("anonymous nodes = %d, want 2 (initial + proxy replacement)", len(nodes))
+	if len(nodes) != 1 {
+		t.Fatalf("anonymous nodes = %d, want 1 (proxy replacement)", len(nodes))
 	}
 	last := nodes[len(nodes)-1].egress
 	if last.proxy == nil || last.address != "proxy:0" {
 		t.Fatalf("replacement lane = %+v, want proxy:0", last)
+	}
+}
+
+// A configured proxy pool keeps the anonymous rotation on multiplexed exits:
+// the shared transport pool still holds direct lanes for keyed traffic, but
+// they never become anonymous nodes.
+func TestAnonymousPoolExcludesDirectWhenProxiesEnabled(t *testing.T) {
+	manager := testProxyManager(t, 2, 0)
+	pool, err := newTransportPool([]string{"direct"}, testPerf(), 0, nil, nil)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	pool.proxies = manager
+	node := manager.profile.Nodes[0]
+	if _, err := pool.addProxyLane(node); err != nil {
+		t.Fatalf("add proxy lane: %v", err)
+	}
+	if got := len(pool.snapshot()); got != 2 {
+		t.Fatalf("transport pool = %d lanes, want direct + proxy", got)
+	}
+	anon := newAnonymousPool(true, pool, time.Second, nil)
+	nodes := anon.snapshotNodes()
+	if len(nodes) != 1 {
+		t.Fatalf("anonymous nodes = %d, want only the proxy lane", len(nodes))
+	}
+	if nodes[0].egress.proxy == nil || nodes[0].egress.address != "proxy:0" {
+		t.Fatalf("anonymous node = %+v, want proxy:0", nodes[0].egress)
 	}
 }
 

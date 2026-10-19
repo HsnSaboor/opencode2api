@@ -165,6 +165,7 @@ func (m *Multiplexer) prepare(ctx context.Context) error {
 }
 
 func (m *Multiplexer) spawn(ctx context.Context) error {
+	started := time.Now()
 	m.mu.Lock()
 	if m.stopped {
 		m.mu.Unlock()
@@ -223,6 +224,9 @@ func (m *Multiplexer) spawn(ctx context.Context) error {
 		m.terminate(cmd, done)
 		return err
 	}
+	if m.log != nil {
+		m.log.Info("proxy multiplexer ready", "component", "egress", "event", "proxy_multiplexer_ready", "socks_port", m.cfg.SocksPort, "duration_ms", time.Since(started).Milliseconds())
+	}
 	return nil
 }
 
@@ -266,7 +270,7 @@ func (m *Multiplexer) waitPort(ctx context.Context) error {
 		if exited {
 			return fmt.Errorf("proxypool: sing-box exited before binding %s (see %s)", m.SocksAddr(), m.logPath())
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 	return fmt.Errorf("proxypool: sing-box did not bind %s in time (see %s)", m.SocksAddr(), m.logPath())
 }
@@ -277,6 +281,7 @@ func (m *Multiplexer) waitPort(ctx context.Context) error {
 // is done, then leaves the process stopped.
 func (m *Multiplexer) Supervise(ctx context.Context) {
 	backoff := time.Second
+	initial := true
 	for {
 		select {
 		case <-ctx.Done():
@@ -289,13 +294,18 @@ func (m *Multiplexer) Supervise(ctx context.Context) {
 		m.mu.Unlock()
 		if done == nil {
 			// No process is running (initial start failed or the spawn is
-			// pending): try to bring one up after the backoff.
-			select {
-			case <-ctx.Done():
-				m.Stop()
-				return
-			case <-time.After(backoff):
+			// pending). The first attempt is immediate: the old one-second
+			// sleep was pure restart latency. Later attempts keep the
+			// exponential backoff so a broken binary cannot spin.
+			if !initial {
+				select {
+				case <-ctx.Done():
+					m.Stop()
+					return
+				case <-time.After(backoff):
+				}
 			}
+			initial = false
 			if m.log != nil {
 				m.log.Info("proxy multiplexer starting", "component", "egress", "event", "proxy_multiplexer_start")
 			}

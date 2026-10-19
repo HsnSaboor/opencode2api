@@ -22,6 +22,7 @@ import (
 var version = "dev"
 
 func main() {
+	startedAt := time.Now()
 	buildinfo.Version = version
 	configPath := flag.String("config", "config.json", "path to config.json")
 	listen := flag.String("listen", "", "override the configured API listen address")
@@ -67,7 +68,7 @@ func main() {
 		Addr: cfg.Listen, Handler: manager.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
 	}
 	servers := []*http.Server{apiServer}
-	go serveHTTP(stopSignals, logger, apiServer, "api")
+	go serveHTTP(stopSignals, logger, apiServer, "api", startedAt)
 
 	if cfg.WebUI.Enabled {
 		admin := adminui.New(manager, monitor, hub, logger)
@@ -75,7 +76,7 @@ func main() {
 			Addr: cfg.WebUI.Listen, Handler: admin.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
 		}
 		servers = append(servers, webServer)
-		go serveHTTP(stopSignals, logger, webServer, "webui")
+		go serveHTTP(stopSignals, logger, webServer, "webui", startedAt)
 	}
 
 	<-signalCtx.Done()
@@ -92,8 +93,8 @@ func main() {
 	stopRuntime()
 }
 
-func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string) {
-	logger.Info("server listening", "component", component, "event", "server_started", "address", server.Addr, "version", buildinfo.Version)
+func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string, startedAt time.Time) {
+	logger.Info("server listening", "component", component, "event", "server_started", "address", server.Addr, "version", buildinfo.Version, "startup_ms", time.Since(startedAt).Milliseconds())
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped unexpectedly", "component", component, "event", "server_failed", "address", server.Addr, "error", err)
 		cancel()

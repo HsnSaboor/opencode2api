@@ -76,6 +76,7 @@ type Gateway struct {
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
+	startup := time.Now()
 	cfg.Rotation.Defaults()
 	rotationManager, err := rotation.New("", cfg.Rotation)
 	if err != nil {
@@ -96,25 +97,29 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		// The sampled pool is fresh per process start, so one startup line
 		// names what this instance actually rotates. Full literals stay at
 		// debug: a pool of 128 addresses would spam the default log level.
-		logger.Info("egress pool ready", "component", "egress", "event", "egress_pool_ready", "prefixes", prefixes, "pool_size", len(addresses))
+		logger.Info("egress pool ready", "component", "egress", "event", "egress_pool_ready", "prefixes", prefixes, "pool_size", len(addresses), "setup_ms", time.Since(startup).Milliseconds())
 		logger.Debug("egress pool addresses", "component", "egress", "event", "egress_pool_addresses", "addresses", addresses)
 	}
-	// Pre-dial every lane against the same neutral target the scheduled
-	// health checks use, so the first client request does not pay for TLS
-	// and route setup. Warm failures never fail startup: lanes stay
-	// healthy and recover on demand.
-	warmCtx, warmCancel := context.WithTimeout(context.Background(), egressWarmTimeout)
-	results := transports.warmLanes(warmCtx, egressHealthCheckURL, egressHealthCheckTimeout)
-	warmCancel()
-	warmed := 0
-	for _, result := range results {
-		if result.err == nil {
-			warmed++
+	// Pre-dial lanes in the background against the same neutral target the
+	// scheduled health checks use, so the first client request usually finds
+	// a warm TLS route. Warming must not gate startup: a few dead addresses
+	// used to stretch the listener's arrival to egressWarmTimeout, which is
+	// exactly the restart window clients saw as an outage.
+	go func() {
+		started := time.Now()
+		warmCtx, warmCancel := context.WithTimeout(context.Background(), egressWarmTimeout)
+		defer warmCancel()
+		results := transports.warmLanes(warmCtx, egressHealthCheckURL, egressHealthCheckTimeout)
+		warmed := 0
+		for _, result := range results {
+			if result.err == nil {
+				warmed++
+			}
 		}
-	}
-	if logger != nil {
-		logger.Info("egress pool warmed", "component", "egress", "event", "egress_pool_warmed", "warmed", warmed, "total", len(results))
-	}
+		if logger != nil {
+			logger.Info("egress pool warmed", "component", "egress", "event", "egress_pool_warmed", "warmed", warmed, "total", len(results), "duration_ms", time.Since(started).Milliseconds())
+		}
+	}()
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
 	tiers := cfg.Tiers()
 	channels := make(map[config.Tier]*channel, len(tiers))
@@ -162,7 +167,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		transports.proxies = manager
 		seeded := gateway.seedProxyLanes()
 		if logger != nil {
-			logger.Info("proxy pool ready", "component", "egress", "event", "proxy_pool_ready", "nodes", len(manager.profile.Nodes), "lanes", seeded, "count", manager.cfg.Count, "socks_port", manager.cfg.SocksPort, "state_file", manager.statePath)
+			logger.Info("proxy pool ready", "component", "egress", "event", "proxy_pool_ready", "nodes", len(manager.profile.Nodes), "lanes", seeded, "count", manager.cfg.Count, "socks_port", manager.cfg.SocksPort, "state_file", manager.statePath, "startup_ms", time.Since(startup).Milliseconds())
 		}
 	}
 	if cfg.Anonymous && cfg.Egress.Proxies.Enabled {
@@ -219,6 +224,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
+	// /health is the conventional readiness path monitors probe; keep it as
+	// an alias so a 404 never reads as "gateway down".
+	mux.HandleFunc("GET /health", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }
 

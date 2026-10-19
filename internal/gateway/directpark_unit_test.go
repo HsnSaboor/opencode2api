@@ -46,13 +46,13 @@ func TestDirectEgressHardParkSkipsNonProxyLanes(t *testing.T) {
 }
 
 func TestAnonymousUnavailableResponseIsRetryable(t *testing.T) {
-	resp := anonymousUnavailableResponse()
+	resp := anonymousUnavailableResponse(anonymousRetryAfter)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
-	if got := resp.Header.Get("Retry-After"); got != "10" {
-		t.Fatalf("Retry-After = %q, want 10", got)
+	if got := resp.Header.Get("Retry-After"); got != "5" {
+		t.Fatalf("Retry-After = %q, want 5", got)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -212,13 +212,23 @@ func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Dur
 		return pool
 	}
 	pool.nodes = make([]*anonymousNode, 0, len(transports.items))
-	// L1 Egress: Place proxy lanes (WARP) first for immediate 200 OK
+	// Proxy lanes lead: multiplexed exits carry independent reputation and
+	// are the only anonymous egress the free tier currently serves.
 	for _, egress := range transports.items {
 		if egress.proxy != nil {
 			pool.nodes = append(pool.nodes, &anonymousNode{egress: egress})
 		}
 	}
-	// L2 Egress: Place native address lanes after proxies
+	if transports.proxies != nil {
+		// When the proxy pool is configured, the direct datacenter lanes stay
+		// in the shared transport pool for keyed traffic but never enter the
+		// anonymous rotation. The free tier rejects those prefixes wholesale,
+		// so adding them would only burn scan attempts (and can expose the
+		// upstream "abusive traffic" 403). The hard park remains the safety
+		// net for deployments that run without a proxy pool.
+		return pool
+	}
+	// Without a proxy pool, address lanes are the only anonymous egress.
 	for _, egress := range transports.items {
 		if egress.proxy == nil {
 			pool.nodes = append(pool.nodes, &anonymousNode{egress: egress})
@@ -1150,6 +1160,11 @@ func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout 
 	return out
 }
 
+// egressWarmConcurrency bounds the background startup pre-dial. A 128-lane
+// pool used to fan out every TLS handshake at once; sixteen at a time keeps
+// the restart CPU/network spike small without stretching the warm window.
+const egressWarmConcurrency = 16
+
 // warmLanes pre-dials every lane against the health-check target so TLS
 // and routing are established before the first client request. Failures
 // never fail startup: lanes stay marked healthy and warm on demand via the
@@ -1159,12 +1174,15 @@ func (p *transportPool) warmLanes(ctx context.Context, target string, timeout ti
 	items := p.snapshot()
 	results := make(chan egressHealthResult, len(items))
 	checks := 0
+	sem := make(chan struct{}, egressWarmConcurrency)
 	for _, egress := range items {
 		if !egress.checking.CompareAndSwap(false, true) {
 			continue
 		}
 		checks++
+		sem <- struct{}{}
 		go func() {
+			defer func() { <-sem }()
 			results <- p.checkClaimedEgress(ctx, egress, target, timeout)
 		}()
 	}

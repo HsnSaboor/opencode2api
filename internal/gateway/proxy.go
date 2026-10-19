@@ -155,10 +155,13 @@ type proxyManager struct {
 	// refusing the canonical profile from a verified exit: during a
 	// request-scoped wave every probe would be charged to a healthy node.
 	gateHoldUntil time.Time
-	// wake nudges the fill and verify loops when the pool wants a node and
-	// none is ready. Buffered so a signal left while no loop is listening
-	// is not lost.
-	wake chan struct{}
+	// wake nudges the verify loop when the pool wants a verified node and
+	// none is ready. fillWake nudges the fill loop when a verification
+	// admits one; the two are separate so a signal for one loop cannot be
+	// consumed by the other. Both are buffered so a signal left while no
+	// loop is listening is not lost.
+	wake     chan struct{}
+	fillWake chan struct{}
 }
 
 // newProxyManager loads the profile and prepares (but does not start) the
@@ -185,6 +188,7 @@ func newProxyManager(cfg config.ProxyPoolConfig, logger *slog.Logger) (*proxyMan
 		statePath: statePath,
 		state:     make([]proxyNodeState, len(profile.Nodes)),
 		wake:      make(chan struct{}, 1),
+		fillWake:  make(chan struct{}, 1),
 	}
 	manager.loadState()
 	// Drain excluded nodes: they keep their slot (index stability, so the
@@ -262,6 +266,19 @@ func (m *proxyManager) requestVerify() {
 	}
 }
 
+// requestFill nudges the fill loop; it never blocks. Called when a
+// verification admits a node so a fresh exit joins rotation immediately
+// instead of waiting for the next five-second fill tick.
+func (m *proxyManager) requestFill() {
+	if m == nil {
+		return
+	}
+	select {
+	case m.fillWake <- struct{}{}:
+	default:
+	}
+}
+
 // nextCandidate claims the next node for a probe: unverified nodes always,
 // plus verified-but-unused nodes whose verdict is older than the re-verify
 // window. The probing flag keeps concurrent workers off the same node.
@@ -314,6 +331,7 @@ func (m *proxyManager) completeVerify(index int, outcome proxyProbeOutcome) {
 			m.logger.Info("proxy node verified", "component", "egress", "event", "proxy_node_verified", "node", index, "type", m.profile.Nodes[index].Type, "verified_total", m.verifiedLocked())
 		}
 		m.dirty = true
+		m.requestFill()
 	case proxyOutcomeInconclusive:
 		// No verdict: no state change, no cooldown.
 		return
@@ -660,6 +678,11 @@ func (g *Gateway) proxyWarmSeededLoop(ctx context.Context) {
 			return
 		}
 		if g.proxies.mux.Ready() {
+			// The pool is now usable: ask for a verification wave and let
+			// the fill loop admit any already-verified reserves immediately,
+			// instead of waiting up to a tick for growth to start.
+			g.proxies.requestVerify()
+			g.proxies.requestFill()
 			for _, lane := range g.transports.snapshot() {
 				if lane.proxy != nil {
 					g.warmProxyLane(lane)
@@ -687,7 +710,7 @@ func (g *Gateway) proxyFillLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		case <-manager.wake:
+		case <-manager.fillWake:
 		}
 		if ctx.Err() != nil {
 			return
