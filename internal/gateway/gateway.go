@@ -573,6 +573,16 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 			}
 			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
 		}
+		if protocol == wire.Chat {
+			// A tool call whose arguments were truncated — for example by an
+			// interrupted stream the client persisted — makes strict upstreams
+			// reject the whole conversation ("Assistant tool call
+			// function.arguments must be a JSON object"). Repair the history
+			// here instead of failing every request that carries it.
+			if repaired := wire.RepairChatToolCallArguments(upstreamPayload); repaired > 0 {
+				g.logger.Info("repaired malformed tool call arguments before forwarding", "component", "conversion", "event", "tool_call_arguments_repaired", "model", jsonutil.StringAt(input, "model"), "tier", tier, "calls", repaired)
+			}
+		}
 		if effort := g.resolvedEffort(jsonutil.StringAt(upstreamPayload, "model"), tier, protocol); effort != "" {
 			wire.ForcedEffort(protocol, upstreamPayload, effort)
 		}
