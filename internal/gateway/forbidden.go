@@ -37,7 +37,12 @@ func classifyForbidden(snippet string) forbiddenVerdict {
 	case strings.Contains(snippet, "FreeTierError"),
 		strings.Contains(snippet, "Abuse Traffic"),
 		strings.Contains(snippet, "Detect Abuse Traffic"),
-		strings.Contains(snippet, "abuse_traffic"):
+		strings.Contains(snippet, "abuse_traffic"),
+		// The user-visible free-tier network block reads "we've detected
+		// abusive traffic from this IP address"; it is the same
+		// exit-attributable class as the other FreeTier markers.
+		strings.Contains(snippet, "abusive traffic"),
+		strings.Contains(snippet, "Abusive Traffic"):
 		return forbiddenFreeTier
 	case strings.Contains(snippet, "RegionError"):
 		return forbiddenRegion

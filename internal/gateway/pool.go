@@ -74,6 +74,13 @@ type transportPool struct {
 	prefixMu      sync.Mutex
 	prefixStrikes map[string]int
 	prefixCooling map[string]int64
+	// directParkUntil hard-parks every non-proxy ("direct") lane after an
+	// upstream FreeTier/abuse verdict. Direct lanes draw on the host's
+	// datacenter prefixes, which the free tier refuses wholesale; keeping
+	// them selectable burns scan budget and can surface the upstream
+	// "abusive traffic" 403 when no proxy lane is ready. Set at startup when
+	// the proxy pool is enabled and refreshed by each fresh verdict.
+	directParkUntil atomic.Int64
 	// maxLanes caps total lanes (initial + replacements) so a sustained
 	// flag storm cannot grow the pool without bound. Zero means the
 	// constructor default below.
@@ -393,6 +400,16 @@ func (p *anonymousPool) prefixCooling(egress *egressTransport) bool {
 	return p.transports.prefixCooled(key)
 }
 
+// directClassParked reports whether the node belongs to the hard-parked
+// direct egress class. The park covers every non-proxy lane, so the cursor
+// drops them from the scan instead of deferring them: unlike a prefix
+// cooldown, this is a class-wide verdict, and retrying a sibling only buys
+// another upstream rejection.
+func (c *anonymousCursor) directClassParked(node *anonymousNode) bool {
+	return node != nil && node.egress != nil && node.egress.proxy == nil &&
+		c.pool != nil && c.pool.transports != nil && c.pool.transports.DirectEgressParked()
+}
+
 // Next visits each healthy, non-cooling, non-parked egress lane at most once
 // per cursor. Lanes of a prefix cooling from repeated FreeTier verdicts are
 // deferred to the end of the scan: the flag covers the prefix as a unit, so
@@ -409,6 +426,9 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		if !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
 			continue
 		}
+		if c.directClassParked(node) {
+			continue
+		}
 		if c.pool != nil && c.pool.prefixCooling(node.egress) {
 			c.deferred = append(c.deferred, node)
 			continue
@@ -419,6 +439,9 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		node := c.deferred[0]
 		c.deferred = c.deferred[1:]
 		if node == nil || !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
+			continue
+		}
+		if c.directClassParked(node) {
 			continue
 		}
 		return node
@@ -478,6 +501,13 @@ const recentSuccessLimit = 6
 // clears. It mirrors zen-proxy's mark_freitier_blocked: per-lane only, never
 // subnet-wide, health and failure counters untouched.
 const freitierCooldown = 30 * time.Minute
+
+// directEgressHardPark is the park applied to the whole non-proxy lane class
+// when the free tier answers it with a FreeTier/abuse verdict. It is far
+// longer than the per-lane freitierCooldown because the verdict describes the
+// host's datacenter prefixes, not one address: the flag has to clear upstream
+// before any sibling /64 will serve again.
+const directEgressHardPark = 12 * time.Hour
 
 // Prefix-level cooling: one FreeTier 403 parks a single lane, but a prefix
 // whose lanes keep answering FreeTier is blocked upstream as a unit — a
@@ -539,6 +569,11 @@ func (p *anonymousPool) replenishPrefixes() []string {
 // of sampling an IPv6 address.
 func (p *anonymousPool) maybeReplenish(parked *egressTransport) {
 	if p == nil || p.transports == nil {
+		return
+	}
+	if parked != nil && parked.proxy == nil && p.transports.DirectEgressParked() {
+		// The direct class is benched as a unit; minting a fresh prefix lane
+		// would only add an unselectable node.
 		return
 	}
 	var lane *egressTransport
@@ -718,6 +753,24 @@ func (p *transportPool) CoolingPrefixes() map[string]time.Time {
 	return out
 }
 
+// ParkDirectEgress hard-parks every non-proxy lane for d. Direct lanes are
+// the host's own route and addresses sampled from the configured datacenter
+// prefixes; the free tier flags those ranges as abusive as a class, so one
+// verdict benches all of them instead of letting each sibling pay the same
+// 403. Proxy lanes are unaffected: their exits carry independent reputation
+// and keep serving anonymous traffic.
+func (p *transportPool) ParkDirectEgress(d time.Duration) {
+	if p == nil || d <= 0 {
+		return
+	}
+	p.directParkUntil.Store(time.Now().Add(d).UnixNano())
+}
+
+// DirectEgressParked reports whether the non-proxy lane class is hard-parked.
+func (p *transportPool) DirectEgressParked() bool {
+	return p != nil && p.directParkUntil.Load() > time.Now().UnixNano()
+}
+
 // prefixCooled reports whether the canonical prefix key is cooling from
 // repeated FreeTier verdicts. Selection drains a blocked prefix's siblings
 // after the independent fate classes (see interleaveOrder); probation
@@ -791,11 +844,12 @@ func (p *transportPool) hasHealthy() bool {
 func (p *transportPool) selectableCounts(nodes []*anonymousNode) (total, healthy, parked, cooling int) {
 	snap := p.snapshot()
 	now := time.Now().UnixNano()
+	directParked := p.DirectEgressParked()
 	for _, egress := range snap {
 		if egress.healthy.Load() {
 			healthy++
 		}
-		if egress.freitierUntil.Load() > now {
+		if egress.freitierUntil.Load() > now || (directParked && egress.proxy == nil) {
 			parked++
 		}
 	}

@@ -296,6 +296,39 @@ const freitierScanLimit = 10
 // so a total wave costs at most one canary round and one budget per request.
 const freitierScanExtendedLimit = 24
 
+// anonymousRetryAfter is the delay advertised when the anonymous tier has no
+// usable egress. Proxy lanes are seeded before the multiplexer answers SOCKS,
+// so the first requests after a restart can fail with transport errors; a
+// short retry lets the client wait for the pool to warm up instead of
+// surfacing an abuse verdict from a direct lane.
+const anonymousRetryAfter = 10 * time.Second
+
+// anonymousUnavailableResponse builds the retryable 503 the anonymous tier
+// returns when its egress is not ready. Direct lanes are hard-parked, so
+// there is nothing healthy to fall through to; a 503 with Retry-After tells
+// clients to try again instead of forwarding an upstream 403 that reads like
+// an account-level refusal.
+func anonymousUnavailableResponse() *http.Response {
+	body := []byte(`{"error":{"type":"service_unavailable","message":"anonymous egress pool is warming up; retry shortly"}}`)
+	header := make(http.Header, 2)
+	header.Set("Content-Type", "application/json")
+	header.Set("Retry-After", strconv.Itoa(int(anonymousRetryAfter/time.Second)))
+	return &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Status:     "503 Service Unavailable",
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+}
+
+// anonymousEgressDown reports whether the anonymous tier depends on the proxy
+// multiplexer and the multiplexer is not accepting connections. Direct lanes
+// are hard-parked whenever the pool is enabled, so a down multiplexer means
+// there is no selectable anonymous egress at all.
+func (g *Gateway) anonymousEgressDown() bool {
+	return g != nil && g.proxies != nil && g.proxies.mux != nil && !g.proxies.mux.Ready()
+}
+
 // doAnonymousUpstream tries every currently available egress lane at most
 // once. Transport failures and retryable responses (5xx, 401/403/429)
 // advance to the next lane; a deterministic non-retryable 4xx ends the scan
@@ -321,6 +354,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	body := bodies[config.TierZen]
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
+	}
+	if g.anonymousEgressDown() {
+		g.logger.Warn("anonymous egress is not ready; returning a retryable 503", "component", "upstream", "event", "anonymous_egress_unavailable", "request_id", ids.Request, "retry_after_s", int(anonymousRetryAfter/time.Second))
+		return anonymousUnavailableResponse(), nil, 0
 	}
 	// The anonymous free tier serves SSE only — non-streaming wire bodies are
 	// rejected with 403 FreeTierError — so streaming is forced here and the
@@ -384,6 +421,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			if verdict == forbiddenFreeTier {
+				if node.egress.proxy == nil {
+					if !g.transports.DirectEgressParked() {
+						g.logger.Info("direct egress class hard-parked after a FreeTier verdict", "component", "upstream", "event", "direct_egress_hard_parked", "request_id", ids.Request, "egress", config.RedactURL(node.egress.address), "duration", directEgressHardPark.String())
+					}
+					g.transports.ParkDirectEgress(directEgressHardPark)
+				}
 				g.parkEgressFreitier(node.egress)
 				requestParks = append(requestParks, node.egress)
 				if prefix, strikes, cooling := g.transports.StrikePrefix(node.egress.address); prefix != "" {
@@ -467,6 +510,18 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
+	}
+	if ctx.Err() != nil {
+		// Preserve the request-budget outcome: callers map a deadline to a
+		// typed timeout, not to a retryable pool-warming error.
+		if lastErr == nil {
+			lastErr = ctx.Err()
+		}
+		return nil, lastErr, attempts
+	}
+	if attempts == 0 || g.anonymousEgressDown() {
+		g.logger.Warn("anonymous egress has no usable lanes; returning a retryable 503", "component", "upstream", "event", "anonymous_egress_unavailable", "request_id", ids.Request, "attempts", attempts, "retry_after_s", int(anonymousRetryAfter/time.Second))
+		return anonymousUnavailableResponse(), nil, attempts
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no healthy anonymous egress lanes available")

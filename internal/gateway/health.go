@@ -138,7 +138,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // egressStatus snapshots the pool the way selection sees it: transport
 // totals plus park/cooling pressure plus the anonymous selectable count.
 // Selectable mirrors anonymousCursor.Next (healthy lane, no node cooldown,
-// no freitier park) without consuming a cursor.
+// no freitier park, no direct-class hard park) without consuming a cursor.
 func (g *Gateway) egressStatus() (total, healthy, parked, cooling, selectable int) {
 	nodes := g.anonymous.snapshotNodes()
 	total, healthy, parked, cooling = g.transports.selectableCounts(nodes)
@@ -146,13 +146,18 @@ func (g *Gateway) egressStatus() (total, healthy, parked, cooling, selectable in
 		return total, healthy, parked, cooling, 0
 	}
 	now := time.Now().UnixNano()
+	directParked := g.transports != nil && g.transports.DirectEgressParked()
 	for _, node := range nodes {
 		if node == nil || node.egress == nil {
 			continue
 		}
-		if node.egress.healthy.Load() && node.cooldownUntil.Load() <= now && node.egress.freitierUntil.Load() <= now {
-			selectable++
+		if !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
+			continue
 		}
+		if directParked && node.egress.proxy == nil {
+			continue
+		}
+		selectable++
 	}
 	return total, healthy, parked, cooling, selectable
 }

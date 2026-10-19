@@ -165,6 +165,15 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 			logger.Info("proxy pool ready", "component", "egress", "event", "proxy_pool_ready", "nodes", len(manager.profile.Nodes), "lanes", seeded, "count", manager.cfg.Count, "socks_port", manager.cfg.SocksPort, "state_file", manager.statePath)
 		}
 	}
+	if cfg.Anonymous && cfg.Egress.Proxies.Enabled {
+		// The free tier now rejects the host's datacenter prefixes as abusive
+		// as a class. Bench them from the start instead of waiting for the
+		// first request to discover the block and briefly surface its 403.
+		transports.ParkDirectEgress(directEgressHardPark)
+		if logger != nil {
+			logger.Info("direct egress lanes hard-parked for anonymous traffic", "component", "egress", "event", "direct_egress_hard_parked", "duration", directEgressHardPark.String())
+		}
+	}
 	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, prefixes)
 	// Key pools bound before proxy lanes seeded, so spread them now: the
 	// seeded lanes would otherwise idle keyless while one address carries

@@ -336,6 +336,11 @@ func (g *Gateway) probeCoolingPrefixes(ctx context.Context) {
 	if !g.cfg.Anonymous {
 		return
 	}
+	if g.transports.DirectEgressParked() {
+		// The whole direct class is benched; probing its prefixes would only
+		// spend gated requests against exits the pool will not select.
+		return
+	}
 	cooling := g.transports.CoolingPrefixes()
 	if len(cooling) == 0 {
 		return
