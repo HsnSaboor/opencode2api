@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,6 +70,13 @@ const (
 	proxyRejectedCooldownBase  = 15 * time.Minute
 	proxyDeadCooldownCap       = time.Hour
 	proxyFreitierCooldownCap   = 2 * time.Hour
+	// WARP exits are per-device registrations whose address quota recovers
+	// much faster than a public proxy's shared egress. A probe 429 there is
+	// usually transient — real traffic on the same lane often succeeds while
+	// the probe is briefly limited — so retry it on the request-path cadence
+	// instead of parking the lane for half an hour.
+	proxyWarpRateLimitCooldownBase = 5 * time.Minute
+	proxyWarpRateLimitCooldownCap  = 15 * time.Minute
 )
 
 // proxyProbeOutcome is the verdict of one candidate verification probe.
@@ -311,7 +319,7 @@ func (m *proxyManager) completeVerify(index int, outcome proxyProbeOutcome) {
 		return
 	default:
 		state.failures++
-		state.coolingUntil = now.Add(proxyCooldownFor(outcome, state.failures))
+		state.coolingUntil = now.Add(m.cooldownFor(index, outcome, state.failures))
 		// A failed verdict — including one on a stale re-verify — retires
 		// the admission until the node passes again.
 		state.verified = false
@@ -320,6 +328,23 @@ func (m *proxyManager) completeVerify(index int, outcome proxyProbeOutcome) {
 		}
 		m.dirty = true
 	}
+}
+
+// cooldownFor applies the node-specific probe cooldown. WARP lanes are
+// per-device quota buckets: their 429s clear on the request-path timescale,
+// while public proxies stay rate-limited much longer.
+func (m *proxyManager) cooldownFor(index int, outcome proxyProbeOutcome, failures int) time.Duration {
+	if outcome == proxyOutcomeRateLimited && m.isWarpNode(index) {
+		shift := max(failures-1, 0)
+		return min(proxyWarpRateLimitCooldownBase*time.Duration(1<<min(shift, 2)), proxyWarpRateLimitCooldownCap)
+	}
+	return proxyCooldownFor(outcome, failures)
+}
+
+// isWarpNode reports whether a profile node is a Cloudflare WARP exit.
+func (m *proxyManager) isWarpNode(index int) bool {
+	return m != nil && index >= 0 && index < len(m.profile.Nodes) &&
+		strings.HasPrefix(m.profile.Nodes[index].Tag, "cf-warp-")
 }
 
 // proxyCooldownFor maps a failure verdict and running failure count to the

@@ -133,6 +133,27 @@ func TestProxyCooldownBounds(t *testing.T) {
 	}
 }
 
+// WARP probe 429s are transient address quota, not dead exits: they retry on
+// the request-path cadence instead of the generic 30-minute park.
+func TestWarpRateLimitCooldown(t *testing.T) {
+	manager := &proxyManager{profile: &proxypool.Profile{Nodes: []proxypool.Node{
+		{Tag: "cf-warp-1"},
+		{Tag: "chk-1"},
+	}}}
+	if got := manager.cooldownFor(0, proxyOutcomeRateLimited, 1); got != proxyWarpRateLimitCooldownBase {
+		t.Fatalf("warp rate-limited base = %v, want %v", got, proxyWarpRateLimitCooldownBase)
+	}
+	if got := manager.cooldownFor(0, proxyOutcomeRateLimited, 99); got != proxyWarpRateLimitCooldownCap {
+		t.Fatalf("warp rate-limited cap = %v, want %v", got, proxyWarpRateLimitCooldownCap)
+	}
+	if got := manager.cooldownFor(1, proxyOutcomeRateLimited, 1); got != proxyRateLimitCooldownBase {
+		t.Fatalf("non-warp rate-limited base = %v, want %v", got, proxyRateLimitCooldownBase)
+	}
+	if got := manager.cooldownFor(0, proxyOutcomeFreitier, 1); got != proxyFreitierCooldownBase {
+		t.Fatalf("warp freitier base = %v, want %v", got, proxyFreitierCooldownBase)
+	}
+}
+
 // A proxy park's replacement lane must come from the verified node set, bind
 // the node, and leave the node busy for a second lane.
 func TestReplenishProxyLaneBindsNode(t *testing.T) {
