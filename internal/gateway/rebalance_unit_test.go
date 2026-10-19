@@ -29,7 +29,7 @@ func TestRebalanceSpreadsKeysOntoLaterLanes(t *testing.T) {
 		lane.healthy.Store(true)
 		pool.items = append(pool.items, lane)
 	}
-	if moved := nodes.RebalanceEgress(nil, false); moved != 4 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 4 {
 		t.Fatalf("RebalanceEgress moved %d, want 4", moved)
 	}
 	if got := nodes.bindingCount[0]; got != 0 {
@@ -51,7 +51,7 @@ func TestRebalanceSpreadsKeysOntoLaterLanes(t *testing.T) {
 			t.Fatalf("lane %d holds %d keys, want 1", lane, count)
 		}
 	}
-	if moved := nodes.RebalanceEgress(nil, false); moved != 0 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 0 {
 		t.Fatalf("second RebalanceEgress moved %d, want 0", moved)
 	}
 	// Re-homed keys must not snap back when the original lane recovers.
@@ -74,7 +74,7 @@ func TestRebalanceSkipsUnhealthyLanes(t *testing.T) {
 	well := &egressTransport{index: 2, address: "proxy:2", proxy: &proxypool.Node{}}
 	well.healthy.Store(true)
 	pool.items = append(pool.items, sick, well)
-	if moved := nodes.RebalanceEgress(nil, false); moved != 1 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 1 {
 		t.Fatalf("RebalanceEgress moved %d, want 1", moved)
 	}
 	if got := nodes.bindingCount[0]; got != 1 {
@@ -116,7 +116,7 @@ func TestRebalancePrefersDedicatedLanes(t *testing.T) {
 		t.Fatalf("newNodePool: %v", err)
 	}
 	pool.items = append(pool.items, laneAt(1, "2001:db8:1::5"), laneAt(2, "2001:db8:2::9"), proxyAt(3))
-	if moved := nodes.RebalanceEgress(nil, false); moved != 2 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 2 {
 		t.Fatalf("RebalanceEgress moved %d, want 2", moved)
 	}
 	if got := nodes.bindingCount[0]; got != 0 {
@@ -149,7 +149,7 @@ func TestRebalanceAvoidsBenchedLanes(t *testing.T) {
 	cooled := laneAt(2, "2001:db8:2::9")
 	pool.items = append(pool.items, parked, cooled, proxyAt(3))
 	pool.CoolSubnet(cooled.address, time.Hour)
-	if moved := nodes.RebalanceEgress(nil, false); moved != 1 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 1 {
 		t.Fatalf("RebalanceEgress moved %d, want 1", moved)
 	}
 	if got := nodes.bindingCount[0]; got != 1 {
@@ -164,7 +164,7 @@ func TestRebalanceAvoidsBenchedLanes(t *testing.T) {
 	// Once the park expires the lane rejoins selection and takes the key
 	// that was left on the host's address.
 	parked.freitierUntil.Store(0)
-	if moved := nodes.RebalanceEgress(nil, false); moved != 1 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 1 {
 		t.Fatalf("RebalanceEgress after park expiry moved %d, want 1", moved)
 	}
 	if got := nodes.bindingCount[1]; got != 1 {
@@ -191,7 +191,7 @@ func TestRebindEgressAvoidsBenchedLanes(t *testing.T) {
 	parked := laneAt(1, "2001:db8:1::5")
 	parked.freitierUntil.Store(time.Now().Add(time.Hour).UnixNano())
 	pool.items = append(pool.items, parked, proxyAt(2))
-	if moved := nodes.RebindEgress(0, false); moved != 2 {
+	if moved := nodes.RebindEgress(0, homeDedicated); moved != 2 {
 		t.Fatalf("RebindEgress moved %d, want 2", moved)
 	}
 	if got := nodes.bindingCount[1]; got != 0 {
@@ -201,8 +201,8 @@ func TestRebindEgressAvoidsBenchedLanes(t *testing.T) {
 		t.Fatalf("proxy lane holds %d keys, want 2", got)
 	}
 
-	// A preferProxy pool looks for a vacant proxy exit before the first
-	// empty dedicated lane, mirroring RebalanceEgress's home order.
+	// A homeProxyFirst pool looks for a vacant proxy exit before the
+	// first empty dedicated lane, mirroring RebalanceEgress's home order.
 	pool3, err := newTransportPool([]string{"direct4"}, testPerf(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newTransportPool: %v", err)
@@ -212,11 +212,33 @@ func TestRebindEgressAvoidsBenchedLanes(t *testing.T) {
 		t.Fatalf("newNodePool: %v", err)
 	}
 	pool3.items = append(pool3.items, laneAt(1, "2001:db8:5::5"), proxyAt(2))
-	if moved := nodes3.RebindEgress(0, true); moved != 1 {
-		t.Fatalf("preferProxy RebindEgress moved %d, want 1", moved)
+	if moved := nodes3.RebindEgress(0, homeProxyFirst); moved != 1 {
+		t.Fatalf("homeProxyFirst RebindEgress moved %d, want 1", moved)
 	}
 	if got := int(nodes3.nodes[0].egressIndex.Load()); got != 2 {
-		t.Fatalf("preferProxy rebind egressIndex = %d, want 2 (the exit)", got)
+		t.Fatalf("homeProxyFirst rebind egressIndex = %d, want 2 (the exit)", got)
+	}
+
+	// A homeDedicatedOnly pool (Zen) moves a key off a failed lane onto
+	// the first vacant dedicated lane even when a proxy exit is vacant
+	// too: no exit may ever carry its keys.
+	pool4, err := newTransportPool([]string{"direct4"}, testPerf(), 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newTransportPool: %v", err)
+	}
+	nodes4, err := newNodePool([]string{"k0"}, pool4, time.Second)
+	if err != nil {
+		t.Fatalf("newNodePool: %v", err)
+	}
+	pool4.items = append(pool4.items, laneAt(1, "2001:db8:6::5"), proxyAt(2))
+	if moved := nodes4.RebindEgress(0, homeDedicatedOnly); moved != 1 {
+		t.Fatalf("homeDedicatedOnly RebindEgress moved %d, want 1", moved)
+	}
+	if got := int(nodes4.nodes[0].egressIndex.Load()); got != 1 {
+		t.Fatalf("homeDedicatedOnly rebind egressIndex = %d, want 1 (the dedicated lane)", got)
+	}
+	if got := nodes4.bindingCount[2]; got != 0 {
+		t.Fatalf("homeDedicatedOnly rebind landed %d keys on an exit, want 0", got)
 	}
 
 	pool2, err := newTransportPool([]string{"direct4"}, testPerf(), 0, nil, nil)
@@ -230,7 +252,7 @@ func TestRebindEgressAvoidsBenchedLanes(t *testing.T) {
 	parked2 := laneAt(1, "2001:db8:3::5")
 	parked2.freitierUntil.Store(time.Now().Add(time.Hour).UnixNano())
 	pool2.items = append(pool2.items, parked2)
-	if moved := nodes2.RebindEgress(0, false); moved != 0 {
+	if moved := nodes2.RebindEgress(0, homeDedicated); moved != 0 {
 		t.Fatalf("RebindEgress moved %d keys onto a parked lane, want 0", moved)
 	}
 	if got := nodes2.bindingCount[0]; got != 2 {
@@ -254,7 +276,7 @@ func TestRebalanceMovesBenchedKeyOntoHealthyLane(t *testing.T) {
 	// k0 binds lane 0, k1 lane 1; then lane 1 parks on a FreeTier verdict.
 	pool.items[1].freitierUntil.Store(time.Now().Add(time.Hour).UnixNano())
 	pool.items = append(pool.items, laneAt(2, "2001:db8:3::7"))
-	if moved := nodes.RebalanceEgress(nil, false); moved != 1 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 1 {
 		t.Fatalf("RebalanceEgress moved %d keys, want 1 (the benched key)", moved)
 	}
 	if got := nodes.bindingCount[1]; got != 0 {
@@ -266,18 +288,16 @@ func TestRebalanceMovesBenchedKeyOntoHealthyLane(t *testing.T) {
 	if got := int(nodes.nodes[1].egressIndex.Load()); got != 2 {
 		t.Fatalf("benched key egressIndex = %d, want 2", got)
 	}
-	if moved := nodes.RebalanceEgress(nil, false); moved != 0 {
+	if moved := nodes.RebalanceEgress(nil, homeDedicated); moved != 0 {
 		t.Fatalf("second RebalanceEgress moved %d keys, want 0", moved)
 	}
 }
 
-// Zen keys invert the home order: the free-tier gate rejects the configured
-// prefixes as a class, so a healthy dedicated lane is not a working home for
-// free models and the pass drains Zen keys onto proxy exits while vacant
-// exits wait. With no exit vacancy the healthy dedicated keys stay put — the
-// pass never churns them between equivalent lanes — and a benched exit hands
-// its key to the next vacant one.
-func TestRebalanceZenKeysHomeOnProxyExits(t *testing.T) {
+// A homeProxyFirst pool drains healthy dedicated keys onto vacant exits —
+// the configuration for a gate that rejects the configured prefixes as a
+// class while exits keep answering. With no exit vacancy healthy keys stay
+// put, and a benched exit hands its key to the next vacant one.
+func TestRebalanceProxyFirstHomeOrder(t *testing.T) {
 	pool, err := newTransportPool([]string{"2001:db8:1::5", "2001:db8:2::9"}, testPerf(), 0, nil, nil)
 	if err != nil {
 		t.Fatalf("newTransportPool: %v", err)
@@ -287,11 +307,11 @@ func TestRebalanceZenKeysHomeOnProxyExits(t *testing.T) {
 		t.Fatalf("newNodePool: %v", err)
 	}
 	// Both keys start on dedicated lanes; without exits they must stay.
-	if moved := nodes.RebalanceEgress(nil, true); moved != 0 {
+	if moved := nodes.RebalanceEgress(nil, homeProxyFirst); moved != 0 {
 		t.Fatalf("RebalanceEgress without exits moved %d keys, want 0", moved)
 	}
 	pool.items = append(pool.items, proxyAt(2))
-	if moved := nodes.RebalanceEgress(nil, true); moved != 1 {
+	if moved := nodes.RebalanceEgress(nil, homeProxyFirst); moved != 1 {
 		t.Fatalf("RebalanceEgress moved %d keys, want 1 (first exit vacancy)", moved)
 	}
 	if got := nodes.bindingCount[2]; got != 1 {
@@ -301,13 +321,13 @@ func TestRebalanceZenKeysHomeOnProxyExits(t *testing.T) {
 		t.Fatalf("drained key egressIndex = %d, want 2 (the exit)", got)
 	}
 	// A healthy dedicated key never churns while the exit vacancy is gone.
-	if moved := nodes.RebalanceEgress(nil, true); moved != 0 {
+	if moved := nodes.RebalanceEgress(nil, homeProxyFirst); moved != 0 {
 		t.Fatalf("second RebalanceEgress moved %d keys, want 0", moved)
 	}
 	// The exit parks: its key moves to the next vacant exit.
 	pool.items[2].freitierUntil.Store(time.Now().Add(time.Hour).UnixNano())
 	pool.items = append(pool.items, proxyAt(3))
-	if moved := nodes.RebalanceEgress(nil, true); moved != 1 {
+	if moved := nodes.RebalanceEgress(nil, homeProxyFirst); moved != 1 {
 		t.Fatalf("RebalanceEgress after exit park moved %d keys, want 1", moved)
 	}
 	if got := nodes.bindingCount[2]; got != 0 {
@@ -315,5 +335,61 @@ func TestRebalanceZenKeysHomeOnProxyExits(t *testing.T) {
 	}
 	if got := nodes.bindingCount[3]; got != 1 {
 		t.Fatalf("replacement exit holds %d keys, want 1", got)
+	}
+}
+
+// Zen's dedicated-only home: every key rides its own /64 and no proxy exit
+// ever carries keyed traffic. With no exit in play the pass is idle, even
+// when construction stacks keys; a key found riding an exit (a legacy
+// placement) moves onto a vacant dedicated lane — never back onto an exit —
+// and a benched dedicated key stays where it is, because every dedicated
+// lane answers to the same upstream gate and hopping would only park a
+// fresh lane with the same verdict.
+func TestRebalanceDedicatedOnlyHomeOrder(t *testing.T) {
+	pool, err := newTransportPool([]string{"2001:db8:1::5", "2001:db8:2::9"}, testPerf(), 0, nil, nil)
+	if err != nil {
+		t.Fatalf("newTransportPool: %v", err)
+	}
+	nodes, err := newNodePool([]string{"k0", "k1"}, pool, time.Second)
+	if err != nil {
+		t.Fatalf("newNodePool: %v", err)
+	}
+	// Both keys sit on dedicated lanes: nothing to do, exits or not.
+	if moved := nodes.RebalanceEgress(nil, homeDedicatedOnly); moved != 0 {
+		t.Fatalf("RebalanceEgress moved %d keys, want 0", moved)
+	}
+	pool.items = append(pool.items, proxyAt(2))
+	if moved := nodes.RebalanceEgress(nil, homeDedicatedOnly); moved != 0 {
+		t.Fatalf("RebalanceEgress drained %d keys onto an exit, want 0", moved)
+	}
+	if got := nodes.bindingCount[2]; got != 0 {
+		t.Fatalf("exit holds %d keys, want 0", got)
+	}
+	// A key left on an exit by an earlier home order moves to a vacant
+	// dedicated lane the moment one exists.
+	if !nodes.RelocateOne(1, 2) {
+		t.Fatalf("RelocateOne(1, 2) = false; k1 was not on lane 1")
+	}
+	pool.items = append(pool.items, laneAt(3, "2001:db8:3::7"))
+	if moved := nodes.RebalanceEgress(nil, homeDedicatedOnly); moved != 1 {
+		t.Fatalf("RebalanceEgress moved %d keys, want 1 (the exit-bound key)", moved)
+	}
+	if got := nodes.bindingCount[2]; got != 0 {
+		t.Fatalf("exit still holds %d keys, want 0", got)
+	}
+	if got := nodes.bindingCount[1]; got != 1 {
+		t.Fatalf("first vacant dedicated lane holds %d keys, want 1", got)
+	}
+	if moved := nodes.RebalanceEgress(nil, homeDedicatedOnly); moved != 0 {
+		t.Fatalf("second RebalanceEgress moved %d keys, want 0", moved)
+	}
+	// A benched dedicated key stays put: no other dedicated lane is a
+	// better answer to the class-wide verdict.
+	pool.items[0].freitierUntil.Store(time.Now().Add(time.Hour).UnixNano())
+	if moved := nodes.RebalanceEgress(nil, homeDedicatedOnly); moved != 0 {
+		t.Fatalf("RebalanceEgress moved %d benched keys, want 0", moved)
+	}
+	if got := nodes.bindingCount[0]; got != 1 {
+		t.Fatalf("benched lane holds %d keys, want 1 (no chasing)", got)
 	}
 }

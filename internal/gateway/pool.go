@@ -1143,15 +1143,32 @@ func (p *nodePool) Egress(node *upstreamNode) *egressTransport {
 	return items[index]
 }
 
+// egressHome declares which lane class a keyed pool treats as home for its
+// keys. Dedicated source-address lanes — one /64 per key — are the default
+// home; proxy exits are used whenever no dedicated lane is vacant. Zen sets
+// homeDedicatedOnly so no proxy exit ever carries keyed free-tier traffic.
+// homeProxyFirst inverts the default order for deployments whose upstream
+// gate rejects the configured prefixes as a class while exits keep
+// answering.
+type egressHome int
+
+const (
+	homeDedicated egressHome = iota
+	homeProxyFirst
+	homeDedicatedOnly
+)
+
 // RebindEgress moves every key currently using failedEgress to the
 // least-loaded healthy lane. Empty lanes are selected in configuration order;
 // otherwise one of the least-loaded lanes is chosen at random. If every
 // alternative is currently unhealthy, it still attempts the least-loaded
 // alternative. Benched lanes — parked by a FreeTier flag or cooled under a
 // region block — are never chosen, since selection would only skip them.
-// preferProxy pools look for a vacant proxy exit before the first dedicated
-// lane, mirroring RebalanceEgress's home order.
-func (p *nodePool) RebindEgress(failedEgress int, preferProxy bool) int {
+// Candidates follow the pool's home order (see egressHome): homeProxyFirst
+// looks for a vacant proxy exit before the first dedicated lane;
+// homeDedicatedOnly accepts dedicated lanes only, so a dead lane never hands
+// its key to an exit.
+func (p *nodePool) RebindEgress(failedEgress int, home egressHome) int {
 	if p == nil || p.transports == nil {
 		return 0
 	}
@@ -1169,18 +1186,27 @@ func (p *nodePool) RebindEgress(failedEgress int, preferProxy bool) int {
 			continue
 		}
 		target := -1
-		if preferProxy {
+		switch home {
+		case homeProxyFirst:
 			// The pool's working home class is the proxy exits (see
 			// RebalanceEgress): prefer a vacant exit over the first
 			// dedicated lane, which would answer the next request with
 			// the same FreeTier verdict that parked its predecessors.
 			target = p.replacementLocked(failedEgress, true, func(e *egressTransport) bool { return e.proxy != nil })
-		}
-		if target < 0 {
+			if target < 0 {
+				target = p.replacementLocked(failedEgress, true, nil)
+			}
+		case homeDedicatedOnly:
+			target = p.replacementLocked(failedEgress, true, dedicatedLane)
+		default:
 			target = p.replacementLocked(failedEgress, true, nil)
 		}
 		if target < 0 {
-			target = p.replacementLocked(failedEgress, false, nil)
+			if home == homeDedicatedOnly {
+				target = p.replacementLocked(failedEgress, false, dedicatedLane)
+			} else {
+				target = p.replacementLocked(failedEgress, false, nil)
+			}
 		}
 		if target < 0 {
 			continue
@@ -1196,27 +1222,29 @@ func (p *nodePool) RebindEgress(failedEgress int, preferProxy bool) int {
 }
 
 // RebalanceEgress spreads keys from lanes carrying several of them onto
-// empty healthy lanes, preferring the pool's home class first and the other
-// class second; the default home class is dedicated source-address lanes,
-// and preferProxy inverts that order (see channel.preferProxy). A second
-// pass gives every key a home that is not benched: keys sitting on a lane
-// parked by a FreeTier flag or cooled under a region block move first — a
-// cursor skips such lanes for everything else, so the key would sit out
-// traffic entirely — then keys riding the host's own route after a
-// failover, then keys on a healthy lane of the non-preferred class while a
-// vacant lane of the preferred class waits. Benched lanes are never chosen
-// as a home, and healthy keys only change class toward a vacant preferred
-// lane, so each pass makes at most one hop per key and two lanes can never
-// trade the same key back and forth. The occupied slice marks lanes held by
-// another channel's keys: per-pool emptiness is not global emptiness, and a
-// key moved onto a lane that already answers for another account would
-// recreate the shared-address problem. Key pools bind against the lanes
-// that exist when they are built, while proxy lanes seed afterwards and
-// keep arriving until the pool reaches its target, so without this pass
-// every account keeps answering from the egress address that happened to
-// exist at boot. Moved keys adopt the target as their preferred lane so a
-// later lane recovery does not drag them back into the crowd.
-func (p *nodePool) RebalanceEgress(occupied []bool, preferProxy bool) int {
+// empty healthy lanes and gives every key a home of the pool's home class
+// (see egressHome): dedicated source-address lanes by default, proxy exits
+// when homeProxyFirst is set. A second pass covers the leftover homes: keys
+// sitting on a lane parked by a FreeTier flag or cooled under a region block
+// move first — a cursor skips such lanes for everything else, so the key
+// would sit out traffic entirely — then keys riding the host's own route
+// after a failover, then keys on a healthy lane of the non-preferred class
+// while a vacant preferred lane waits. homeDedicatedOnly pools never land a
+// key on an exit, and never chase a benched key between dedicated lanes
+// either: every dedicated lane shares one upstream gate, so hopping to a
+// vacant lane would only park a fresh lane with the same verdict. Benched
+// lanes are never chosen as a home, and healthy keys only change class
+// toward a vacant preferred lane, so each pass makes at most one hop per key
+// and two lanes can never trade the same key back and forth. The occupied
+// slice marks lanes held by another channel's keys: per-pool emptiness is
+// not global emptiness, and a key moved onto a lane that already answers for
+// another account would recreate the shared-address problem. Key pools bind
+// against the lanes that exist when they are built, while proxy lanes seed
+// afterwards and keep arriving until the pool reaches its target, so without
+// this pass every account keeps answering from the egress address that
+// happened to exist at boot. Moved keys adopt the target as their preferred
+// lane so a later lane recovery does not drag them back into the crowd.
+func (p *nodePool) RebalanceEgress(occupied []bool, home egressHome) int {
 	if p == nil || p.transports == nil || len(p.nodes) == 0 {
 		return 0
 	}
@@ -1256,12 +1284,12 @@ func (p *nodePool) RebalanceEgress(occupied []bool, preferProxy bool) int {
 	}
 	proxyLane := func(egress *egressTransport) bool { return egress.proxy != nil }
 	pickEmpty := func(kind int) int {
-		// 0: preferred class only; 1: preferred class, then the other;
-		// 2: any lane. The preferred class follows the pool's home order:
-		// dedicated source-address lanes by default, proxy exits when
-		// preferProxy is set.
+		// 0: home class only; 1: home class, then the other; 2: any
+		// lane. The home class follows the pool's home order (see
+		// egressHome). A dedicated-only pool never falls past its home
+		// class: no proxy exit may carry one of its keys.
 		first, second := dedicatedLane, proxyLane
-		if preferProxy {
+		if home == homeProxyFirst {
 			first, second = proxyLane, dedicatedLane
 		}
 		if kind < 2 {
@@ -1269,7 +1297,7 @@ func (p *nodePool) RebalanceEgress(occupied []bool, preferProxy bool) int {
 				return target
 			}
 		}
-		if kind == 0 {
+		if kind == 0 || home == homeDedicatedOnly {
 			return -1
 		}
 		if kind == 1 {
@@ -1326,10 +1354,14 @@ func (p *nodePool) RebalanceEgress(occupied []bool, preferProxy bool) int {
 	// of the non-preferred class while a vacant preferred lane waits.
 	// Moves toward the non-preferred class happen only from a benched or
 	// host-route lane, so two lanes can never trade the same key back and
-	// forth across calls.
+	// forth across calls. A dedicated-only pool moves only host-route and
+	// exit-bound keys (a legacy placement): a benched dedicated key stays
+	// where it is, because every dedicated lane answers to the same
+	// upstream gate.
 	for range p.nodes {
 		var target, source int
-		if preferProxy {
+		switch home {
+		case homeProxyFirst:
 			// Proxy exits first: the zen free-tier gate rejects the
 			// configured prefixes as a class while per-node exits keep
 			// answering, so an exit is a key's working home whenever one
@@ -1348,7 +1380,13 @@ func (p *nodePool) RebalanceEgress(occupied []bool, preferProxy bool) int {
 					source = withKeys(directLane)
 				}
 			}
-		} else {
+		case homeDedicatedOnly:
+			if target = empty(dedicatedLane); target >= 0 {
+				if source = withKeys(directLane); source < 0 {
+					source = withKeys(proxyLane)
+				}
+			}
+		default:
 			if target = empty(dedicatedLane); target >= 0 {
 				if source = withKeys(benched); source < 0 {
 					if source = withKeys(directLane); source < 0 {

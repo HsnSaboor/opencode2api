@@ -39,14 +39,12 @@ type channel struct {
 	// the anonymous lane. Provider channels are plain OpenAI-compatible APIs
 	// that reuse the same pool machinery without the gate semantics.
 	opencode bool
-	// preferProxy inverts the egress home order for this channel's key
-	// pool: proxy exits are preferred over dedicated source-address lanes.
-	// Zen sets it because the free-tier gate rejects the configured egress
-	// prefixes as a class while per-node proxy exits keep answering — the
-	// prefixes share one upstream transit that the deployment's anonymous
-	// traffic has flagged, so a Zen key homed on an exit keeps serving
-	// free models where a /64 lane would sit behind a FreeTier wall.
-	preferProxy bool
+	// home declares which lane class this channel's key pool treats as
+	// home for its keys: dedicated source-address lanes (one /64 per key)
+	// by default, proxy exits whenever no dedicated lane is vacant. Zen
+	// sets homeDedicatedOnly: its keys ride their own /64 lanes, and no
+	// proxy exit is ever applied to keyed free-tier traffic.
+	home egressHome
 	// suffix is appended to every discovered model ID before it enters the
 	// catalog, so a provider whose free routes carry a name suffix is
 	// addressable by the exact ID its upstream accepts.
@@ -125,16 +123,19 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		if err != nil {
 			return nil, fmt.Errorf("%s node pool: %w", tier, err)
 		}
+		home := homeDedicated
+		if tier == config.TierZen {
+			// Zen keys ride their dedicated /64 lanes only; no proxy
+			// exit ever carries keyed free-tier traffic (see channel.home).
+			home = homeDedicatedOnly
+		}
 		channels[tier] = &channel{
 			tier:     tier,
 			upstream: cfg.TierUpstream(tier),
 			opencode: tier == config.TierZen || tier == config.TierGo,
-			// Zen free-tier requests (keyed and anonymous) answer from
-			// proxy exits once the gate flags the configured prefixes;
-			// its keys home on exits first (see channel.preferProxy).
-			preferProxy: tier == config.TierZen,
-			suffix:      cfg.TierModelSuffix(tier),
-			nodes:       nodes,
+			home:     home,
+			suffix:   cfg.TierModelSuffix(tier),
+			nodes:    nodes,
 		}
 	}
 	catalog := models.NewCatalog(cfg.Prefer, tiers, cfg.Models.Protocols)
