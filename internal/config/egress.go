@@ -70,6 +70,10 @@ type ProxyPoolConfig struct {
 	StateFile string `json:"state_file,omitempty"`
 	// VerifyConcurrency bounds concurrent verification probes.
 	VerifyConcurrency int `json:"verify_concurrency,omitempty"`
+	// ExcludeTags drains profile nodes by tag: excluded outbounds are
+	// dropped at load, so chronically gate-refused exits never become
+	// candidates or canary exits again, even after a profile re-harvest.
+	ExcludeTags []string `json:"exclude_tags,omitempty"`
 }
 
 const (

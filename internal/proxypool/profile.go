@@ -19,13 +19,14 @@ import (
 // document plus the metadata the pool needs to route and label it. User is
 // the SOCKS5 username ("p<Index>") the multiplexer maps to this outbound.
 type Node struct {
-	Index  int
-	Tag    string
-	Type   string
-	Server string
-	Port   int
-	User   string
-	Raw    map[string]any
+	Index    int
+	Tag      string
+	Type     string
+	Server   string
+	Port     int
+	User     string
+	Excluded bool
+	Raw      map[string]any
 }
 
 // Profile is a loaded node list plus a content fingerprint of its source
@@ -40,8 +41,10 @@ type Profile struct {
 // shape written by the zen-proxy verification pipeline) and flattens it into
 // nodes. Outbounds that cannot serve as a general exit are skipped: direct,
 // block, and dns handlers; entries without a server endpoint; and transport
-// types the installed sing-box cannot dial (xhttp).
-func LoadProfile(path string) (*Profile, error) {
+// types the installed sing-box cannot dial (xhttp). Nodes whose tag appears in
+// excludeTags are marked Excluded (they keep their slot so persisted pool
+// state stays index-stable) and the manager drains them from candidacy.
+func LoadProfile(path string, excludeTags ...string) (*Profile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read proxy profile: %w", err)
@@ -51,6 +54,12 @@ func LoadProfile(path string) (*Profile, error) {
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse proxy profile %s: %w", path, err)
+	}
+	excluded := make(map[string]bool, len(excludeTags))
+	for _, tag := range excludeTags {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			excluded[tag] = true
+		}
 	}
 	nodes := make([]Node, 0, len(doc.Outbounds))
 	for _, ob := range doc.Outbounds {
@@ -89,15 +98,19 @@ func LoadProfile(path string) (*Profile, error) {
 			tag = fmt.Sprintf("node-%d", index)
 		}
 		nodes = append(nodes, Node{
-			Index:  index,
-			Tag:    tag,
-			Type:   outboundType,
-			Server: server,
-			Port:   port,
-			User:   fmt.Sprintf("p%d", index),
-			Raw:    ob,
+			Index:    index,
+			Tag:      tag,
+			Type:     outboundType,
+			Server:   server,
+			Port:     port,
+			User:     fmt.Sprintf("p%d", index),
+			Excluded: excluded[tag],
+			Raw:      ob,
 		})
 	}
+	// Fingerprint only the source file: pool state is index-stable (excluded
+	// nodes keep their slot), so an exclusion change must not cold-start the
+	// whole pool and drop warm lanes.
 	sum := sha256.Sum256(data)
 	return &Profile{Path: path, Nodes: nodes, Fingerprint: hex.EncodeToString(sum[:])}, nil
 }

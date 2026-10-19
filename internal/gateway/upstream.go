@@ -354,12 +354,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 					g.logger.Info("anonymous FreeTier verdict attributed to configured prefix", "component", "upstream", "event", "anonymous_prefix_strike", "request_id", ids.Request, "prefix", prefix, "strikes", strikes, "cooling", cooling)
 				}
 				freitierParks++
+				// Cap the FreeTier scan hard. A gate wave answers every
+				// lane, so sampling the whole proxy pool (laneTarget, up to
+				// 200) only delays the canary and the client's eventual
+				// failure. The cursor interleaves fate classes, so
+				// freitierScanLimit parks already cover each class before
+				// the canary runs.
 				scanLimit := freitierScanLimit
-				if g.proxies != nil {
-					if target := g.proxies.laneTarget(); target > scanLimit {
-						scanLimit = target
-					}
-				}
 				if freitierParks >= scanLimit {
 					// The fate-interleaved scan has now sampled every class
 					// the pool holds — the configured prefixes and the proxy

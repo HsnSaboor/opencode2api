@@ -158,7 +158,7 @@ type proxyManager struct {
 // explicitly enabled the pool, so a broken path must be loud instead of
 // silently dropping to address-only egress.
 func newProxyManager(cfg config.ProxyPoolConfig, logger *slog.Logger) (*proxyManager, error) {
-	profile, err := proxypool.LoadProfile(cfg.Profile)
+	profile, err := proxypool.LoadProfile(cfg.Profile, cfg.ExcludeTags...)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +179,18 @@ func newProxyManager(cfg config.ProxyPoolConfig, logger *slog.Logger) (*proxyMan
 		wake:      make(chan struct{}, 1),
 	}
 	manager.loadState()
+	// Drain excluded nodes: they keep their slot (index stability, so the
+	// persisted state fingerprint stays valid) but are made permanently
+	// uncandidate and never verified, so they can't be taken as lanes or
+	// picked as gate canaries again.
+	for i := range manager.state {
+		if manager.profile.Nodes[i].Excluded {
+			manager.state[i].verified = false
+			manager.state[i].probing = false
+			manager.state[i].inUse = false
+			manager.state[i].coolingUntil = time.Now().AddDate(100, 0, 0)
+		}
+	}
 	return manager, nil
 }
 
