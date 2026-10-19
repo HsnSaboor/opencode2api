@@ -286,6 +286,16 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 // stand, request fails), so the pool survives global rejections intact.
 const freitierScanLimit = 10
 
+// freitierScanExtendedLimit is the second, one-shot budget a scan may spend
+// when the canary proves the gate still serves the canonical profile from a
+// verified exit. A served canary means the FreeTier verdicts were lane-scoped,
+// not a wave: the sampled lanes were genuinely flagged, but working lanes
+// remain, and the capped scan would otherwise fail a request the pool can
+// serve. The extended budget walks past the flagged prefix classes into the
+// independent exits; when it is spent without a 2xx the scan still fails fast,
+// so a total wave costs at most one canary round and one budget per request.
+const freitierScanExtendedLimit = 24
+
 // doAnonymousUpstream tries every currently available egress lane at most
 // once. Transport failures and retryable responses (5xx, 401/403/429)
 // advance to the next lane; a deterministic non-retryable 4xx ends the scan
@@ -299,6 +309,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	limit := g.anonymous.Len()
 	attempts := 0
 	freitierParks := 0
+	// scanLimit is the FreeTier park budget for this request. It starts at
+	// the base cap and extends once when the canary proves the gate still
+	// serves (see freitierScanExtendedLimit).
+	scanLimit := freitierScanLimit
 	// requestParks records the lanes this request parked on FreeTier
 	// verdicts. If the scan's cap is reached and the canary shows the
 	// verdicts were request-scoped, these parks are restored: they were
@@ -376,13 +390,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 					g.logger.Info("anonymous FreeTier verdict attributed to configured prefix", "component", "upstream", "event", "anonymous_prefix_strike", "request_id", ids.Request, "prefix", prefix, "strikes", strikes, "cooling", cooling)
 				}
 				freitierParks++
-				// Cap the FreeTier scan hard. A gate wave answers every
-				// lane, so sampling the whole proxy pool (laneTarget, up to
-				// 200) only delays the canary and the client's eventual
-				// failure. The cursor interleaves fate classes, so
-				// freitierScanLimit parks already cover each class before
-				// the canary runs.
-				scanLimit := freitierScanLimit
+				// Cap the FreeTier scan. A gate wave answers every lane, so
+				// sampling the whole proxy pool (laneTarget, up to 200) only
+				// delays the canary and the client's eventual failure. The
+				// cursor interleaves fate classes, so freitierScanLimit parks
+				// already cover each class before the canary runs.
 				if freitierParks >= scanLimit {
 					// The fate-interleaved scan has now sampled every class
 					// the pool holds — the configured prefixes and the proxy
@@ -392,7 +404,8 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 					// not the exits, so the parks this request charged are
 					// restored and the wave may leave every lane selectable
 					// for the requests that follow.
-					if rejected, decisive := g.proxyGateRejectsRequest(ctx); decisive && rejected {
+					rejected, decisive := g.proxyGateRejectsRequest(ctx)
+					if decisive && rejected {
 						for _, parked := range requestParks {
 							g.anonymous.UnparkFreitier(parked)
 						}
@@ -401,13 +414,25 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 						lastErr = err
 						break
 					}
-					// The same verdict from every lane means the gate rejects
-					// the request itself, not the exit: another park would
-					// drain the pool for a decision no lane can change.
-					g.logger.Warn("anonymous FreeTier verdict repeated across lanes; failing fast", "component", "upstream", "event", "anonymous_freitier_scan_capped", "request_id", ids.Request, "attempts", attempts, "limit", freitierScanLimit)
-					lastResponse = resp
-					lastErr = err
-					break
+					if decisive && scanLimit < freitierScanExtendedLimit {
+						// A verified exit served the canonical profile, so
+						// the gate is up and the verdicts are lane-scoped:
+						// extend the budget once and keep walking towards the
+						// lanes the flag wave did not cover. Failing here
+						// would abandon a request the pool can still answer.
+						scanLimit = freitierScanExtendedLimit
+						g.logger.Info("anonymous FreeTier verdicts are lane-scoped; extending the scan", "component", "upstream", "event", "anonymous_freitier_scan_extended", "request_id", ids.Request, "attempts", attempts, "parks", freitierParks, "limit", scanLimit)
+					} else {
+						// No verified exit could serve the canonical profile,
+						// or the extended budget is spent: the gate rejects
+						// this request from every lane, and another park
+						// would drain the pool for a decision no lane can
+						// change.
+						g.logger.Warn("anonymous FreeTier verdict repeated across lanes; failing fast", "component", "upstream", "event", "anonymous_freitier_scan_capped", "request_id", ids.Request, "attempts", attempts, "limit", scanLimit)
+						lastResponse = resp
+						lastErr = err
+						break
+					}
 				}
 			}
 			if verdict == forbiddenRegion {

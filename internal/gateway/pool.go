@@ -103,8 +103,15 @@ type anonymousPool struct {
 	// prefixes are the configured egress CIDRs used to sample replacement
 	// lanes. Stored once at construction; never mutated afterwards.
 	prefixes []string
-	// mu guards nodes, which grows by replenishment while selection
-	// cursors range it. Read locks are slice-header-sized critical
+	// recent lists the lanes whose 2xx arrived most recently, newest first,
+	// capped at recentSuccessLimit. Cursors lead scans with them so a
+	// request opens on an egress that answered lately — the anonymous scan
+	// is per-IP quota-bound and otherwise half its requests open on a
+	// flagged lane — while the interleaved fate order still covers every
+	// lane once whenever a recent lane stops answering.
+	recent []*anonymousNode
+	// mu guards nodes and recent, which grow and reorder while selection
+	// cursors range them. Read locks are slice-header-sized critical
 	// sections only; no I/O happens under them.
 	mu sync.RWMutex
 }
@@ -123,6 +130,11 @@ type anonymousCursor struct {
 	nodes  []*anonymousNode
 	start  int
 	offset int
+	// deferred holds lanes whose prefix was cooling when the scan reached
+	// them. They are retried only after every live lane, so a blocked prefix
+	// that cools mid-scan cannot keep eating attempts, while a pool whose
+	// every lane is cooling still gets tried instead of failing outright.
+	deferred []*anonymousNode
 }
 
 // cooldownFor converts a consecutive-failure count into an exponential
@@ -214,26 +226,59 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	}
 	p.mu.RLock()
 	nodes := append([]*anonymousNode(nil), p.nodes...)
+	recent := append([]*anonymousNode(nil), p.recent...)
 	p.mu.RUnlock()
 	if len(nodes) == 0 {
 		return anonymousCursor{pool: p}
 	}
-	// The scan order interleaves the pool's fate classes — one per
-	// configured prefix, plus one shared by the multiplexed proxy exits —
-	// so a flag or outage that covers one class cannot swallow a whole
-	// request's attempts. The affinity-chosen lane stays first, so prompt
-	// caches and per-session placement keep working; every lane still
-	// appears exactly once.
-	return anonymousCursor{pool: p, nodes: interleaveByFate(p, nodes, startForAffinity(&p.next, affinity, len(nodes)))}
+	// The scan leads with the pool's most recent successes — the free tier
+	// is per-IP quota-bound, and a request that opens on a lane the pool
+	// has not just heard from pays attempt after attempt rediscovering a
+	// working egress — then walks the fate-interleaved order: one class per
+	// configured prefix, plus one shared by the multiplexed proxy exits, so
+	// a flag or outage that covers one class cannot swallow a whole
+	// request's attempts. The affinity-chosen lane stays first among the
+	// rest, so prompt caches and per-session placement keep working; every
+	// lane still appears exactly once.
+	return anonymousCursor{pool: p, nodes: interleaveByFate(p, nodes, startForAffinity(&p.next, affinity, len(nodes)), recent)}
 }
 
-// interleaveByFate reorders one cursor snapshot: the affinity-chosen lane
-// leads, then the remaining lanes round-robin by fate class. With the pool's
-// typical composition (many address lanes behind one tunnel, a handful of
-// independent proxy exits) a contiguous walk could spend every attempt of a
-// request inside a single blocked prefix; the interleaved order instead
-// samples another prefix or a proxy node within its first few attempts.
-func interleaveByFate(pool *anonymousPool, nodes []*anonymousNode, start int) []*anonymousNode {
+// interleaveByFate reorders one cursor snapshot: the given lead lanes (the
+// pool's recent successes, most recent first) come first, then the
+// affinity-chosen lane, then the remaining lanes round-robin by fate class.
+// With the pool's typical composition (many address lanes behind one
+// tunnel, a handful of independent proxy exits) a contiguous walk could
+// spend every attempt of a request inside a single blocked prefix; the
+// interleaved order instead samples another prefix or a proxy node within
+// its first few attempts. Every lane appears exactly once.
+func interleaveByFate(pool *anonymousPool, nodes []*anonymousNode, start int, lead []*anonymousNode) []*anonymousNode {
+	size := len(nodes)
+	if size < 2 {
+		return nodes
+	}
+	ordered := interleaveOrder(pool, nodes, start)
+	if len(lead) == 0 {
+		return ordered
+	}
+	out := make([]*anonymousNode, 0, size)
+	seen := make(map[*anonymousNode]bool, len(lead))
+	for _, node := range lead {
+		if node == nil || seen[node] {
+			continue
+		}
+		seen[node] = true
+		out = append(out, node)
+	}
+	for _, node := range ordered {
+		if !seen[node] {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
+// interleaveOrder is the fate-class round-robin behind interleaveByFate.
+func interleaveOrder(pool *anonymousPool, nodes []*anonymousNode, start int) []*anonymousNode {
 	size := len(nodes)
 	if size < 2 {
 		return nodes
@@ -270,19 +315,36 @@ func interleaveByFate(pool *anonymousPool, nodes []*anonymousNode, start int) []
 	} else {
 		order = append(order, firstKey)
 	}
-	for len(out) < size {
-		progress := false
-		for _, key := range order {
-			bucket := buckets[key]
-			if len(bucket) == 0 {
-				continue
-			}
-			out = append(out, bucket[0])
-			buckets[key] = bucket[1:]
-			progress = true
+	// Classes the gate has cooled from repeated FreeTier verdicts drain last.
+	// The flag covers a prefix as a unit, so its sibling lanes would only pay
+	// 403s ahead of the independent classes; keeping them reachable (rather
+	// than skipping them) preserves capacity when a cooldown is stale. Within
+	// each phase the order stays round-robin, so no single class can swallow
+	// the scan.
+	live := make([]string, 0, len(order))
+	cooling := make([]string, 0, len(order))
+	for _, key := range order {
+		if pool != nil && pool.transports != nil && pool.transports.prefixCooled(key) {
+			cooling = append(cooling, key)
+			continue
 		}
-		if !progress {
-			break
+		live = append(live, key)
+	}
+	for _, phase := range [][]string{live, cooling} {
+		for len(out) < size {
+			progress := false
+			for _, key := range phase {
+				bucket := buckets[key]
+				if len(bucket) == 0 {
+					continue
+				}
+				out = append(out, bucket[0])
+				buckets[key] = bucket[1:]
+				progress = true
+			}
+			if !progress {
+				break
+			}
 		}
 	}
 	return out
@@ -308,8 +370,25 @@ func (p *anonymousPool) fateKey(egress *egressTransport) string {
 	return "direct"
 }
 
+// prefixCooling reports whether the configured prefix holding the lane is
+// cooling from repeated FreeTier verdicts. Proxy lanes and addresses outside
+// the configured prefixes never cool: their fate is their own exit.
+func (p *anonymousPool) prefixCooling(egress *egressTransport) bool {
+	if p == nil || p.transports == nil || egress == nil {
+		return false
+	}
+	key := config.PrefixKeyFor(p.prefixes, egress.address)
+	if key == "" {
+		return false
+	}
+	return p.transports.prefixCooled(key)
+}
+
 // Next visits each healthy, non-cooling, non-parked egress lane at most once
-// per cursor.
+// per cursor. Lanes of a prefix cooling from repeated FreeTier verdicts are
+// deferred to the end of the scan: the flag covers the prefix as a unit, so
+// its sibling lanes would only pay another 403 ahead of independent classes,
+// but they stay reachable in case the whole pool is cooling.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if len(c.nodes) == 0 {
 		return nil
@@ -319,6 +398,18 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		node := c.nodes[(c.start+c.offset)%len(c.nodes)]
 		c.offset++
 		if !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
+			continue
+		}
+		if c.pool != nil && c.pool.prefixCooling(node.egress) {
+			c.deferred = append(c.deferred, node)
+			continue
+		}
+		return node
+	}
+	for len(c.deferred) > 0 {
+		node := c.deferred[0]
+		c.deferred = c.deferred[1:]
+		if node == nil || !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
 			continue
 		}
 		return node
@@ -332,6 +423,24 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	if p == nil {
+		return
+	}
+	// Remember the lane as the most recent success: the next scans lead
+	// with it, so a request opens on an egress the pool just proved works
+	// instead of paying another flagged lane's 403. The list is a bounded
+	// MRU — re-marking a lane moves it to the head without duplicating it.
+	p.mu.Lock()
+	next := make([]*anonymousNode, 0, recentSuccessLimit)
+	next = append(next, node)
+	for _, seen := range p.recent {
+		if seen == node || len(next) >= recentSuccessLimit {
+			continue
+		}
+		next = append(next, seen)
+	}
+	p.recent = next
+	p.mu.Unlock()
 }
 
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
@@ -348,6 +457,13 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	}
 	storeCooldownUntil(&node.cooldownUntil, p.cooldown, node.failures.Add(1), retryAfterOf(resp))
 }
+
+// recentSuccessLimit bounds the anonymous pool's recent-success memory: the
+// head lanes lead every scan, the oldest is dropped. Large enough to spread
+// a burst over several exits instead of hammering one IP's quota, small
+// enough that a scan left without a winner still reaches the interleaved
+// full-pool order quickly.
+const recentSuccessLimit = 6
 
 // freitierCooldown parks a FreeTier-flagged exit while the upstream flag
 // clears. It mirrors zen-proxy's mark_freitier_blocked: per-lane only, never
@@ -591,6 +707,20 @@ func (p *transportPool) CoolingPrefixes() map[string]time.Time {
 		}
 	}
 	return out
+}
+
+// prefixCooled reports whether the canonical prefix key is cooling from
+// repeated FreeTier verdicts. Selection drains a blocked prefix's siblings
+// after the independent fate classes (see interleaveOrder); probation
+// re-admits the prefix once its cooldown expires (see probeCoolingPrefixes).
+func (p *transportPool) prefixCooled(key string) bool {
+	if p == nil || key == "" {
+		return false
+	}
+	now := time.Now().UnixNano()
+	p.prefixMu.Lock()
+	defer p.prefixMu.Unlock()
+	return p.prefixCooling[key] > now
 }
 
 // ClearPrefix retires any strikes and cooldown for the prefix holding addr:

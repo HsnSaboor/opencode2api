@@ -60,7 +60,7 @@ func TestInterleaveByFateCoversClassesEarly(t *testing.T) {
 	if len(nodes) != len(lanes) {
 		t.Fatalf("snapshot = %d nodes, want %d", len(nodes), len(lanes))
 	}
-	ordered := interleaveByFate(pool, nodes, 3)
+	ordered := interleaveByFate(pool, nodes, 3, nil)
 	if ordered[0] != nodes[3] {
 		t.Fatal("the affinity-chosen lane must stay first")
 	}
