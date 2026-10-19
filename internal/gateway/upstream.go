@@ -446,12 +446,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		if ctx.Err() != nil {
 			// The parent budget expired while this attempt was in flight. Its
 			// outcome says nothing about this lane, so record nothing and stop
-			// scanning.
-			lastResponse, lastErr = resp, err
-			if lastErr == nil && lastResponse == nil {
-				lastErr = ctx.Err()
+			// scanning. Report the budget itself: callers map a deadline to a
+			// typed timeout, and a bare transport error here would otherwise be
+			// answered as a non-retryable 502.
+			if resp != nil {
+				httpx.DrainAndClose(resp.Body)
 			}
-			break
+			return nil, ctx.Err(), attempts
 		}
 		g.observeAnonymousResult(ctx, node, resp, err)
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.egress, resp, err, duration)
@@ -585,10 +586,29 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		g.logger.Warn("anonymous egress has no usable lanes; returning a retryable 503", "component", "upstream", "event", "anonymous_egress_unavailable", "request_id", ids.Request, "attempts", attempts, "retry_after_s", int(anonymousRetryAfter/time.Second))
 		return anonymousUnavailableResponse(anonymousRetryAfter), nil, attempts
 	}
+	if anonymousScanDegraded(lastResponse, freitierParks) {
+		// Every lane that answered attributed the verdict to itself and the
+		// scan still ended without a response to forward: the remaining
+		// attempts failed at the transport layer. The pool is flagged, so
+		// hand clients the retryable signal instead of a 502 that they may
+		// treat as fatal.
+		g.logger.Warn("anonymous scan ended without a response after FreeTier verdicts; returning a retryable 503", "component", "upstream", "event", "anonymous_scan_degraded", "request_id", ids.Request, "attempts", attempts, "parks", freitierParks, "retry_after_s", int(anonymousRetryAfter/time.Second))
+		return anonymousUnavailableResponse(anonymousRetryAfter), nil, attempts
+	}
 	if lastErr == nil {
 		lastErr = errors.New("no healthy anonymous egress lanes available")
 	}
 	return nil, lastErr, attempts
+}
+
+// anonymousScanDegraded reports whether a finished anonymous lane scan should
+// be reported as a retryable pool outage rather than a bad gateway. It is true
+// when lanes answered with exit-attributable FreeTier verdicts and the scan
+// still ended without a response to forward — the remaining attempts failed at
+// the transport layer. The pool is flagged, so clients should back off and
+// retry instead of treating the request as broken.
+func anonymousScanDegraded(lastResponse *http.Response, freitierParks int) bool {
+	return lastResponse == nil && freitierParks > 0
 }
 
 // anonymousReadTool is the one tool the free-tier gate requires on agent
