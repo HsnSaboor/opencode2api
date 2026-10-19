@@ -244,6 +244,28 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		}
 		lastResponse, lastErr = resp, err
 	}
+	if route.AnonymousFallback && ctx.Err() == nil {
+		// The authenticated plan is exhausted (429s, blocks, outages), so the
+		// public credential gets the request instead of failing on the last
+		// keyed verdict: the anonymous lane is the route's last-resort layer.
+		if lastResponse != nil {
+			httpx.DrainAndClose(lastResponse.Body)
+			lastResponse = nil
+		}
+		anonymousRoute := route
+		anonymousRoute.Tier = config.TierZen
+		anonymousRoute.Protocol = route.ProtocolFor(config.TierZen)
+		anonymousRoute.Anonymous = true
+		anonymousRoute.AnonymousFallback = false
+		effectiveRoute = anonymousRoute
+		g.logger.Debug("authenticated tiers exhausted; entering the anonymous bottom layer", "component", "upstream", "event", "anonymous_bottom_layer", "request_id", ids.Request, "attempts", attempts)
+		resp, err, used := g.doAnonymousUpstream(ctx, anonymousRoute, bodies, ids, attempts)
+		attempts += used
+		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+			return resp, anonymousRoute, attempts, nil
+		}
+		lastResponse, lastErr = resp, err
+	}
 	if lastResponse != nil {
 		return lastResponse, effectiveRoute, attempts, nil
 	}
@@ -348,7 +370,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			if verdict == forbiddenFreeTier {
-				g.anonymous.ParkFreitier(node.egress)
+				g.parkEgressFreitier(node.egress)
 				requestParks = append(requestParks, node.egress)
 				if prefix, strikes, cooling := g.transports.StrikePrefix(node.egress.address); prefix != "" {
 					g.logger.Info("anonymous FreeTier verdict attributed to configured prefix", "component", "upstream", "event", "anonymous_prefix_strike", "request_id", ids.Request, "prefix", prefix, "strikes", strikes, "cooling", cooling)
@@ -788,6 +810,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if node == nil {
 			break
 		}
+		// Cursor.Next only returns a benched node when every lane in the
+		// pool is benched (its cooldown fallback ran out of unbenched
+		// candidates). Attempting it would spend the request budget on
+		// the lane's own known verdict — a parked FreeTier lane answers
+		// the same 403 again — so hand the request to the layers below.
+		if nodes.laneParked(node) {
+			break
+		}
 		attempts++
 		// Keep the request-level trace synchronized with the attempt that is
 		// about to be sent. Only the redacted key suffix is retained.
@@ -838,7 +868,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 				return resp, nil, attempts
 			}
 			if verdict == forbiddenFreeTier {
-				g.anonymous.ParkFreitier(egress)
+				g.parkEgressFreitier(egress)
 			}
 			if verdict == forbiddenRegion {
 				g.transports.CoolSubnet(egress.address, forbiddenRegionCooldown)

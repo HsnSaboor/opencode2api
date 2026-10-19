@@ -23,6 +23,13 @@ type Route struct {
 	// crosses tiers.
 	Protocols map[config.Tier]wire.Protocol
 	Anonymous bool
+	// AnonymousFallback marks a keyed route that keeps the public credential
+	// as its last-resort layer: the request is tried on the authenticated
+	// tiers first and only enters the anonymous lane when every keyed tier
+	// has been exhausted. It is set for OpenCode free models whenever a Zen
+	// key pool is configured, so real API keys (per-account quota) outrank
+	// the shared public credential (per-IP quota).
+	AnonymousFallback bool
 	// KeyTiers is the ordered authenticated fallback plan. Anonymous requests
 	// always start on Zen, then enter this list when the public credential does
 	// not succeed.
@@ -255,12 +262,30 @@ func (c *Catalog) routeLocked(model string, hasKeys map[config.Tier]bool, hasAno
 		return Route{}, fmt.Errorf("model %q is disabled after a failed availability check; restore it in the WebUI or wait for the next probe", model)
 	}
 	keyTiers := c.keyTierOrderLocked(model, hasKeys)
-	// OpenCode's public credential is a Zen-only lane. Every free model starts
-	// there, even if the current catalog only advertises it on Go: an upstream
-	// rejection will move the request into the authenticated fallback plan.
+	// OpenCode's public credential is a Zen-only lane. Free models start
+	// there, even if the current catalog only advertises them on Go: an
+	// upstream rejection will move the request into the authenticated
+	// fallback plan.
 	decision := c.anonymousDecision(model)
-	if hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(c.zenGoPendingLocked() || c.advertised[config.TierZen][model] || c.advertised[config.TierGo][model]) {
+	anonymousEligible := hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
+		(c.zenGoPendingLocked() || c.advertised[config.TierZen][model] || c.advertised[config.TierGo][model])
+	// A configured Zen key pool outranks the public credential. Real API keys
+	// carry per-account quota instead of the shared per-IP free allowance, so
+	// free models are tried keyed first and the anonymous lane becomes the
+	// last-resort layer after every keyed tier is exhausted (429s, blocks,
+	// outages).
+	zenKeyed := false
+	for _, tier := range keyTiers {
+		if tier == config.TierZen {
+			zenKeyed = true
+			break
+		}
+	}
+	if anonymousEligible && zenKeyed {
+		protocols := c.protocolsForLocked(model, keyTiers, true)
+		return Route{ID: model, Tier: keyTiers[0], Protocol: protocols[keyTiers[0]], Protocols: protocols, AnonymousFallback: true, KeyTiers: keyTiers}, nil
+	}
+	if anonymousEligible {
 		protocols := c.protocolsForLocked(model, keyTiers, true)
 		return Route{ID: model, Tier: config.TierZen, Protocol: protocols[config.TierZen], Protocols: protocols, Anonymous: true, KeyTiers: keyTiers}, nil
 	}

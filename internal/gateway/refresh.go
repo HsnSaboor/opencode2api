@@ -88,7 +88,7 @@ func (g *Gateway) rebindFailedEgress(egress *egressTransport) (moved int) {
 // reacts once.
 func (g *Gateway) rebindUnavailableEgress(egress *egressTransport, wasHealthy bool) (moved int) {
 	for _, channel := range g.channels {
-		moved += channel.nodes.RebindEgress(egress.index)
+		moved += channel.nodes.RebindEgress(egress.index, channel.preferProxy)
 	}
 	if wasHealthy || moved > 0 {
 		g.logger.Warn("egress lane became unavailable", "component", "egress", "event", "egress_unavailable", "egress", config.RedactURL(egress.address), "keys_moved", moved)
@@ -114,13 +114,144 @@ func (g *Gateway) restoreEgress(egress *egressTransport) (moved int) {
 // proxy exits exist: key pools bind at construction, proxy lanes seed after
 // them and keep filling to the target, and failover can park a key on the
 // direct lane, so the distribution is re-asserted whenever the pool admits
-// a lane or finishes a health round.
+// a lane or finishes a health round. Every pass is told which lanes the
+// other channels hold, so a key is never parked where another account
+// already answers from; the cross-channel spread then separates keys that
+// the per-channel passes cannot see sharing a lane. Channels are visited in
+// configuration order so moves are deterministic.
 func (g *Gateway) rebalanceEgressKeys() (moved int) {
-	for _, channel := range g.channels {
-		moved += channel.nodes.RebalanceEgress()
+	channels := g.orderedChannels()
+	n := 0
+	if g.transports != nil {
+		n = len(g.transports.snapshot())
 	}
+	for i, channel := range channels {
+		occupied := make([]bool, n)
+		for j, other := range channels {
+			if i == j {
+				continue
+			}
+			for lane, count := range other.nodes.bindingCounts(n) {
+				if count > 0 {
+					occupied[lane] = true
+				}
+			}
+		}
+		moved += channel.nodes.RebalanceEgress(occupied, channel.preferProxy)
+	}
+	moved += g.spreadKeysAcrossLanes()
 	if moved > 0 && g.logger != nil {
 		g.logger.Info("egress keys rebalanced across lanes", "component", "egress", "event", "egress_keys_rebalanced", "keys_moved", moved)
+	}
+	return moved
+}
+
+// parkEgressFreitier parks an egress lane after a FreeTier 403 and re-homes
+// any key bound to a benched lane. Cursors skip parked lanes for every
+// account, so the verdict is the moment a key on that lane loses its home;
+// waiting for the next health round (15 minutes later) would leave a keyed
+// tier benched for many requests after a gate wave moves the pool's fate
+// classes.
+func (g *Gateway) parkEgressFreitier(egress *egressTransport) {
+	if g == nil {
+		return
+	}
+	g.anonymous.ParkFreitier(egress)
+	g.rebalanceEgressKeys()
+}
+
+// spreadKeysAcrossLanes gives every keyed account a lane of its own across
+// channels. Each channel's key pool binds independently at construction
+// (round-robin over the lanes that exist), so a Zen key and a TokenHarbor
+// key can land on the same lane even though neither pool looks crowded to
+// its own rebalance pass — and one egress address answering for several
+// accounts is exactly what upstreams flag as many accounts behind one
+// network address. Lanes carrying keys from more than one pool are drained
+// onto lanes no pool holds yet, preferring dedicated source-address lanes
+// over proxy exits, mirroring RebalanceEgress's home order. It returns the
+// number of keys relocated.
+func (g *Gateway) spreadKeysAcrossLanes() int {
+	if g == nil || g.transports == nil {
+		return 0
+	}
+	items := g.transports.snapshot()
+	n := len(items)
+	if n < 2 {
+		return 0
+	}
+	type poolCounts struct {
+		pool   *nodePool
+		counts []int
+	}
+	pools := make([]poolCounts, 0, len(g.channels))
+	total := make([]int, n)
+	for _, channel := range g.orderedChannels() {
+		counts := channel.nodes.bindingCounts(n)
+		pools = append(pools, poolCounts{pool: channel.nodes, counts: counts})
+		for i, count := range counts {
+			total[i] += count
+		}
+	}
+	benched := func(index int) bool {
+		lane := items[index]
+		return !lane.healthy.Load() || freitierParked(lane) || g.transports.subnetCooled(lane.address)
+	}
+	find := func(want func(*egressTransport) bool) int {
+		for i := 0; i < n; i++ {
+			if total[i] != 0 || benched(i) {
+				continue
+			}
+			if want == nil || want(items[i]) {
+				return i
+			}
+		}
+		return -1
+	}
+	proxyLane := func(lane *egressTransport) bool { return lane.proxy != nil }
+	moved := 0
+	for {
+		source := -1
+		for i := 0; i < n; i++ {
+			if total[i] > 1 {
+				source = i
+				break
+			}
+		}
+		if source < 0 {
+			break
+		}
+		// Mirror RebalanceEgress's home order: dedicated source-address
+		// lanes first, proxy exits second, anything else last.
+		target := find(dedicatedLane)
+		if target < 0 {
+			target = find(proxyLane)
+		}
+		if target < 0 {
+			target = find(nil)
+		}
+		if target < 0 {
+			break
+		}
+		relocated := false
+		for i := range pools {
+			if pools[i].counts[source] == 0 {
+				continue
+			}
+			if pools[i].pool.RelocateOne(source, target) {
+				pools[i].counts[source]--
+				pools[i].counts[target]++
+				total[source]--
+				total[target]++
+				moved++
+				relocated = true
+			}
+			break
+		}
+		if !relocated {
+			// Defensive: a lane reported crowded whose owner could not
+			// produce a key would otherwise spin this loop forever.
+			break
+		}
 	}
 	return moved
 }

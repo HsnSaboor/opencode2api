@@ -116,6 +116,35 @@ func TestPreferOrdersProviderFirst(t *testing.T) {
 	}
 }
 
+// A configured Zen key pool outranks the public credential: an OpenCode free
+// model routes keyed-Zen first and keeps the anonymous lane as a last-resort
+// fallback. Without keys, the public credential keeps opening the request.
+func TestZenKeysPrecedeAnonymousLane(t *testing.T) {
+	catalog := NewCatalog(config.TierZen, testTiers, nil)
+	catalog.ReplaceWithCapabilities(
+		map[config.Tier][]string{config.TierZen: {"zen-model-free"}},
+		map[config.Tier]map[string]wire.Protocol{config.TierZen: {"zen-model-free": wire.Chat}},
+		nil, nil,
+	)
+	route, err := catalog.Route("zen-model-free", map[config.Tier]bool{config.TierZen: true}, true)
+	if err != nil {
+		t.Fatalf("Route with Zen keys: %v", err)
+	}
+	if route.Anonymous || !route.AnonymousFallback {
+		t.Fatalf("route = %+v, want keyed route with anonymous fallback", route)
+	}
+	if route.Tier != config.TierZen || len(route.KeyTiers) == 0 || route.KeyTiers[0] != config.TierZen {
+		t.Fatalf("route plan = %+v", route)
+	}
+	anonymous, err := catalog.Route("zen-model-free", nil, true)
+	if err != nil {
+		t.Fatalf("Route without Zen keys: %v", err)
+	}
+	if !anonymous.Anonymous || anonymous.AnonymousFallback {
+		t.Fatalf("keyless route = %+v, want anonymous-first", anonymous)
+	}
+}
+
 // The disk cache round-trips provider discovery, so a restart keeps serving
 // provider models before the first refresh completes.
 func TestCatalogCacheRoundTripsProviderTiers(t *testing.T) {

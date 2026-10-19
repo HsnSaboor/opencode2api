@@ -1149,7 +1149,9 @@ func (p *nodePool) Egress(node *upstreamNode) *egressTransport {
 // alternative is currently unhealthy, it still attempts the least-loaded
 // alternative. Benched lanes — parked by a FreeTier flag or cooled under a
 // region block — are never chosen, since selection would only skip them.
-func (p *nodePool) RebindEgress(failedEgress int) int {
+// preferProxy pools look for a vacant proxy exit before the first dedicated
+// lane, mirroring RebalanceEgress's home order.
+func (p *nodePool) RebindEgress(failedEgress int, preferProxy bool) int {
 	if p == nil || p.transports == nil {
 		return 0
 	}
@@ -1166,9 +1168,19 @@ func (p *nodePool) RebindEgress(failedEgress int) int {
 		if int(node.egressIndex.Load()) != failedEgress {
 			continue
 		}
-		target := p.replacementLocked(failedEgress, true)
+		target := -1
+		if preferProxy {
+			// The pool's working home class is the proxy exits (see
+			// RebalanceEgress): prefer a vacant exit over the first
+			// dedicated lane, which would answer the next request with
+			// the same FreeTier verdict that parked its predecessors.
+			target = p.replacementLocked(failedEgress, true, func(e *egressTransport) bool { return e.proxy != nil })
+		}
 		if target < 0 {
-			target = p.replacementLocked(failedEgress, false)
+			target = p.replacementLocked(failedEgress, true, nil)
+		}
+		if target < 0 {
+			target = p.replacementLocked(failedEgress, false, nil)
 		}
 		if target < 0 {
 			continue
@@ -1184,19 +1196,27 @@ func (p *nodePool) RebindEgress(failedEgress int) int {
 }
 
 // RebalanceEgress spreads keys from lanes carrying several of them onto
-// empty healthy lanes, preferring dedicated source-address lanes first,
-// proxy exits second, and the host's own route last; a second pass moves
-// keys off the host's address and off proxy exits while empty dedicated
-// lanes remain, then drains host-address keys onto proxy exits when no
-// dedicated lane is left. Benched lanes — parked by a FreeTier flag or
-// cooled under a region block — are never chosen as a home, since selection
-// would only skip them. Key pools bind against the lanes that exist when
-// they are built, while proxy lanes seed afterwards and keep arriving until
-// the pool reaches its target, so without this pass every account keeps
-// answering from the egress address that happened to exist at boot. Moved
-// keys adopt the target as their preferred lane so a later lane recovery
-// does not drag them back into the crowd.
-func (p *nodePool) RebalanceEgress() int {
+// empty healthy lanes, preferring the pool's home class first and the other
+// class second; the default home class is dedicated source-address lanes,
+// and preferProxy inverts that order (see channel.preferProxy). A second
+// pass gives every key a home that is not benched: keys sitting on a lane
+// parked by a FreeTier flag or cooled under a region block move first — a
+// cursor skips such lanes for everything else, so the key would sit out
+// traffic entirely — then keys riding the host's own route after a
+// failover, then keys on a healthy lane of the non-preferred class while a
+// vacant lane of the preferred class waits. Benched lanes are never chosen
+// as a home, and healthy keys only change class toward a vacant preferred
+// lane, so each pass makes at most one hop per key and two lanes can never
+// trade the same key back and forth. The occupied slice marks lanes held by
+// another channel's keys: per-pool emptiness is not global emptiness, and a
+// key moved onto a lane that already answers for another account would
+// recreate the shared-address problem. Key pools bind against the lanes
+// that exist when they are built, while proxy lanes seed afterwards and
+// keep arriving until the pool reaches its target, so without this pass
+// every account keeps answering from the egress address that happened to
+// exist at boot. Moved keys adopt the target as their preferred lane so a
+// later lane recovery does not drag them back into the crowd.
+func (p *nodePool) RebalanceEgress(occupied []bool, preferProxy bool) int {
 	if p == nil || p.transports == nil || len(p.nodes) == 0 {
 		return 0
 	}
@@ -1214,6 +1234,9 @@ func (p *nodePool) RebalanceEgress() int {
 	}
 	empty := func(want func(*egressTransport) bool) int {
 		for i := 0; i < n; i++ {
+			if i < len(occupied) && occupied[i] {
+				continue
+			}
 			if p.bindingCount[i] != 0 || !items[i].healthy.Load() || benched(items[i]) {
 				continue
 			}
@@ -1233,9 +1256,16 @@ func (p *nodePool) RebalanceEgress() int {
 	}
 	proxyLane := func(egress *egressTransport) bool { return egress.proxy != nil }
 	pickEmpty := func(kind int) int {
-		// 0: dedicated lanes only; 1: dedicated, then proxy exits; 2: any.
+		// 0: preferred class only; 1: preferred class, then the other;
+		// 2: any lane. The preferred class follows the pool's home order:
+		// dedicated source-address lanes by default, proxy exits when
+		// preferProxy is set.
+		first, second := dedicatedLane, proxyLane
+		if preferProxy {
+			first, second = proxyLane, dedicatedLane
+		}
 		if kind < 2 {
-			if target := empty(dedicatedLane); target >= 0 {
+			if target := empty(first); target >= 0 {
 				return target
 			}
 		}
@@ -1243,7 +1273,7 @@ func (p *nodePool) RebalanceEgress() int {
 			return -1
 		}
 		if kind == 1 {
-			return empty(proxyLane)
+			return empty(second)
 		}
 		return empty(nil)
 	}
@@ -1289,27 +1319,53 @@ func (p *nodePool) RebalanceEgress() int {
 		}
 		move(source, target, carrier)
 	}
-	// Pass two: dedicated lanes are the preferred home. Move keys off the
-	// host's address first, then off proxy exits, while empty dedicated
-	// lanes remain; with no dedicated lane left, keep draining the host's
-	// address onto proxy exits — one host address answering for a whole
-	// account set is what a provider sees as one network address.
+	// Pass two: give every key a home that is not benched. Sources are
+	// tried by urgency: keys on a benched lane first — cursors skip those
+	// lanes, so the key would sit out traffic entirely — then keys riding
+	// the host's own route after a failover, then keys on a healthy lane
+	// of the non-preferred class while a vacant preferred lane waits.
+	// Moves toward the non-preferred class happen only from a benched or
+	// host-route lane, so two lanes can never trade the same key back and
+	// forth across calls.
 	for range p.nodes {
-		target := pickEmpty(0)
-		source := -1
-		if target >= 0 {
-			source = withKeys(directLane)
-			if source < 0 {
-				source = withKeys(proxyLane)
+		var target, source int
+		if preferProxy {
+			// Proxy exits first: the zen free-tier gate rejects the
+			// configured prefixes as a class while per-node exits keep
+			// answering, so an exit is a key's working home whenever one
+			// is vacant and unbenched.
+			if target = empty(proxyLane); target >= 0 {
+				if source = withKeys(benched); source < 0 {
+					if source = withKeys(directLane); source < 0 {
+						source = withKeys(dedicatedLane)
+					}
+				}
+			} else if target = empty(dedicatedLane); target >= 0 {
+				// No exit is vacant: only benched and host-route keys can
+				// be helped; healthy dedicated keys stay put so an exit's
+				// recovery cannot pull the pool into churn.
+				if source = withKeys(benched); source < 0 {
+					source = withKeys(directLane)
+				}
 			}
 		} else {
-			target = empty(proxyLane)
-			if target < 0 {
-				break
+			if target = empty(dedicatedLane); target >= 0 {
+				if source = withKeys(benched); source < 0 {
+					if source = withKeys(directLane); source < 0 {
+						source = withKeys(proxyLane)
+					}
+				}
+			} else if target = empty(proxyLane); target >= 0 {
+				// No dedicated lane is left: keep draining benched and
+				// host-route keys onto proxy exits — one host address
+				// answering for a whole account set is what a provider
+				// sees as one network address.
+				if source = withKeys(benched); source < 0 {
+					source = withKeys(directLane)
+				}
 			}
-			source = withKeys(directLane)
 		}
-		if source < 0 {
+		if target < 0 || source < 0 {
 			break
 		}
 		carrier := carrierOn(source)
@@ -1330,12 +1386,61 @@ func (p *nodePool) ensureBindingsLocked(n int) {
 	}
 }
 
-func (p *nodePool) replacementLocked(failedEgress int, healthyOnly bool) int {
+// bindingCounts returns a copy of the per-lane key counts sized to n lanes.
+// Gateway-level placement uses it to see every channel's demand at once;
+// per-channel rebalancing alone cannot know that another provider's key
+// already sits on a lane this pool considers empty.
+func (p *nodePool) bindingCounts(n int) []int {
+	if p == nil {
+		return make([]int, max(n, 0))
+	}
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+	p.ensureBindingsLocked(n)
+	out := make([]int, n)
+	copy(out, p.bindingCount[:n])
+	return out
+}
+
+// RelocateOne moves one of this pool's keys from lane src onto lane dst and
+// marks dst as that key's preferred home, so a later lane recovery does not
+// drag it back into the crowd. It reports false when the pool holds no key
+// on src.
+func (p *nodePool) RelocateOne(src, dst int) bool {
+	if p == nil || src == dst || src < 0 || dst < 0 {
+		return false
+	}
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+	p.ensureBindingsLocked(max(src, dst) + 1)
+	if p.bindingCount[src] == 0 {
+		return false
+	}
+	for _, node := range p.nodes {
+		if int(node.egressIndex.Load()) == src {
+			p.bindingCount[src]--
+			p.bindingCount[dst]++
+			node.egressIndex.Store(int64(dst))
+			node.preferredEgress = dst
+			return true
+		}
+	}
+	return false
+}
+
+// replacementLocked returns a home lane for a key leaving failedEgress:
+// the first empty lane in the desired class when one exists, otherwise a
+// random pick among the least-loaded lanes of that class. want filters the
+// lane class (nil means any); benched lanes are never candidates.
+func (p *nodePool) replacementLocked(failedEgress int, healthyOnly bool, want func(*egressTransport) bool) int {
 	items := p.transports.snapshot()
 	minimum := int(^uint(0) >> 1)
 	candidates := make([]int, 0, len(items)-1)
 	for i := range items {
 		if i == failedEgress || healthyOnly && !items[i].healthy.Load() {
+			continue
+		}
+		if want != nil && !want(items[i]) {
 			continue
 		}
 		// A benched lane is not a home: selection prefers to skip parked
