@@ -205,8 +205,17 @@ func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Dur
 		return pool
 	}
 	pool.nodes = make([]*anonymousNode, 0, len(transports.items))
+	// L1 Egress: Place proxy lanes (WARP) first for immediate 200 OK
 	for _, egress := range transports.items {
-		pool.nodes = append(pool.nodes, &anonymousNode{egress: egress})
+		if egress.proxy != nil {
+			pool.nodes = append(pool.nodes, &anonymousNode{egress: egress})
+		}
+	}
+	// L2 Egress: Place native address lanes after proxies
+	for _, egress := range transports.items {
+		if egress.proxy == nil {
+			pool.nodes = append(pool.nodes, &anonymousNode{egress: egress})
+		}
 	}
 	return pool
 }
