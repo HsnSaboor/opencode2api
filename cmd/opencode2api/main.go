@@ -40,8 +40,15 @@ func main() {
 		cfg.WebUI.Listen = *webListen
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// Signals cancel signalCtx, but the runtime keeps its own root: the
+	// egress multiplexer must stay up while HTTP requests drain. Cancel the
+	// runtime only after server.Shutdown returns. Canceling this signal
+	// context directly used to stop sing-box first, leaving draining
+	// anonymous requests to fall back to the abusive-blocked direct lanes.
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	runtimeCtx, stopRuntime := context.WithCancel(context.Background())
+	defer stopRuntime()
 	level := new(slog.LevelVar)
 	telemetry.SetLogLevel(level, cfg.Logging.Level)
 	hub := telemetry.NewLogHub(cfg.Logging.RingSize)
@@ -49,7 +56,7 @@ func main() {
 	redactor.Replace(cfg)
 	logger := telemetry.NewStructuredLogger(level, hub, redactor)
 	monitor := telemetry.NewMonitor()
-	manager, err := gateway.NewRuntimeManager(ctx, *configPath, cfg, logger, monitor, hub, redactor, level)
+	manager, err := gateway.NewRuntimeManager(runtimeCtx, *configPath, cfg, logger, monitor, hub, redactor, level)
 	if err != nil {
 		logger.Error("failed to initialize runtime", "component", "runtime", "event", "runtime_initialization_failed", "error", err)
 		os.Exit(1)
@@ -60,7 +67,7 @@ func main() {
 		Addr: cfg.Listen, Handler: manager.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
 	}
 	servers := []*http.Server{apiServer}
-	go serveHTTP(cancel, logger, apiServer, "api")
+	go serveHTTP(stopSignals, logger, apiServer, "api")
 
 	if cfg.WebUI.Enabled {
 		admin := adminui.New(manager, monitor, hub, logger)
@@ -68,10 +75,10 @@ func main() {
 			Addr: cfg.WebUI.Listen, Handler: admin.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
 		}
 		servers = append(servers, webServer)
-		go serveHTTP(cancel, logger, webServer, "webui")
+		go serveHTTP(stopSignals, logger, webServer, "webui")
 	}
 
-	<-ctx.Done()
+	<-signalCtx.Done()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutdownCancel()
 	for _, server := range servers {
@@ -79,6 +86,10 @@ func main() {
 			logger.Error("graceful shutdown failed", "component", "server", "event", "shutdown_failed", "address", server.Addr, "error", err)
 		}
 	}
+	// HTTP is drained (or its shutdown budget expired): only now stop the
+	// egress multiplexer and background loops, so draining requests keep
+	// their proxy lanes until the last one finishes.
+	stopRuntime()
 }
 
 func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string) {
