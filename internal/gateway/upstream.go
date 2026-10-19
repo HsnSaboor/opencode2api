@@ -1014,12 +1014,21 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 	if meta := telemetry.MetaFromContext(ctx); meta != nil {
 		meta.AttemptOutcome = outcome
 		meta.Protocol = route.Protocol
-		// Append a per-attempt leg (key:status:ms, anonymized for the
-		// public lane) so the request log shows the whole attempt chain
-		// at a glance. Only the redacted key suffix is retained.
+		// Append a per-attempt leg (lane:status:ms) so the request log
+		// shows the whole attempt chain at a glance. Anonymous attempts
+		// carry the egress identity: WARP/proxy lanes use their node tag
+		// (e.g. anon.cf-warp-9), direct lanes use anon.direct. This makes
+		// 429s attributable to a specific exit without guessing.
 		label := keyID
 		if anonymous {
 			label = "anon"
+			if egress != nil {
+				if egress.proxy != nil && egress.proxy.Tag != "" {
+					label += "." + egress.proxy.Tag
+				} else {
+					label += ".direct"
+				}
+			}
 		}
 		leg := label + ":"
 		if err != nil {
