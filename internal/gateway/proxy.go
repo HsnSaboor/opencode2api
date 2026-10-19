@@ -324,7 +324,13 @@ func (m *proxyManager) completeVerify(index int, outcome proxyProbeOutcome) {
 		// the admission until the node passes again.
 		state.verified = false
 		if m.logger != nil {
-			m.logger.Debug("proxy node probe failed", "component", "egress", "event", "proxy_node_probe_failed", "node", index, "outcome", outcome.String(), "failures", state.failures, "cooldown_s", int(time.Until(state.coolingUntil).Seconds()))
+			// WARP lanes are few and operator-managed: surface their probe
+			// verdicts at info. The public proxy mass stays at debug.
+			log := m.logger.Debug
+			if m.isWarpNode(index) {
+				log = m.logger.Info
+			}
+			log("proxy node probe failed", "component", "egress", "event", "proxy_node_probe_failed", "node", index, "outcome", outcome.String(), "failures", state.failures, "cooldown_s", int(time.Until(state.coolingUntil).Seconds()))
 		}
 		m.dirty = true
 	}
