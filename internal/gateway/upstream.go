@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/config"
@@ -309,6 +310,16 @@ const (
 	// starts at a one-second backoff, so a 15s budget absorbs a real restart
 	// instead of surfacing a "warming up" refusal the client cannot use.
 	anonymousWarmupGrace = 15 * time.Second
+	// anonymousLaneWait is how long a request with a ready multiplexer waits
+	// for the pool to produce a selectable lane. A flag wave parks the current
+	// exits and admits replacements asynchronously, so selection can be empty
+	// for a few seconds even while the mux serves; waiting out that window
+	// keeps the churn invisible instead of answering the client with a
+	// retryable 503 that reads like a model outage.
+	anonymousLaneWait = 20 * time.Second
+	// anonymousLanePoll is the interval between selectable-set checks while
+	// waiting for a lane.
+	anonymousLanePoll = 250 * time.Millisecond
 )
 
 // anonymousUnavailableResponse builds the retryable 503 the anonymous tier
@@ -380,6 +391,59 @@ func (g *Gateway) anonymousEgressDown() bool {
 // immediately (mirroring the key path) because no other IP will change the
 // verdict. Only a successful response ends the anonymous phase; exhausting
 // the lane cursor returns control to the preferred authenticated tiers.
+// anonymousLaneWaiters caps how many requests may hold the lane wait at once.
+// A client that retries a 503 in a tight loop could otherwise stack
+// thousands of 20-second waits; past the cap a request takes the fast 503 the
+// scan already produces, which keeps a retry storm from consuming memory.
+var anonymousLaneWaiters atomic.Int64
+
+// anonymousLaneWaiterLimit is the concurrency cap for lane waits.
+const anonymousLaneWaiterLimit = 256
+
+// anonymousSelectable reports whether any lane currently passes the anonymous
+// selection predicate (healthy, no failure cooldown, no FreeTier park, not a
+// hard-parked direct class). It delegates to egressStatus, which mirrors
+// anonymousCursor.Next without consuming a cursor.
+func (g *Gateway) anonymousSelectable() bool {
+	if g == nil || g.anonymous == nil {
+		return false
+	}
+	_, _, _, _, selectable := g.egressStatus()
+	return selectable > 0
+}
+
+// waitForAnonymousLane reports whether the pool has at least one selectable
+// lane, waiting up to anonymousLaneWait for one to appear. It returns as soon
+// as the request context ends so an abandoned request does not hold the wait
+// open. A pool that stays empty for the whole budget returns false; the caller
+// then runs its normal scan and answers with the retryable 503.
+func (g *Gateway) waitForAnonymousLane(ctx context.Context) bool {
+	if g.anonymousSelectable() {
+		return true
+	}
+	if anonymousLaneWaiters.Add(1) > anonymousLaneWaiterLimit {
+		anonymousLaneWaiters.Add(-1)
+		return false
+	}
+	defer anonymousLaneWaiters.Add(-1)
+	deadline := time.Now().Add(anonymousLaneWait)
+	ticker := time.NewTicker(anonymousLanePoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			if g.anonymousSelectable() {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+		}
+	}
+}
+
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -413,6 +477,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// The same shaping stamps the gate's required tool profile (see
 	// shapeAnonymousBody). Key tiers keep their original bodies.
 	body = shapeAnonymousBody(body, route.ProtocolFor(config.TierZen))
+	// The mux can be ready while every lane is parked: a flag wave benches the
+	// current exits and substitutes replacements asynchronously, so the pool is
+	// briefly empty even though the upstream will serve an exit moments later.
+	// Wait out that window before deciding the tier has nothing to offer. When
+	// the budget runs out, fall through so the scan (and its retryable 503)
+	// reports the condition on the same terms as before.
+	if !g.waitForAnonymousLane(ctx) && ctx.Err() != nil {
+		return nil, ctx.Err(), 0
+	}
 	for attempts < limit {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead

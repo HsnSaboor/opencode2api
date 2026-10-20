@@ -39,10 +39,13 @@ type egressTransport struct {
 	checking atomic.Bool
 	// freitierUntil parks a FreeTier-flagged exit while the upstream flag
 	// clears (UnixNano wall clock, 0 = not parked). totalFreitiers counts
-	// lifetime flags and is diagnostic only. Park state lives on the lane
-	// (not the anonymous node) so the key path shares the same enforcement.
+	// lifetime flags and is diagnostic only. freitierParks counts consecutive
+	// parks with no success in between, which sets the escalating park
+	// duration (see freitierParkFor). Park state lives on the lane (not the
+	// anonymous node) so the key path shares the same enforcement.
 	freitierUntil  atomic.Int64
 	totalFreitiers atomic.Uint32
+	freitierParks  atomic.Int32
 }
 
 type transportPool struct {
@@ -465,6 +468,11 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	if node.egress != nil {
+		// A served request proves the exit is not flagged: reset the FreeTier
+		// park escalation so a later flag starts at the short base again.
+		node.egress.freitierParks.Store(0)
+	}
 	if p == nil {
 		return
 	}
@@ -519,6 +527,31 @@ const freitierCooldown = 30 * time.Minute
 // before any sibling /64 will serve again.
 const directEgressHardPark = 12 * time.Hour
 
+// freitierParkBase is the first FreeTier park applied to a lane. Repeated
+// parks with no success in between double it up to freitierCooldown. A flat
+// freitierCooldown let a single flag wave bench every current exit for the
+// full window, which starved anonymous selection and produced a retryable
+// 503 for the whole period; a short first park leaves room for a transient
+// wave to pass, and the streak still keeps genuinely blocked exits out of
+// rotation.
+const freitierParkBase = 3 * time.Minute
+
+// freitierParkFor returns the escalating park for the n-th consecutive park
+// on a lane (n >= 1): freitierParkBase * 2^min(n-1, 4), capped at
+// freitierCooldown. The streak resets on any success or restored park, so a
+// verdict that described the request rather than the exit does not escalate.
+func freitierParkFor(parks int32) time.Duration {
+	if parks < 1 {
+		parks = 1
+	}
+	shift := min(parks-1, 4)
+	delay := freitierParkBase
+	for range shift {
+		delay *= 2
+	}
+	return min(delay, freitierCooldown)
+}
+
 // Prefix-level cooling: one FreeTier 403 parks a single lane, but a prefix
 // whose lanes keep answering FreeTier is blocked upstream as a unit — a
 // rotated /48 that had been used for abuse answered 403 FreeTierError from
@@ -544,7 +577,7 @@ func (p *anonymousPool) ParkFreitier(egress *egressTransport) {
 		return
 	}
 	egress.totalFreitiers.Add(1)
-	egress.freitierUntil.Store(time.Now().Add(freitierCooldown).UnixNano())
+	egress.freitierUntil.Store(time.Now().Add(freitierParkFor(egress.freitierParks.Add(1))).UnixNano())
 	p.maybeReplenish(egress)
 }
 
@@ -557,6 +590,9 @@ func (p *anonymousPool) UnparkFreitier(egress *egressTransport) {
 	if egress == nil {
 		return
 	}
+	// The verdict was request-scoped, so it is not evidence against the exit:
+	// clear the park and the escalation streak with it.
+	egress.freitierParks.Store(0)
 	egress.freitierUntil.Store(0)
 }
 
