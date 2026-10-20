@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,8 +65,17 @@ func main() {
 	}
 	defer manager.Shutdown()
 
+	// A stop keeps the listener open and answers new requests with a retryable
+	// 503 while in-flight streams finish. The previous behavior called
+	// Shutdown immediately, which closes the listener, so clients hit a
+	// refused connection for the whole drain budget; most clients do not retry
+	// a reset and surfaced it as a hard "model unavailable" failure.
+	var draining atomic.Bool
+	var inflight atomic.Int64
+	drain := &drainState{draining: &draining, inflight: &inflight}
+
 	apiServer := &http.Server{
-		Addr: cfg.Listen, Handler: manager.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
+		Addr: cfg.Listen, Handler: drain.wrap(manager.Handler()), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
 	}
 	servers := []*http.Server{apiServer}
 	go serveHTTP(stopSignals, logger, apiServer, "api", startedAt)
@@ -73,14 +83,23 @@ func main() {
 	if cfg.WebUI.Enabled {
 		admin := adminui.New(manager, monitor, hub, logger)
 		webServer := &http.Server{
-			Addr: cfg.WebUI.Listen, Handler: admin.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
+			Addr: cfg.WebUI.Listen, Handler: drain.wrap(admin.Handler()), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 120 * time.Second,
 		}
 		servers = append(servers, webServer)
 		go serveHTTP(stopSignals, logger, webServer, "webui", startedAt)
 	}
 
 	<-signalCtx.Done()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	draining.Store(true)
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer drainCancel()
+	// Wait out the in-flight streams while the listener still accepts the
+	// departing clients' retries. The wait is bounded: a stream that outlives
+	// the budget is cut when Shutdown runs.
+	for inflight.Load() > 0 && drainCtx.Err() == nil {
+		time.Sleep(50 * time.Millisecond)
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	for _, server := range servers {
 		if err := server.Shutdown(shutdownCtx); err != nil {
@@ -99,4 +118,28 @@ func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Serv
 		logger.Error("server stopped unexpectedly", "component", component, "event", "server_failed", "address", server.Addr, "error", err)
 		cancel()
 	}
+}
+
+// drainState fronts the request handlers so a stopping gateway keeps accepting
+// connections, answering new requests with a retryable 503 while the stop
+// waits out work already in flight. Refusing the connection instead made a
+// deploy look like a hard failure to clients that do not retry a reset.
+type drainState struct {
+	draining *atomic.Bool
+	inflight *atomic.Int64
+}
+
+func (d *drainState) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if d.draining.Load() {
+			w.Header().Set("Retry-After", "5")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"type":"service_unavailable","message":"server is restarting; retry shortly"}}`))
+			return
+		}
+		d.inflight.Add(1)
+		defer d.inflight.Add(-1)
+		next.ServeHTTP(w, r)
+	})
 }

@@ -305,9 +305,10 @@ const (
 	anonymousRetryAfter = 5 * time.Second
 	// anonymousWarmupGrace is how long an anonymous request waits for a
 	// restarting multiplexer to bind before it is answered with a retryable
-	// 503. The first spawn binds in about a second, so this hides the common
-	// restart window from clients entirely.
-	anonymousWarmupGrace = 2 * time.Second
+	// 503. The first spawn binds in about a second and a supervised respawn
+	// starts at a one-second backoff, so a 15s budget absorbs a real restart
+	// instead of surfacing a "warming up" refusal the client cannot use.
+	anonymousWarmupGrace = 15 * time.Second
 )
 
 // anonymousUnavailableResponse builds the retryable 503 the anonymous tier

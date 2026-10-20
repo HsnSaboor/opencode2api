@@ -45,7 +45,20 @@ type Multiplexer struct {
 	cmd     *exec.Cmd
 	stopped bool
 	done    chan struct{}
+	// readyAt is the last successful readiness probe. It gives Ready a short
+	// trust window so one missed loopback dial under load cannot report the
+	// pool as down while it is actively serving.
+	readyAt time.Time
 }
+
+const (
+	// readyProbeTimeout bounds the loopback dial Ready uses to prove the SOCKS
+	// port accepts connections. The old 300ms budget was too tight under load.
+	readyProbeTimeout = 1500 * time.Millisecond
+	// readyTrustWindow keeps the multiplexer ready through a transient probe
+	// failure: a listener that accepted a connection this recently is not dead.
+	readyTrustWindow = 10 * time.Second
+)
 
 // NewMultiplexer prepares (but does not start) the multiplexer.
 func NewMultiplexer(cfg MultiplexerConfig, nodes []Node, log *slog.Logger) *Multiplexer {
@@ -224,6 +237,9 @@ func (m *Multiplexer) spawn(ctx context.Context) error {
 		m.terminate(cmd, done)
 		return err
 	}
+	m.mu.Lock()
+	m.readyAt = time.Now()
+	m.mu.Unlock()
 	if m.log != nil {
 		m.log.Info("proxy multiplexer ready", "component", "egress", "event", "proxy_multiplexer_ready", "socks_port", m.cfg.SocksPort, "duration_ms", time.Since(started).Milliseconds())
 	}
@@ -351,6 +367,7 @@ func (m *Multiplexer) Supervise(ctx context.Context) {
 func (m *Multiplexer) Ready() bool {
 	m.mu.Lock()
 	done := m.done
+	lastReady := m.readyAt
 	m.mu.Unlock()
 	if done == nil {
 		return false
@@ -360,11 +377,19 @@ func (m *Multiplexer) Ready() bool {
 		return false
 	default:
 	}
-	conn, err := net.DialTimeout("tcp", m.SocksAddr(), 300*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", m.SocksAddr(), readyProbeTimeout)
 	if err != nil {
+		// A single slow dial is not proof the listener is gone; only age the
+		// multiplexer out once no probe has succeeded for the trust window.
+		if !lastReady.IsZero() && time.Since(lastReady) < readyTrustWindow {
+			return true
+		}
 		return false
 	}
 	_ = conn.Close()
+	m.mu.Lock()
+	m.readyAt = time.Now()
+	m.mu.Unlock()
 	return true
 }
 
