@@ -22,9 +22,9 @@ type Config struct {
 	ServerKeyMetadata map[string]ServerKeyMetadata `json:"server_key_metadata,omitempty"`
 	ZenKeys           []string                     `json:"zen_keys"`
 	GoKeys            []string                     `json:"go_keys"`
+	Providers         []ProviderConfig             `json:"providers,omitempty"`
 	Anonymous         bool                         `json:"anonymous"`
-	Proxies           []string                     `json:"proxies"`
-	ProxyFile         string                       `json:"proxyfile"`
+	Egress            EgressConfig                 `json:"egress"`
 	Upstream          UpstreamConfig               `json:"upstream"`
 	Retry             RetryConfig                  `json:"retry"`
 	Models            ModelsConfig                 `json:"models"`
@@ -33,8 +33,6 @@ type Config struct {
 	WebUI             WebUIConfig                  `json:"webui"`
 	Prefer            Tier                         `json:"prefer"`
 	Reasoning         ReasoningConfig              `json:"reasoning"`
-
-	effectiveProxies []string
 }
 
 // ReasoningConfig forces a thinking level for requests that do not state one.
@@ -128,11 +126,12 @@ func Load(path string) (Config, error) {
 	}
 	cfg := Config{
 		Listen:      "127.0.0.1:8080",
-		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/inference", Go: "https://opencode.ai/inference/go"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
+		Egress:      defaultEgress(),
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
 	}
@@ -147,6 +146,22 @@ func Load(path string) (Config, error) {
 	return Normalize(path, cfg)
 }
 
+// legacyUpstreamBase rewrites the retired /zen API bases onto the current
+// /inference contract so existing configs keep working: the protocol routes
+// moved from /v1/* to the vendor-scoped paths (see protocol.Path), so a stale
+// base would 404 every call. Unknown hosts pass through untouched.
+func legacyUpstreamBase(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	switch strings.TrimRight(trimmed, "/") {
+	case "https://opencode.ai/zen":
+		return "https://opencode.ai/inference"
+	case "https://opencode.ai/zen/go":
+		return "https://opencode.ai/inference/go"
+	default:
+		return trimmed
+	}
+}
+
 // Normalize resolves external inputs and validates a Config supplied by
 // either the JSON file or the authenticated management API.
 func Normalize(path string, cfg Config) (Config, error) {
@@ -157,18 +172,21 @@ func Normalize(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
-	cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
-	if err := resolveProxyFiles(path, &cfg); err != nil {
+	if err := normalizeProviders(&cfg); err != nil {
 		return Config{}, err
 	}
-	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
-		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
+	cfg.Egress.withDefaults()
+	if err := cfg.Egress.validate(); err != nil {
+		return Config{}, err
+	}
+	if !cfg.HasTier(cfg.Prefer) {
+		return Config{}, errors.New("prefer must name a configured tier: \"zen\", \"go\", or a provider")
 	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
 	}
-	cfg.Upstream.Zen = strings.TrimSpace(cfg.Upstream.Zen)
-	cfg.Upstream.Go = strings.TrimSpace(cfg.Upstream.Go)
+	cfg.Upstream.Zen = legacyUpstreamBase(cfg.Upstream.Zen)
+	cfg.Upstream.Go = legacyUpstreamBase(cfg.Upstream.Go)
 	for name, raw := range map[string]string{"upstream.zen": cfg.Upstream.Zen, "upstream.go": cfg.Upstream.Go} {
 		u, err := url.Parse(strings.TrimSpace(raw))
 		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
@@ -181,8 +199,8 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.FirstEnabledServerKey() == "" {
 		return Config{}, errors.New("至少保留一个启用的 API Key")
 	}
-	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
+	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 && len(cfg.Providers) == 0 {
+		return Config{}, errors.New("zen_keys, go_keys, or providers must contain at least one upstream key unless anonymous is enabled")
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
@@ -225,20 +243,6 @@ func Normalize(path string, cfg Config) (Config, error) {
 		}
 		if cfg.WebUI.SessionTTLMinutes < 5 || cfg.WebUI.SessionTTLMinutes > 10080 {
 			return Config{}, errors.New("webui.session_ttl_minutes must be between 5 and 10080")
-		}
-	}
-	for _, raw := range cfg.RuntimeProxies() {
-		if raw == "direct" {
-			continue
-		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" {
-			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return Config{}, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 		}
 	}
 	for model, protocol := range cfg.Models.Protocols {
@@ -307,23 +311,51 @@ func (cfg Config) ForcedEffort(model string) string {
 	return cfg.Reasoning.Effort
 }
 
-// RuntimeProxies returns the resolved proxy list, including proxyfile entries.
-// Config.Proxies intentionally remains the list stored in config.json so a
-// save never duplicates values loaded from proxyfile.
-func (cfg Config) RuntimeProxies() []string {
-	if len(cfg.effectiveProxies) > 0 {
-		return cfg.effectiveProxies
+// EgressAddresses samples the configured source addresses in rotation.
+//
+// It is a method (rather than a package function) so callers read the
+// resolved pool off the Config they already hold. The sample is fresh per
+// process start, which keeps the egress set stable for the lifetime of one
+// gateway instance while still rotating it across restarts.
+//
+// Call-once: every call re-samples from crypto randomness, so each result is
+// a distinct pool. The single call site is gateway New, which feeds the
+// sampled slice to the shared transport pool. A second call would fork the
+// pool (lanes bound to addresses the transports never dialed), so do not
+// call this again for the same instance — thread the slice through instead.
+// Memoization was deliberately avoided: caching the sample on Config would
+// change Config copy semantics (Clone must still deep-copy plain fields,
+// and a lazy Once field would either share the sample across clones or
+// need explicit invalidation).
+func (cfg Config) EgressAddresses() []string {
+	if cfg.Egress.IPv4Only {
+		// The unbound direct lane, dialing tcp4: the upstream free-tier
+		// gate rejects IPv6 traffic while accepting the same request over
+		// IPv4, so a family-racing direct lane is not enough.
+		return []string{"direct4"}
 	}
-	if len(cfg.Proxies) > 0 {
-		return cfg.Proxies
+	size := cfg.Egress.PoolSize
+	if size < 1 {
+		size = defaultEgressPoolSize
 	}
-	return []string{"direct"}
-}
-
-// PasswordForSave ensures resolved-only data is excluded. The method is kept
-// separate to make accidental persistence of effective proxy values obvious.
-func (cfg *Config) PasswordForSave() {
-	cfg.effectiveProxies = nil
+	prefixes := cfg.Egress.Prefixes
+	if len(prefixes) == 0 {
+		if !cfg.Egress.EnableIPv6 {
+			return []string{"direct"}
+		}
+		prefixes = []string{defaultEgressPrefix}
+	}
+	addrs, err := resolveEgress(prefixes, cfg.Egress.PrefixWeights, size)
+	if err != nil {
+		// resolveEgress only fails when the configured prefixes cannot yield
+		// the pool, which Validate/Normalize already rejects. Keep the
+		// gateway startable in the impossible case with a loud direct lane.
+		return []string{"direct"}
+	}
+	if !cfg.Egress.EnableIPv6 {
+		return append([]string{"direct"}, addrs...)
+	}
+	return addrs
 }
 
 func Clone(cfg Config) Config {
@@ -337,8 +369,22 @@ func Clone(cfg Config) Config {
 	cfg.ServerKeyMetadata = metadata
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
-	cfg.Proxies = append([]string(nil), cfg.Proxies...)
-	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
+	if cfg.Providers != nil {
+		providers := make([]ProviderConfig, len(cfg.Providers))
+		for i, provider := range cfg.Providers {
+			provider.APIKeys = append([]string(nil), provider.APIKeys...)
+			providers[i] = provider
+		}
+		cfg.Providers = providers
+	}
+	cfg.Egress.Prefixes = append([]string(nil), cfg.Egress.Prefixes...)
+	if cfg.Egress.PrefixWeights != nil {
+		weights := make(map[string]int, len(cfg.Egress.PrefixWeights))
+		for prefix, weight := range cfg.Egress.PrefixWeights {
+			weights[prefix] = weight
+		}
+		cfg.Egress.PrefixWeights = weights
+	}
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))
 		for key, value := range cfg.Models.Protocols {

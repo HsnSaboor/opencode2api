@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"opencode2api/internal/config"
@@ -27,51 +28,192 @@ const maxRequestBody = 32 << 20
 
 const anonymousZenKey = "public"
 
+// channel is one authenticated upstream family: a base URL with its own key
+// pool and wire dialect. Zen and Go are the built-in OpenCode channels; every
+// configured provider is one more channel under its own name.
+type channel struct {
+	tier     config.Tier
+	upstream string
+	// opencode marks an OpenCode inference upstream: vendor-scoped protocol
+	// paths, the free-tier request shaping, and egress verdicts shared with
+	// the anonymous lane. Provider channels are plain OpenAI-compatible APIs
+	// that reuse the same pool machinery without the gate semantics.
+	opencode bool
+	// home declares which lane class this channel's key pool treats as
+	// home for its keys: dedicated source-address lanes (one /64 per key)
+	// by default, proxy exits whenever no dedicated lane is vacant. Zen
+	// sets homeDedicatedOnly: its keys ride their own /64 lanes, and no
+	// proxy exit is ever applied to keyed free-tier traffic.
+	home egressHome
+	// suffix is appended to every discovered model ID before it enters the
+	// catalog, so a provider whose free routes carry a name suffix is
+	// addressable by the exact ID its upstream accepts.
+	suffix string
+	nodes  *nodePool
+}
+
 type Gateway struct {
 	rotation     *rotation.Manager
 	cfg          config.Config
 	logger       *slog.Logger
 	transports   *transportPool
-	zenNodes     *nodePool
-	goNodes      *nodePool
+	channels     map[config.Tier]*channel
+	order        []config.Tier
 	anonymous    *anonymousPool
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
 	availability *models.AvailabilityStore
+	// proxies is nil unless the proxy pool is configured: it owns the
+	// candidate node set, verification state, and multiplexer process.
+	proxies *proxyManager
+	// proxyCanary caches the most recent gate-canary verdict (see
+	// proxyGateRejectsRequest): one canonical-profile probe per TTL decides
+	// whether a burst of FreeTier verdicts describes the requests or the
+	// exits, on both the request and verification paths.
+	proxyCanaryMu sync.Mutex
+	proxyCanaryAt time.Time
+	proxyCanaryOK bool
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
+	startup := time.Now()
 	cfg.Rotation.Defaults()
 	rotationManager, err := rotation.New("", cfg.Rotation)
 	if err != nil {
 		return nil, err
 	}
-	transports, err := newTransportPool(cfg.RuntimeProxies(), cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second))
+	addresses := cfg.EgressAddresses()
+	prefixes := cfg.Egress.Prefixes
+	prefixWeights := cfg.Egress.PrefixWeights
+	if cfg.Egress.IPv4Only || !cfg.Egress.EnableIPv6 {
+		prefixes = nil
+		prefixWeights = nil
+	}
+	transports, err := newTransportPool(addresses, cfg.Performance, cfg.Performance.AttemptTimeout(time.Duration(cfg.Retry.TimeoutSeconds)*time.Second), prefixes, prefixWeights)
 	if err != nil {
 		return nil, err
 	}
+	if logger != nil {
+		// The sampled pool is fresh per process start, so one startup line
+		// names what this instance actually rotates. Full literals stay at
+		// debug: a pool of 128 addresses would spam the default log level.
+		logger.Info("egress pool ready", "component", "egress", "event", "egress_pool_ready", "prefixes", prefixes, "pool_size", len(addresses), "setup_ms", time.Since(startup).Milliseconds())
+		logger.Debug("egress pool addresses", "component", "egress", "event", "egress_pool_addresses", "addresses", addresses)
+	}
+	// Pre-dial lanes in the background against the same neutral target the
+	// scheduled health checks use, so the first client request usually finds
+	// a warm TLS route. Warming must not gate startup: a few dead addresses
+	// used to stretch the listener's arrival to egressWarmTimeout, which is
+	// exactly the restart window clients saw as an outage.
+	go func() {
+		started := time.Now()
+		warmCtx, warmCancel := context.WithTimeout(context.Background(), egressWarmTimeout)
+		defer warmCancel()
+		results := transports.warmLanes(warmCtx, egressHealthCheckURL, egressHealthCheckTimeout)
+		warmed := 0
+		for _, result := range results {
+			if result.err == nil {
+				warmed++
+			}
+		}
+		if logger != nil {
+			logger.Info("egress pool warmed", "component", "egress", "event", "egress_pool_warmed", "warmed", warmed, "total", len(results), "duration_ms", time.Since(started).Milliseconds())
+		}
+	}()
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := newNodePool(cfg.ZenKeys, transports, cooldown)
-	if err != nil {
-		return nil, fmt.Errorf("zen node pool: %w", err)
+	tiers := cfg.Tiers()
+	channels := make(map[config.Tier]*channel, len(tiers))
+	for _, tier := range tiers {
+		nodes, err := newNodePool(cfg.TierKeys(tier), transports, cooldown)
+		if err != nil {
+			return nil, fmt.Errorf("%s node pool: %w", tier, err)
+		}
+		home := homeDedicated
+		if tier == config.TierZen {
+			// Zen keys ride their dedicated /64 lanes only; no proxy
+			// exit ever carries keyed free-tier traffic (see channel.home).
+			home = homeDedicatedOnly
+		}
+		channels[tier] = &channel{
+			tier:     tier,
+			upstream: cfg.TierUpstream(tier),
+			opencode: tier == config.TierZen || tier == config.TierGo,
+			home:     home,
+			suffix:   cfg.TierModelSuffix(tier),
+			nodes:    nodes,
+		}
 	}
-	goNodes, err := newNodePool(cfg.GoKeys, transports, cooldown)
-	if err != nil {
-		return nil, fmt.Errorf("go node pool: %w", err)
-	}
-	catalog := models.NewCatalog(cfg.Prefer, cfg.Models.Protocols)
+	catalog := models.NewCatalog(cfg.Prefer, tiers, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
-	return &Gateway{
+	gateway := &Gateway{
 		cfg:        cfg,
 		rotation:   rotationManager,
 		logger:     logger,
 		transports: transports,
-		zenNodes:   zenNodes,
-		goNodes:    goNodes,
-		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
+		channels:   channels,
+		order:      tiers,
 		catalog:    catalog,
 		monitor:    monitor,
-	}, nil
+	}
+	// The proxy pool is attached before the anonymous pool snapshots the
+	// lane list so seeded proxy lanes become anonymous nodes like any
+	// other; later admissions append via anonymousPool.addNode.
+	if cfg.Egress.Proxies.Enabled {
+		manager, proxyErr := newProxyManager(cfg.Egress.Proxies, logger)
+		if proxyErr != nil {
+			return nil, fmt.Errorf("proxy pool: %w", proxyErr)
+		}
+		gateway.proxies = manager
+		transports.proxies = manager
+		seeded := gateway.seedProxyLanes()
+		if logger != nil {
+			logger.Info("proxy pool ready", "component", "egress", "event", "proxy_pool_ready", "nodes", len(manager.profile.Nodes), "lanes", seeded, "count", manager.cfg.Count, "socks_port", manager.cfg.SocksPort, "state_file", manager.statePath, "startup_ms", time.Since(startup).Milliseconds())
+		}
+	}
+	if cfg.Anonymous && cfg.Egress.Proxies.Enabled {
+		// The free tier now rejects the host's datacenter prefixes as abusive
+		// as a class. Bench them from the start instead of waiting for the
+		// first request to discover the block and briefly surface its 403.
+		transports.ParkDirectEgress(directEgressHardPark)
+		if logger != nil {
+			logger.Info("direct egress lanes hard-parked for anonymous traffic", "component", "egress", "event", "direct_egress_hard_parked", "duration", directEgressHardPark.String())
+		}
+	}
+	gateway.anonymous = newAnonymousPool(cfg.Anonymous, transports, cooldown, prefixes)
+	// Key pools bound before proxy lanes seeded, so spread them now: the
+	// seeded lanes would otherwise idle keyless while one address carries
+	// every account of a keyed provider.
+	gateway.rebalanceEgressKeys()
+	return gateway, nil
+}
+
+// channel returns the authenticated channel for one tier, or nil when the
+// tier is not configured.
+func (g *Gateway) channel(tier config.Tier) *channel {
+	return g.channels[tier]
+}
+
+// orderedChannels returns every channel in configuration order (zen, go,
+// then providers).
+func (g *Gateway) orderedChannels() []*channel {
+	channels := make([]*channel, 0, len(g.order))
+	for _, tier := range g.order {
+		if channel := g.channels[tier]; channel != nil {
+			channels = append(channels, channel)
+		}
+	}
+	return channels
+}
+
+// keyAvailability reports which tiers hold at least one key. It is the single
+// routing input for tier selection, so a tier's eligibility always matches
+// the pool that would serve it.
+func (g *Gateway) keyAvailability() map[config.Tier]bool {
+	availability := make(map[config.Tier]bool, len(g.channels))
+	for tier, channel := range g.channels {
+		availability[tier] = channel.nodes.Len() > 0
+	}
+	return availability
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -82,6 +224,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
+	// /health is the conventional readiness path monitors probe; keep it as
+	// an alias so a 404 never reads as "gateway down".
+	mux.HandleFunc("GET /health", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }
 
@@ -143,11 +288,11 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 			return
 		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+		route, err := g.catalog.Route(model, g.keyAvailability(), g.cfg.Anonymous)
 		if override, selected := debugKeyOverrideFrom(r.Context()); selected {
 			// A per-key diagnostic must not silently be served by another key,
 			// another tier or the anonymous lane.
-			route, err = g.catalog.RouteForTier(model, override.Tier, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0)
+			route, err = g.catalog.RouteForTier(model, override.Tier, g.keyAvailability())
 		}
 		if err != nil {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
@@ -182,7 +327,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
-		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, stream)
 		if err != nil {
 			finalTier := route.Tier
 			if meta != nil && meta.Tier != "" {
@@ -244,15 +389,22 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		}
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		if err != nil {
+			// Log before answering: without this the 502 is invisible in the
+			// journal, which is what made these failures hard to attribute to a
+			// lane that answered 200 and then truncated its body.
+			egress := ""
+			if meta != nil {
+				egress = meta.Egress
+			}
+			g.logger.Warn("failed to read upstream response body", "component", "http", "event", "upstream_body_read_failed", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "egress", egress, "status", resp.StatusCode, "error", err)
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
 		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
-			// Key-tier shaped requests were force-streamed like the
-			// anonymous lane; collapse the same way.
-			// The anonymous lane is served streaming (see prepareAnonymousBody);
-			// collapse the events back into the single document this
-			// non-streaming client asked for.
+			// The anonymous lane and key-tier shaped requests were
+			// force-streamed (see shapeAnonymousBody); collapse the events
+			// back into the single document this non-streaming client
+			// asked for.
 			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
 			if err != nil {
 				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
@@ -305,7 +457,7 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 		return
 	}
-	route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+	route, err := g.catalog.Route(model, g.keyAvailability(), g.cfg.Anonymous)
 	if err != nil {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 		return
@@ -342,7 +494,9 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	}
 	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 	defer cancel()
-	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+	// The SystemOne decision path answers non-streaming today, so the
+	// anonymous scan validates and buffers the body before reporting success.
+	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, false)
 	if err != nil {
 		finalTier := route.Tier
 		if meta != nil && meta.Tier != "" {
@@ -394,7 +548,7 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 	tiers := make([]config.Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[config.Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier config.Tier) {
-		if tier != config.TierZen && tier != config.TierGo || seen[tier] {
+		if _, known := g.channels[tier]; !known || seen[tier] {
 			return
 		}
 		seen[tier] = true
@@ -410,11 +564,14 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 	bodies := make(map[config.Tier][]byte, len(tiers))
 	for _, tier := range tiers {
 		protocol := route.ProtocolFor(tier)
-		baseURL := g.cfg.Upstream.Zen
-		if tier == config.TierGo {
-			baseURL = g.cfg.Upstream.Go
+		tierInput := input
+		if from == wire.Responses {
+			if tools, ok := sanitizeToolsForUpstream(input, protocol); ok {
+				tierInput = withReplacedTools(input, tools)
+			}
 		}
-		upstreamPayload, err := wire.PrepareRequest(from, protocol, input, baseURL)
+		target := wire.Target{InterleavedField: g.catalog.MetadataForTier(route.ID, tier).InterleavedField}
+		upstreamPayload, err := wire.PrepareRequest(from, protocol, tierInput, target)
 		if err != nil {
 			if tier != route.Tier {
 				// A fallback tier may use a stricter wire format than the
@@ -425,6 +582,16 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 				continue
 			}
 			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+		}
+		if protocol == wire.Chat {
+			// A tool call whose arguments were truncated — for example by an
+			// interrupted stream the client persisted — makes strict upstreams
+			// reject the whole conversation ("Assistant tool call
+			// function.arguments must be a JSON object"). Repair the history
+			// here instead of failing every request that carries it.
+			if repaired := wire.RepairChatToolCallArguments(upstreamPayload); repaired > 0 {
+				g.logger.Info("repaired malformed tool call arguments before forwarding", "component", "conversion", "event", "tool_call_arguments_repaired", "model", jsonutil.StringAt(input, "model"), "tier", tier, "calls", repaired)
+			}
 		}
 		if effort := g.resolvedEffort(jsonutil.StringAt(upstreamPayload, "model"), tier, protocol); effort != "" {
 			wire.ForcedEffort(protocol, upstreamPayload, effort)

@@ -59,17 +59,18 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		effective: effectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
 	}
 	manager.metadata = modelcatalog.NewPricingStore(configPath, logger)
-	// models.dev refreshes ride the active runtime's healthy proxy transports
+	// models.dev refreshes ride the active runtime's healthy egress transports
 	// and fall back to the store's direct client when none are available.
 	manager.metadata.SetClientProvider(func() []*http.Client {
 		runtime := manager.current.Load()
 		if runtime == nil || runtime.gateway == nil || runtime.gateway.transports == nil {
 			return nil
 		}
-		clients := make([]*http.Client, 0, len(runtime.gateway.transports.items))
-		for _, proxy := range runtime.gateway.transports.items {
-			if proxy != nil && proxy.healthy.Load() {
-				clients = append(clients, proxy.client)
+		items := runtime.gateway.transports.snapshot()
+		clients := make([]*http.Client, 0, len(items))
+		for _, egress := range items {
+			if egress != nil && egress.healthy.Load() {
+				clients = append(clients, egress.client)
 			}
 		}
 		return clients
@@ -142,10 +143,11 @@ func (m *RuntimeManager) build(cfg config.Config) (*gatewayRuntime, error) {
 
 func (m *RuntimeManager) start(runtime *gatewayRuntime) {
 	// Store the context through a lightweight wrapper so cancel stops catalog
-	// and proxy checks while in-flight HTTP requests continue on the old pools.
+	// and egress checks while in-flight HTTP requests continue on the old pools.
 	runtimeCtx, cancel := context.WithCancel(m.root)
 	runtime.cancel = cancel
-	runtime.gateway.StartProxyHealthChecks(runtimeCtx)
+	runtime.gateway.StartEgressHealthChecks(runtimeCtx)
+	runtime.gateway.StartProxyPlugins(runtimeCtx)
 	runtime.gateway.StartModelRefresh(runtimeCtx)
 }
 
@@ -291,28 +293,60 @@ func (m *RuntimeManager) Shutdown() {
 type ResourceSnapshot struct {
 	Models    modelcatalog.CatalogSnapshot  `json:"models"`
 	Keys      []KeyStatus                   `json:"keys"`
-	Proxies   []ProxyStatus                 `json:"proxies"`
+	Egress    []EgressStatus                `json:"egress"`
 	Anonymous bool                          `json:"anonymous"`
 	Metadata  modelcatalog.MetadataSnapshot `json:"metadata"`
+	// Proxy reports the multiplexed proxy pool inventory; omitted when the
+	// pool is disabled.
+	Proxy *ProxyStatus `json:"proxy,omitempty"`
+}
+
+// ProxyStatus is the operator-facing view of the proxy pool: how many
+// profile nodes exist, how many the verification sweep has admitted, and how
+// many lanes currently rotate them.
+type ProxyStatus struct {
+	Nodes      int  `json:"nodes"`
+	Lanes      int  `json:"lanes"`
+	Verified   int  `json:"verified"`
+	Available  int  `json:"available"`
+	Cooling    int  `json:"cooling"`
+	Pending    int  `json:"pending"`
+	SocksPort  int  `json:"socks_port"`
+	SocksReady bool `json:"socks_ready"`
+	// SweepHeld reports a canary-confirmed gate rejection: the canonical
+	// request profile was refused from a verified exit, so candidate sweeps
+	// are paused instead of charging failures to healthy nodes.
+	SweepHeld bool `json:"sweep_held,omitempty"`
+	// SweepHeldUntil carries the moment the hold expires.
+	SweepHeldUntil *time.Time `json:"sweep_held_until,omitempty"`
 }
 
 type KeyStatus struct {
 	ID            string     `json:"id"`
 	Tier          string     `json:"tier"`
 	Index         int        `json:"index"`
-	ProxyIndex    int        `json:"proxy_index"`
+	EgressIndex   int        `json:"egress_index"`
 	Failures      uint32     `json:"failures"`
 	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
 }
 
-type ProxyStatus struct {
-	Index     int    `json:"index"`
-	Address   string `json:"address"`
-	Healthy   bool   `json:"healthy"`
-	Checking  bool   `json:"checking"`
-	ZenKeys   int    `json:"zen_keys"`
-	GoKeys    int    `json:"go_keys"`
-	Anonymous bool   `json:"anonymous"`
+type EgressStatus struct {
+	Index    int    `json:"index"`
+	Address  string `json:"address"`
+	Healthy  bool   `json:"healthy"`
+	Checking bool   `json:"checking"`
+	// Keys reports how many keys of each tier are currently bound to this
+	// lane, keyed by tier name.
+	Keys      map[string]int `json:"keys,omitempty"`
+	Anonymous bool           `json:"anonymous"`
+	// Proxy marks a multiplexed proxy lane whose address is "proxy:<node>".
+	Proxy bool `json:"proxy,omitempty"`
+	// ParkedUntil marks a FreeTier-parked lane with its expiry; CoolingUntil
+	// marks an anonymous failure backoff. Both omit when unset. A lane can
+	// report Healthy while parked — health is transport state, park/cool
+	// is selection state.
+	ParkedUntil  *time.Time `json:"parked_until,omitempty"`
+	CoolingUntil *time.Time `json:"cooling_until,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -324,23 +358,63 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	_, models := gateway.availableModels()
 	result := ResourceSnapshot{Models: models, Anonymous: gateway.cfg.Anonymous}
 	result.Metadata = gateway.catalog.MetadataSnapshot()
-	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
-	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
-	gateway.zenNodes.bindingsMu.Lock()
-	zenBindings := append([]int(nil), gateway.zenNodes.bindingCount...)
-	gateway.zenNodes.bindingsMu.Unlock()
-	gateway.goNodes.bindingsMu.Lock()
-	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
-	gateway.goNodes.bindingsMu.Unlock()
-	for _, proxy := range gateway.transports.items {
-		status := ProxyStatus{Index: proxy.index, Address: config.RedactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(), Anonymous: gateway.cfg.Anonymous}
-		if proxy.index < len(zenBindings) {
-			status.ZenKeys = zenBindings[proxy.index]
+	channels := gateway.orderedChannels()
+	bindings := make(map[config.Tier][]int, len(channels))
+	for _, channel := range channels {
+		result.Keys = append(result.Keys, keyStatuses(string(channel.tier), channel.nodes)...)
+		channel.nodes.bindingsMu.Lock()
+		bindings[channel.tier] = append([]int(nil), channel.nodes.bindingCount...)
+		channel.nodes.bindingsMu.Unlock()
+	}
+	cooling := make(map[*egressTransport]int64, len(gateway.anonymous.snapshotNodes()))
+	for _, node := range gateway.anonymous.snapshotNodes() {
+		if node == nil || node.egress == nil {
+			continue
 		}
-		if proxy.index < len(goBindings) {
-			status.GoKeys = goBindings[proxy.index]
+		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
+			if prev, ok := cooling[node.egress]; !ok || until > prev {
+				cooling[node.egress] = until
+			}
 		}
-		result.Proxies = append(result.Proxies, status)
+	}
+	for _, egress := range gateway.transports.snapshot() {
+		status := EgressStatus{Index: egress.index, Address: config.RedactURL(egress.address), Healthy: egress.healthy.Load(), Checking: egress.checking.Load(), Anonymous: gateway.cfg.Anonymous, Proxy: egress.proxy != nil}
+		if until := egress.freitierUntil.Load(); until > time.Now().UnixNano() {
+			value := time.Unix(0, until).UTC()
+			status.ParkedUntil = &value
+		}
+		if until, ok := cooling[egress]; ok {
+			value := time.Unix(0, until).UTC()
+			status.CoolingUntil = &value
+		}
+		for tier, counts := range bindings {
+			if egress.index >= len(counts) || counts[egress.index] == 0 {
+				continue
+			}
+			if status.Keys == nil {
+				status.Keys = make(map[string]int, len(bindings))
+			}
+			status.Keys[string(tier)] = counts[egress.index]
+		}
+		result.Egress = append(result.Egress, status)
+	}
+	if gateway.proxies != nil {
+		stats := gateway.proxies.stats()
+		result.Proxy = &ProxyStatus{
+			Nodes:      stats.Nodes,
+			Lanes:      gateway.transports.proxyLaneCount(),
+			Verified:   stats.Verified,
+			Available:  stats.Available,
+			Cooling:    stats.Cooling,
+			Pending:    stats.Pending,
+			SocksPort:  gateway.proxies.cfg.SocksPort,
+			SocksReady: gateway.proxies.mux.Ready(),
+		}
+		if held, until := gateway.proxies.sweepHold(); held {
+			result.Proxy.SweepHeld = true
+			value := until.UTC()
+			result.Proxy.SweepHeldUntil = &value
+		}
 	}
 	return result
 }
@@ -354,7 +428,7 @@ func (m *RuntimeManager) DebugModels() ([]modelcatalog.RouteDiagnostic, modelcat
 	models := gateway.catalog.List()
 	result := make([]modelcatalog.RouteDiagnostic, 0, len(models))
 	for _, model := range models {
-		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous))
+		result = append(result, gateway.catalog.Diagnostic(model, "", gateway.keyAvailability(), gateway.cfg.Anonymous))
 	}
 	metadata := gateway.catalog.MetadataSnapshot()
 	return result, metadata
@@ -366,7 +440,7 @@ func (m *RuntimeManager) DebugRoute(model string, requested protocol.Protocol) m
 		return modelcatalog.RouteDiagnostic{Model: model, RequestedProtocol: requested, RouteError: "gateway runtime is unavailable"}
 	}
 	gateway := runtime.gateway
-	return gateway.catalog.Diagnostic(model, requested, len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous)
+	return gateway.catalog.Diagnostic(model, requested, gateway.keyAvailability(), gateway.cfg.Anonymous)
 }
 
 // DebugKeyView is the operator-facing view of one configured upstream key. It
@@ -383,7 +457,7 @@ type DebugKeyView struct {
 // DebugKeys lists every configured upstream key per tier so the Playground can
 // offer an explicit per-key test target.
 func (m *RuntimeManager) DebugKeys() map[string][]DebugKeyView {
-	result := map[string][]DebugKeyView{"zen": {}, "go": {}}
+	result := map[string][]DebugKeyView{}
 	runtime := m.current.Load()
 	if runtime == nil {
 		return result
@@ -401,8 +475,9 @@ func (m *RuntimeManager) DebugKeys() map[string][]DebugKeyView {
 			result[string(tier)] = append(result[string(tier)], view)
 		}
 	}
-	appendKeys(config.TierZen, runtime.gateway.zenNodes.nodes)
-	appendKeys(config.TierGo, runtime.gateway.goNodes.nodes)
+	for _, channel := range runtime.gateway.orderedChannels() {
+		appendKeys(channel.tier, channel.nodes.nodes)
+	}
 	return result
 }
 
@@ -423,9 +498,9 @@ func (m *RuntimeManager) DebugRouteForTier(model string, tier config.Tier) (mode
 		return modelcatalog.RouteDiagnostic{Model: model, RouteError: "gateway runtime is unavailable"}, fmt.Errorf("gateway runtime is unavailable")
 	}
 	gateway := runtime.gateway
-	hasZen, hasGo := len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0
-	diagnostic := gateway.catalog.Diagnostic(model, "", hasZen, hasGo, false)
-	route, err := gateway.catalog.RouteForTier(model, tier, hasZen, hasGo)
+	hasKeys := gateway.keyAvailability()
+	diagnostic := gateway.catalog.Diagnostic(model, "", hasKeys, false)
+	route, err := gateway.catalog.RouteForTier(model, tier, hasKeys)
 	if err != nil {
 		diagnostic.RouteError = err.Error()
 		return diagnostic, err
@@ -440,7 +515,7 @@ func (m *RuntimeManager) DebugRouteForTier(model string, tier config.Tier) (mode
 func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
-		status := KeyStatus{ID: config.KeyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
+		status := KeyStatus{ID: config.KeyDisplayID(node.key), Tier: tier, Index: node.index, EgressIndex: int(node.egressIndex.Load()), Failures: node.failures.Load()}
 		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value

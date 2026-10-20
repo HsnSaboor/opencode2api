@@ -158,7 +158,7 @@ func (a *Server) handleModelQuotas(w http.ResponseWriter, r *http.Request) {
 	}
 	models := []modelView{}
 	for _, model := range all {
-		if model.AvailableGo && model.RouteError == "" {
+		if model.Available[string(config.TierGo)] && model.RouteError == "" {
 			protocol := model.NativeProtocols[config.TierGo]
 			models = append(models, modelView{ID: model.Model, Protocol: string(protocol)})
 		}

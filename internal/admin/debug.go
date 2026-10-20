@@ -45,11 +45,12 @@ func (a *Server) handleDebugModels(w http.ResponseWriter, _ *http.Request) {
 	models, metadata := a.manager.DebugModels()
 	catalog := a.manager.Resources().Models
 	keys := a.manager.DebugKeys()
+	aliases := a.manager.RotationAliases()
 	a.mu.Lock()
 	last := a.lastInference
 	a.mu.Unlock()
 	w.Header().Set("Cache-Control", "no-store")
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "keys": keys, "metadata": metadata, "catalog": catalog, "last_inference": last})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "aliases": aliases, "keys": keys, "metadata": metadata, "catalog": catalog, "last_inference": last})
 }
 
 func (a *Server) handleDebugInference(w http.ResponseWriter, r *http.Request) {

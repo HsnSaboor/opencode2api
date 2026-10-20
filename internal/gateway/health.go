@@ -12,44 +12,53 @@ import (
 )
 
 type healthResponse struct {
-	Status  string        `json:"status"`
-	Ready   bool          `json:"ready"`
-	Version string        `json:"version"`
-	Models  healthModels  `json:"models"`
-	Keys    healthKeys    `json:"keys"`
-	Proxies healthProxies `json:"proxies"`
-	Issues  []string      `json:"issues,omitempty"`
+	Status  string       `json:"status"`
+	Ready   bool         `json:"ready"`
+	Version string       `json:"version"`
+	Models  healthModels `json:"models"`
+	Keys    healthKeys   `json:"keys"`
+	Egress  healthEgress `json:"egress"`
+	Issues  []string     `json:"issues,omitempty"`
 }
 
 type healthModels struct {
-	Status            string     `json:"status"`
-	Total             int        `json:"total"`
-	Exposed           int        `json:"exposed"`
-	Zen               int        `json:"zen"`
-	Go                int        `json:"go"`
-	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
-	StaleAfterSeconds int        `json:"stale_after_seconds"`
-	CacheSource       string     `json:"cache_source,omitempty"`
-	Stale             bool       `json:"stale"`
+	Status            string         `json:"status"`
+	Total             int            `json:"total"`
+	Exposed           int            `json:"exposed"`
+	Tiers             map[string]int `json:"tiers"`
+	LastRefresh       *time.Time     `json:"last_refresh,omitempty"`
+	StaleAfterSeconds int            `json:"stale_after_seconds"`
+	CacheSource       string         `json:"cache_source,omitempty"`
+	Stale             bool           `json:"stale"`
 }
 
 type healthKeys struct {
-	Zen       int  `json:"zen"`
-	Go        int  `json:"go"`
-	Total     int  `json:"total"`
-	Anonymous bool `json:"anonymous"`
+	Tiers     map[string]int `json:"tiers"`
+	Total     int            `json:"total"`
+	Anonymous bool           `json:"anonymous"`
 }
 
-type healthProxies struct {
+type healthEgress struct {
 	Total     int `json:"total"`
 	Healthy   int `json:"healthy"`
 	Unhealthy int `json:"unhealthy"`
+	// Parked counts lanes sitting out a FreeTier flag; Cooling counts
+	// anonymous lanes in failure backoff. Both are selectable again on
+	// expiry, unlike Unhealthy (transport-down). Healthy-transport with
+	// zero selectable is the signature of a flag storm, not an outage.
+	Parked  int `json:"parked,omitempty"`
+	Cooling int `json:"cooling,omitempty"`
 }
 
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, models := g.availableModels()
-	proxyTotal, proxyHealthy := g.transports.healthCounts()
-	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
+	egressTotal, egressHealthy, egressParked, egressCooling, egressSelectable := g.egressStatus()
+	keyCounts := make(map[string]int, len(g.channels))
+	totalKeys := 0
+	for tier, channel := range g.channels {
+		keyCounts[string(tier)] = channel.nodes.Len()
+		totalKeys += channel.nodes.Len()
+	}
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
 	modelStatus := "ready"
@@ -69,20 +78,31 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			issues = append(issues, "model_catalog_stale")
 		}
 	}
-	if zenKeys+goKeys == 0 && !g.cfg.Anonymous {
+	if totalKeys == 0 && !g.cfg.Anonymous {
 		issues = append(issues, "no_upstream_keys")
 	}
-	if proxyHealthy == 0 {
-		issues = append(issues, "no_healthy_proxies")
+	if egressHealthy == 0 {
+		issues = append(issues, "no_healthy_egress")
+	}
+	// A flag storm parks every lane while transports stay healthy: the pool
+	// reports 100/100 and readiness stays green, but selection finds
+	// nothing. Surface that state explicitly instead of the misleading
+	// all-healthy line.
+	if egressHealthy > 0 && egressSelectable == 0 && g.cfg.Anonymous {
+		issues = append(issues, "no_selectable_egress")
 	}
 
 	status := "ok"
 	if len(issues) > 0 {
 		status = "degraded"
 	}
-	blocking := modelStatus == "pending" || modelStatus == "empty" || proxyHealthy == 0
+	blocking := modelStatus == "pending" || modelStatus == "empty" || egressHealthy == 0
 	httpStatus := http.StatusOK
 	ready := !blocking
+	// Readiness stays transport-based on purpose: a flag storm is
+	// transient (parks expire, replenishment regrows) and must not flap
+	// orchestrators into restarts. Operators watch no_selectable_egress
+	// and the parked/cooling counts instead.
 	if blocking {
 		httpStatus = http.StatusServiceUnavailable
 		if modelStatus == "pending" {
@@ -97,25 +117,53 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Status:            modelStatus,
 			Total:             models.Total,
 			Exposed:           models.Exposed,
-			Zen:               models.Zen,
-			Go:                models.Go,
+			Tiers:             models.Tiers,
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
-		Proxies: healthProxies{
-			Total:     proxyTotal,
-			Healthy:   proxyHealthy,
-			Unhealthy: proxyTotal - proxyHealthy,
+		Keys: healthKeys{Tiers: keyCounts, Total: totalKeys, Anonymous: g.cfg.Anonymous},
+		Egress: healthEgress{
+			Total:     egressTotal,
+			Healthy:   egressHealthy,
+			Unhealthy: egressTotal - egressHealthy,
+			Parked:    egressParked,
+			Cooling:   egressCooling,
 		},
 		Issues: issues,
 	})
 }
 
+// egressStatus snapshots the pool the way selection sees it: transport
+// totals plus park/cooling pressure plus the anonymous selectable count.
+// Selectable mirrors anonymousCursor.Next (healthy lane, no node cooldown,
+// no freitier park, no direct-class hard park) without consuming a cursor.
+func (g *Gateway) egressStatus() (total, healthy, parked, cooling, selectable int) {
+	nodes := g.anonymous.snapshotNodes()
+	total, healthy, parked, cooling = g.transports.selectableCounts(nodes)
+	if g.anonymous == nil {
+		return total, healthy, parked, cooling, 0
+	}
+	now := time.Now().UnixNano()
+	directParked := g.transports != nil && g.transports.DirectEgressParked()
+	for _, node := range nodes {
+		if node == nil || node.egress == nil {
+			continue
+		}
+		if !node.egress.healthy.Load() || node.cooldownUntil.Load() > now || node.egress.freitierUntil.Load() > now {
+			continue
+		}
+		if directParked && node.egress.proxy == nil {
+			continue
+		}
+		selectable++
+	}
+	return total, healthy, parked, cooling, selectable
+}
+
 func (g *Gateway) availableModels() ([]modelcatalog.Route, modelcatalog.CatalogSnapshot) {
-	return g.catalog.AvailableModels(g.zenNodes.Len() > 0, g.goNodes.Len() > 0, g.cfg.Anonymous)
+	return g.catalog.AvailableModels(g.keyAvailability(), g.cfg.Anonymous)
 }
 
 func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
@@ -127,8 +175,14 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		// Tier-scoped metadata: the advertised context window must match
 		// the tier that will serve the request (anonymous ⇒ Zen).
 		md := g.catalog.MetadataForTier(model, route.Tier)
+		// Provider models are owned by their provider; the built-in OpenCode
+		// channels keep the historical "opencode" owner.
+		ownedBy := "opencode"
+		if channel := g.channel(route.Tier); channel != nil && !channel.opencode {
+			ownedBy = string(route.Tier)
+		}
 		entry := map[string]any{
-			"id": model, "object": "model", "created": now, "owned_by": "opencode",
+			"id": model, "object": "model", "created": now, "owned_by": ownedBy,
 			"metadata":        md,
 			"native_protocol": route.Protocol,
 		}
@@ -162,12 +216,12 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		data = append(data, entry)
 	}
 	for _, group := range g.rotation.Snapshot().Groups {
-		if g.goNodes.Len() == 0 {
+		if g.channel(config.TierGo).nodes.Len() == 0 {
 			continue
 		}
 		available := false
 		for _, model := range group.Order {
-			if route, err := g.catalog.RouteForTier(model, config.TierGo, false, true); err == nil && route.Protocol != wire.SystemOne {
+			if route, err := g.catalog.RouteForTier(model, config.TierGo, g.keyAvailability()); err == nil && route.Protocol != wire.SystemOne {
 				available = true
 				break
 			}

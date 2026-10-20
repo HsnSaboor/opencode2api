@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,25 +22,155 @@ import (
 	"opencode2api/internal/telemetry"
 )
 
-func (g *Gateway) syncRotation() {
-	available := map[string]bool{}
-	for _, model := range g.catalog.List() {
-		if route, err := g.catalog.RouteForTier(model, config.TierGo, false, g.goNodes.Len() > 0); err == nil && route.Protocol != wire.SystemOne {
-			available[model] = true
-		}
+// rotationMembership ranks every Go-servable model into the two rotation
+// groups from the upstream catalog's published prices. The most capable
+// models (highest published output price) form SOTA; the rest, cheapest
+// first, form the value group. Nothing about a model is compiled in: a new
+// flagship joins SOTA, a repriced model changes groups, and a retired model
+// drops out on its own.
+//
+// The split is by price because the catalog publishes no capability score and
+// price is the operator-visible proxy for it. Within a group, ties break on
+// input price, then context window, then release date, then ID, so ranking is
+// deterministic across refreshes.
+func (g *Gateway) rotationMembership() rotation.Membership {
+	models := g.catalog.List()
+	type candidate struct {
+		id         string
+		inputCost  float64
+		outputCost float64
+		context    int
+		released   string
 	}
-	g.rotation.Sync(available)
+	candidates := make([]candidate, 0, len(models))
+	for _, model := range models {
+		route, err := g.catalog.RouteForTier(model, config.TierGo, g.keyAvailability())
+		if err != nil || route.Protocol == wire.SystemOne {
+			continue
+		}
+		md := g.catalog.MetadataForTier(model, config.TierGo)
+		item := candidate{id: model, context: md.ContextWindow, released: md.ReleaseDate}
+		if md.InputCost != nil {
+			item.inputCost = *md.InputCost
+		}
+		if md.OutputCost != nil {
+			item.outputCost = *md.OutputCost
+		}
+		candidates = append(candidates, item)
+	}
+	slices.SortFunc(candidates, func(a, b candidate) int {
+		if a.outputCost != b.outputCost {
+			return cmp.Compare(b.outputCost, a.outputCost)
+		}
+		if a.inputCost != b.inputCost {
+			return cmp.Compare(b.inputCost, a.inputCost)
+		}
+		if a.context != b.context {
+			return cmp.Compare(b.context, a.context)
+		}
+		if a.released != b.released {
+			return cmp.Compare(b.released, a.released)
+		}
+		return strings.Compare(a.id, b.id)
+	})
+	size := min(max(g.cfg.Rotation.SOTASize, 1), len(candidates))
+	membership := rotation.Membership{
+		SOTA:  make([]string, 0, size),
+		Sweet: make([]string, 0, len(candidates)-size),
+	}
+	for i, item := range candidates {
+		if i < size {
+			membership.SOTA = append(membership.SOTA, item.id)
+			continue
+		}
+		membership.Sweet = append(membership.Sweet, item.id)
+	}
+	// The value group reads cheapest-first, which is the opposite of the
+	// capability ordering the sort produced.
+	slices.Reverse(membership.Sweet)
+	return membership
+}
+
+func (g *Gateway) syncRotation() {
+	g.rotation.Sync(g.rotationMembership())
 }
 func (m *RuntimeManager) RotationSnapshot() rotation.Snapshot {
 	r := m.current.Load()
 	r.gateway.syncRotation()
 	return m.rotation.Snapshot()
 }
+
+// RotationAliases lists the rotation group aliases that currently resolve to
+// at least one Go-servable model, in group order. The WebUI offers them as the
+// stable model name to put in a client configuration.
+func (m *RuntimeManager) RotationAliases() []string {
+	runtime := m.current.Load()
+	runtime.gateway.syncRotation()
+	snapshot := m.rotation.Snapshot()
+	aliases := make([]string, 0, len(snapshot.Groups))
+	for _, group := range snapshot.Groups {
+		for _, model := range group.Order {
+			if route, err := runtime.gateway.catalog.RouteForTier(model, config.TierGo, runtime.gateway.keyAvailability()); err == nil && route.Protocol != wire.SystemOne {
+				aliases = append(aliases, group.Alias)
+				break
+			}
+		}
+	}
+	return aliases
+}
 func (m *RuntimeManager) SelectRotation(id, model string) error {
 	m.updateMu.Lock()
 	defer m.updateMu.Unlock()
 	m.current.Load().gateway.syncRotation()
 	return m.rotation.Manual(id, model)
+}
+
+// probeEffortLadder orders the levels to try for an auto-effort probe, from
+// the model's own declared ladder. The probe's goal is the highest level the
+// model accepts, so the ladder is reversed from strongest to weakest and ends
+// with "none" (the already-succeeded baseline) so a model that accepts no
+// effort at all is recorded as such rather than left unknown.
+//
+// A model that declares no named effort (toggle or budget-only) has no ladder
+// to search: the baseline result stands as "none".
+func probeEffortLadder(declared []string) []string {
+	rank := func(level string) int {
+		switch level {
+		case "max":
+			return 5
+		case "xhigh":
+			return 4
+		case "high":
+			return 3
+		case "medium":
+			return 2
+		case "low":
+			return 1
+		case "minimal":
+			return 0
+		default:
+			return -1
+		}
+	}
+	levels := make([]string, 0, len(declared))
+	for _, level := range declared {
+		if rank(level) >= 0 {
+			levels = append(levels, level)
+		}
+	}
+	// "none" is the baseline the probe already ran successfully; it must come
+	// last so it is only recorded when every real level was rejected.
+	levels = append(levels, "none")
+	slices.SortStableFunc(levels, func(a, b string) int {
+		if a == "none" {
+			return 1
+		}
+		if b == "none" {
+			return -1
+		}
+		return cmp.Compare(rank(b), rank(a))
+	})
+	return levels
 }
 
 // Explicit quota markers only: ordinary provider errors must keep their budget.
@@ -80,7 +212,7 @@ func (g *Gateway) handleRotation(w http.ResponseWriter, r *http.Request, externa
 			break
 		}
 		visited[token.Model] = true
-		route, err := g.catalog.RouteForTier(token.Model, config.TierGo, false, g.goNodes.Len() > 0)
+		route, err := g.catalog.RouteForTier(token.Model, config.TierGo, g.keyAvailability())
 		if err != nil {
 			continue
 		}
@@ -180,8 +312,9 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		result.reason = "request_conversion_error"
 		return result
 	}
-	body, shaped := g.shapeKeyBody(bodies[config.TierGo], route, config.TierGo)
-	cursor := g.goNodes.CursorFor(ids.Session)
+	goChannel := g.channel(config.TierGo)
+	body, shaped := g.shapeKeyBody(goChannel, bodies[config.TierGo], route)
+	cursor := goChannel.nodes.CursorFor(ids.Session)
 	var node *upstreamNode
 	// Each group attempt is exactly one HTTP call. Key selection may change,
 	// but there is no nested retry, stale-reasoning replay, or model-wide key ban.
@@ -192,24 +325,24 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		result.err = errors.New("no Go key")
 		return result
 	}
-	proxy := g.goNodes.Proxy(node)
-	if proxy == nil {
-		result.err = errors.New("no proxy")
+	egress := goChannel.nodes.Egress(node)
+	if egress == nil {
+		result.err = errors.New("no egress lane")
 		return result
 	}
-	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Go, route.Protocol, body, ids, node.key)
+	req, err := newUpstreamRequest(ctx, goChannel.upstream, goChannel.opencode, route.Protocol, body, ids, node.key)
 	if err != nil {
 		result.err = err
 		return result
 	}
 	// A reused connection must not cause net/http to implicitly replay POSTs.
 	req.GetBody = nil
-	client := *proxy.client
+	client := *egress.client
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	setRequestCredential(parent, config.TierGo, config.KeyDisplayID(node.key), "key", false, proxy)
+	setRequestCredential(parent, config.TierGo, config.KeyDisplayID(node.key), "key", false, egress)
 	started := time.Now()
 	resp, err := client.Do(req)
-	g.recordUpstreamAttempt(parent, route, ids, attempt, config.KeyDisplayID(node.key), "key", false, proxy, resp, err, time.Since(started))
+	g.recordUpstreamAttempt(parent, route, ids, attempt, config.KeyDisplayID(node.key), "key", false, egress, resp, err, time.Since(started))
 	if resp != nil {
 		defer resp.Body.Close()
 	}
@@ -221,13 +354,10 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		}
 		return result
 	}
-	retryAfter := resp.Header.Get("Retry-After")
-	if pause := parseRetryAfter(retryAfter); pause > 0 {
+	// Absent/invalid Retry-After keeps the 60s default; an explicit zero
+	// ("0" or an HTTP date at/before now) means retry immediately.
+	if pause, ok := parseRetryAfterPresent(resp.Header.Get("Retry-After")); ok {
 		result.pause = pause
-	} else if strings.TrimSpace(retryAfter) == "0" {
-		result.pause = 0
-	} else if _, err := http.ParseTime(retryAfter); err == nil {
-		result.pause = 0
 	}
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

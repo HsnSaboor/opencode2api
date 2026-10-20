@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"sync"
 	"time"
 )
@@ -43,6 +42,9 @@ type Snapshot struct {
 	Attempts           []Attempt `json:"attempts"`
 	PersistenceError   string    `json:"persistence_error,omitempty"`
 	FirstOutputSeconds int       `json:"first_output_seconds"`
+	// SOTASize is how many top-ranked catalog models the SOTA group holds. It
+	// is reported so the management UI can move the line between the groups.
+	SOTASize int `json:"sota_size"`
 }
 type Token struct {
 	Group, Model string
@@ -114,33 +116,57 @@ func (m *Manager) Configure(cfg config.RotationConfig) {
 	}
 	m.cfg = cfg
 	m.state.FirstOutputSeconds = cfg.FirstOutputSeconds
+	m.state.SOTASize = cfg.SOTASize
 	m.saveLocked()
 }
-func (m *Manager) Sync(available map[string]bool) {
+
+// Membership is the ranked model list for each rotation group: position 0 is
+// the highest-capability model. The rotation manager appends newly discovered
+// models in this order and preserves whatever order the operator has saved.
+// Which models belong to which group is decided by the caller from the
+// upstream catalog, so this package holds no model-name knowledge.
+type Membership struct {
+	SOTA  []string
+	Sweet []string
+}
+
+func (m *Manager) Sync(membership Membership) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	ranked := [2][]string{membership.SOTA, membership.Sweet}
+	sets := [2]map[string]bool{toSet(membership.SOTA), toSet(membership.Sweet)}
 	changed := false
-	for _, g := range m.state.Groups {
+	for i, g := range m.state.Groups {
 		g.Available = map[string]bool{}
-		for model := range available {
-			if config.IsSOTA(model) == (g.ID == "sota") {
-				g.Available[model] = true
-			}
+		for _, model := range ranked[i] {
+			g.Available[model] = true
 		}
-		added := []string{}
-		for model := range g.Available {
+		added := make([]string, 0, len(ranked[i]))
+		for _, model := range ranked[i] {
 			if !slices.Contains(g.Order, model) {
 				added = append(added, model)
 			}
 		}
-		sort.Strings(added)
-		if len(g.Order) == 0 && slices.Contains(added, "glm-5.3-flash") {
-			added = append([]string{"glm-5.3-flash"}, slices.Delete(added, slices.Index(added, "glm-5.3-flash"), slices.Index(added, "glm-5.3-flash")+1)...)
-		}
 		if len(added) > 0 {
+			// Rank order, not alphabetical: a fresh installation starts with
+			// the strongest model first.
 			g.Order = append(g.Order, added...)
 			changed = true
 		}
+		// A model the catalog now ranks into the other group must leave this
+		// one, or the same ID would be served by both aliases. Models that are
+		// merely unavailable stay listed: they remain part of this group and
+		// return to the order when the catalog carries them again.
+		other := sets[(i+1)%2]
+		kept := make([]string, 0, len(g.Order))
+		for _, model := range g.Order {
+			if other[model] {
+				changed = true
+				continue
+			}
+			kept = append(kept, model)
+		}
+		g.Order = kept
 		if g.Current == "" && len(g.Order) > 0 {
 			g.Current = g.Order[0]
 			g.Generation++
@@ -150,6 +176,14 @@ func (m *Manager) Sync(available map[string]bool) {
 	if changed {
 		m.saveLocked()
 	}
+}
+
+func toSet(models []string) map[string]bool {
+	result := make(map[string]bool, len(models))
+	for _, model := range models {
+		result[model] = true
+	}
+	return result
 }
 func (m *Manager) GroupID(alias string) string {
 	m.mu.Lock()

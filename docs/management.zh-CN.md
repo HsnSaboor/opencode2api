@@ -7,7 +7,7 @@
 管理页面 `/#model-quotas`，登录后读取 `GET /api/model-quotas`。
 
 - 模型来自网关同步的 OpenCode Go 目录，支持搜索和复制模型 ID。
-- 额度由网关使用已配置的 Go Key 查询 `https://opencode.ai/zen/go/v1/usage`。浏览器不会收到上游 Key。
+- 额度由网关使用已配置的 Go Key 查询 `upstream.go` 下的 `/v1/usage`（默认为 `https://opencode.ai/inference/go/v1/usage`）。浏览器不会收到上游 Key。
 - 显示 5 小时、每周、每月窗口的剩余百分比和重置时间。接口只提供共享套餐窗口，不提供独立的逐模型余额，不推算金额或可用次数。多个 Key 的额度不相加。
 - 成功响应缓存 60 秒，失败缓存 15 秒；失败时保留上次成功结果并明确标记历史数据。没有成功数据时显示未知。
 - 页面打开期间每 60 秒查询一次；离开页面或隐藏浏览器时停止周期查询。手动刷新也受服务端缓存约束。
@@ -46,10 +46,13 @@ go build -trimpath -o opencode2api ./cmd/opencode2api
 `sweet`。两个别名列入 `/v1/models`，支持 Chat Completions、Responses 和
 Messages，以及这三种协议的流式输出。真实模型 ID 的原有调用路径保持不变。
 
-- SOTA 固定成员：`deepseek-v4.1-flash`、`glm-5.3`、`grok-4.6`、`kimi-k3`、
-  `qwen3.8-max`，默认按上述顺序。
-- 甜点组包含其余 Go 可用模型，初次以 `glm-5.3-flash` 为首，随后按名称排序。
-  新模型追加在末尾；下架或协议不受支持的模型保留在列表，但不参与调用。
+- SOTA 成员在每次刷新目录时按上游目录的公布价格推导：Go 可用模型中输出
+  价格最高者属于 SOTA，`rotation.sota_size`（默认 5）决定成员数量；其余 Go
+  可用模型进入甜点组。新旗舰会自动进入 SOTA，被调价的模型会自动换组，
+  无需修改代码或配置。价格相同时依次比较输入价格、上下文长度、发布日期和
+  模型 ID，保证排序稳定。
+- 组内顺序保留运营者保存的顺序；新发现的模型按排名插入末尾（不是按名称
+  排序）。下架或协议不受支持的模型保留在列表，但不参与调用。
 - 每组共享一个当前模型。成功后保持位置；失败切换后，下次从新位置开始。
   并发请求通过位置版本号避免旧请求把游标移回去；手动切换不打断在途回答。
 - 普通错误每模型最多 3 次（包含首次），每请求最多消耗 3 个普通错误模型预算。
@@ -69,17 +72,20 @@ Messages，以及这三种协议的流式输出。真实模型 ID 的原有调�
   不记录上游错误正文、请求正文或密钥。最近保留 100 条尝试和每组 30 条切换。
 
 配置保存于 `config.json` 的 `rotation` 字段：`sota` / `sweet` 各有 `alias`
-和 `order`；状态单独原子写入 `config.json.rotation.json`（0600），包括当前
-位置、版本、动态追加的顺序、暂停期限和最近记录。修改 Key 或其他配置时
-沿用同一个轮转状态管理器。页面展示状态写入失败提示，首次无法写入则拒绝启动。
+和 `order`，另有 `sota_size` 决定分组界线；成员关系由目录价格推导，配置里
+只保存运营者确认过的顺序。状态单独原子写入 `config.json.rotation.json`
+（0600），包括当前位置、版本、动态追加的顺序、暂停期限和最近记录。修改 Key
+或其他配置时沿用同一个轮转状态管理器。页面展示状态写入失败提示，首次无法
+写入则拒绝启动。
 
 管理接口均需要现有管理 Session，写入另需 CSRF：
 
 - `GET /api/rotation`：分组配置、可用状态、暂停期限、切换和尝试记录。
-- `PUT /api/rotation`：提交 `sota` / `sweet` 的 `alias`、完整 `order`，以及
-  `first_output_seconds`；别名不得重复或与真实模型 ID 冲突，成员不得跨组。
-- `POST /api/rotation/current`：`{"group":"sota","model":"glm-5.3"}`；立即
-  修改当前模型并解除该模型的临时暂停。
+- `PUT /api/rotation`：提交 `sota` / `sweet` 的 `alias`、完整 `order`、
+  `sota_size`，以及 `first_output_seconds`；别名不得重复或与真实模型 ID
+  冲突，成员不得跨组。省略 `sota_size` 时保留当前值。
+- `POST /api/rotation/current`：`{"group":"sota","model":"<模型 ID>"}`；
+  立即修改当前模型并解除该模型的临时暂停。
 
 验证：`go test -race ./...`、`go vet ./...`、`npm run check:web`。
 模拟上游测试覆盖 9 次普通错误上限、超过 3 个额度跳过、混合错误预算、

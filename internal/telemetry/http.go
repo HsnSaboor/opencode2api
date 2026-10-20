@@ -20,7 +20,7 @@ type RequestMeta struct {
 	KeyID      string
 	Channel    string
 	Anonymous  bool
-	Proxy      string
+	Egress     string
 	Attempts   int
 	Legs       []string
 	Stop       string
@@ -85,7 +85,7 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func Middleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}

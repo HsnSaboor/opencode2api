@@ -17,7 +17,14 @@ func MaskValue(value string) string {
 	return "••••" + string(runes[len(runes)-5:])
 }
 
+// RedactURL strips credentials from a URL's userinfo for safe logging.
+// Inputs without a "://" scheme (bare egress values such as "direct", IPv6
+// literals, or host:port) carry no userinfo and never survive url.Parse, so
+// they pass through as-is instead of collapsing to "<invalid>".
 func RedactURL(raw string) string {
+	if !strings.Contains(raw, "://") {
+		return raw
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "<invalid>"
@@ -41,27 +48,17 @@ func NewSecretRedactor() *SecretRedactor {
 func (r *SecretRedactor) Replace(cfg Config) {
 	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.ZenKeys)+len(cfg.GoKeys)+2)
 	values = append(values, cfg.ServerKeys...)
-	values = append(values, cfg.ZenKeys...)
-	values = append(values, cfg.GoKeys...)
+	for _, tier := range cfg.Tiers() {
+		values = append(values, cfg.TierKeys(tier)...)
+	}
 	if cfg.WebUI.Password != "" {
 		values = append(values, cfg.WebUI.Password)
 	}
-	for _, value := range []string{cfg.Upstream.Zen, cfg.Upstream.Go} {
-		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
-			values = append(values, value, parsed.User.Username())
+	for _, tier := range cfg.Tiers() {
+		if parsed, err := url.Parse(cfg.TierUpstream(tier)); err == nil && parsed.User != nil {
+			values = append(values, parsed.String(), parsed.User.Username())
 			if password, ok := parsed.User.Password(); ok {
 				values = append(values, password)
-			}
-		}
-	}
-	for _, value := range cfg.RuntimeProxies() {
-		if value != "direct" {
-			values = append(values, value)
-			if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
-				values = append(values, parsed.User.Username())
-				if password, ok := parsed.User.Password(); ok {
-					values = append(values, password)
-				}
 			}
 		}
 	}

@@ -9,17 +9,29 @@ import (
 	"opencode2api/internal/jsonutil"
 )
 
+// Target describes the upstream model a prepared request is destined for.
+// Every field is derived from OpenCode's public capability catalog by the
+// caller, so no vendor or model name is compiled into this package.
+type Target struct {
+	// InterleavedField names the wire field a model uses to replay its
+	// reasoning on tool-call turns ("reasoning_content" in the current
+	// catalog). The catalog publishes it as the model's `interleaved` entry.
+	// An empty value means the model does not interleave, which is also the
+	// signal that Anthropic reasoning history must be replayed verbatim.
+	InterleavedField string
+}
+
 // PrepareRequest is the single request preparation path for both
 // pass-through and transcoded requests. Same-protocol requests are cloned so
 // provider-specific fields survive, while cross-protocol requests go through
 // the bridge. Target-protocol normalization then repairs reasoning history in
 // either case.
-func PrepareRequest(from, to Protocol, input map[string]any, upstreamURL string) (map[string]any, error) {
+func PrepareRequest(from, to Protocol, input map[string]any, target Target) (map[string]any, error) {
 	output, err := ConvertRequest(from, to, input)
 	if err != nil {
 		return nil, err
 	}
-	normalizeToolReasoningHistory(to, jsonutil.StringAt(output, "model"), upstreamURL, output)
+	normalizeToolReasoningHistory(to, target, output)
 	return output, nil
 }
 
@@ -148,9 +160,14 @@ func validForcedEffort(effort string) bool {
 // require reasoning replay, or to requests that explicitly enable reasoning.
 // Normalizing the target shape makes the behavior independent of the client
 // protocol used to reach the gateway.
-func normalizeToolReasoningHistory(protocol Protocol, model, upstreamURL string, input map[string]any) bool {
-	vendor := isReasoningVendorIdentifier(model) || isReasoningVendorIdentifier(upstreamURL)
-	widened := vendor || requestEnablesReasoning(input)
+//
+// Whether replay is required is read from the catalog's `interleaved` field,
+// not from a model or vendor name: a model that interleaves reasoning with
+// tool calls is exactly the model whose next turn must carry the reasoning
+// field back.
+func normalizeToolReasoningHistory(protocol Protocol, target Target, input map[string]any) bool {
+	interleaved := target.InterleavedField != ""
+	widened := interleaved || requestEnablesReasoning(input)
 	switch protocol {
 	case Chat:
 		// The Chat repair is additive: it only supplies reasoning_content that
@@ -159,31 +176,21 @@ func normalizeToolReasoningHistory(protocol Protocol, model, upstreamURL string,
 		if !widened {
 			return false
 		}
-		return normalizeChatToolReasoningHistory(input)
+		return normalizeChatToolReasoningHistory(input, target.InterleavedField)
 	case Anthropic:
 		// Every repair below is destructive for a native Anthropic endpoint:
 		// it deletes thinking signatures, discards redacted_thinking payloads
 		// and overwrites empty thinking text. Those are precisely the shapes a
 		// native endpoint re-validates and replays verbatim, and rewriting them
-		// also shifts the cached prompt prefix mid-history. Only endpoints
-		// identified as reasoning vendors get the rewrite.
-		if !vendor {
+		// also shifts the cached prompt prefix mid-history. Only models the
+		// catalog identifies as interleaving reasoning get the rewrite.
+		if !interleaved {
 			return false
 		}
 		return normalizeAnthropicToolThinkingHistory(input)
 	default:
 		return false
 	}
-}
-
-func isReasoningVendorIdentifier(value string) bool {
-	value = strings.ToLower(value)
-	for _, hint := range reasoningVendorHints {
-		if strings.Contains(value, hint) {
-			return true
-		}
-	}
-	return false
 }
 
 func requestEnablesReasoning(input map[string]any) bool {
@@ -216,10 +223,14 @@ func requestEnablesReasoning(input map[string]any) bool {
 }
 
 // normalizeChatToolReasoningHistory ensures every assistant tool-call turn
-// carries reasoning_content. Some clients discard this non-standard field
-// while retaining tool_calls, which otherwise makes the next thinking-mode
-// request invalid. A legacy reasoning string is promoted when available.
-func normalizeChatToolReasoningHistory(input map[string]any) bool {
+// carries the reasoning field the model interleaves with. Some clients discard
+// this non-standard field while retaining tool_calls, which otherwise makes the
+// next thinking-mode request invalid. A legacy reasoning string is promoted
+// when available.
+func normalizeChatToolReasoningHistory(input map[string]any, field string) bool {
+	if field == "" {
+		field = "reasoning_content"
+	}
 	messages, ok := input["messages"].([]any)
 	if !ok {
 		return false
@@ -231,14 +242,14 @@ func normalizeChatToolReasoningHistory(input map[string]any) bool {
 		if !ok || jsonutil.StringAt(message, "role") != "assistant" || len(jsonutil.SliceAt(message, "tool_calls")) == 0 {
 			continue
 		}
-		if reasoning, ok := message["reasoning_content"].(string); ok && strings.TrimSpace(reasoning) != "" {
+		if reasoning, ok := message[field].(string); ok && strings.TrimSpace(reasoning) != "" {
 			continue
 		}
 		reasoning, _ := message["reasoning"].(string)
 		if strings.TrimSpace(reasoning) == "" {
 			reasoning = toolReasoningPlaceholder
 		}
-		message["reasoning_content"] = reasoning
+		message[field] = reasoning
 		changed = true
 	}
 	return changed
@@ -782,13 +793,23 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 			}
 		}
 		if len(pending) == 0 && len(pendingOrder) > 0 {
+			var attachments []bridgeBlock
 			for _, id := range pendingOrder {
 				result := pendingResults[id]
+				content, extras := splitToolResultForChat(result.Result)
 				messages = append(messages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": id,
-					"content":      bridgeToolResultContent(result.Result),
+					"content":      content,
 				})
+				attachments = append(attachments, extras...)
+			}
+			if len(attachments) > 0 {
+				// Chat tool messages carry text only. Image/file parts of a tool
+				// result (Codex view_image, Claude Code Read) travel in a
+				// follow-up user message; serializing them into the tool string
+				// used to hand the model base64 bytes instead of the picture.
+				messages = append(messages, map[string]any{"role": "user", "content": encodeChatBlocks(attachments)})
 			}
 			flushDeferred()
 			pendingOrder = nil

@@ -1,11 +1,12 @@
 .key
 config.json
-config.json.bak
+config.json.bak*
 .config-*.tmp
 *.models.dev.json
 opencode/
 /opencode2api
 /opencode2api.exe
+/opencode2api.bak.*
 *.log
 .tmp/
 .gocache/
@@ -21,3 +22,7 @@ coverage.out
 # Local credentials, deployment backups, and verification artifacts
 .local/
 *.availability.json
+
+# Local research and reference clones
+.devdocs/
+/opencode2api.bak-*

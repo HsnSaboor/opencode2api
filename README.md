@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Responses, and Anthropic Messages endpoints, translates between their native protocols, and manages upstream keys and proxies.
+A Go gateway for **OpenCode Zen and Zen Go**. It exposes Chat Completions, Responses, and Anthropic Messages endpoints, translates between their native protocols, and manages upstream keys with IPv6 egress rotation.
 
 The executable includes the WebUI. Running the service requires no Node.js runtime or database.
 
@@ -12,13 +12,14 @@ The executable includes the WebUI. Running the service requires no Node.js runti
 - Text, images, reasoning, function tools, tool calls, and tool results; file content where the target protocol can represent it.
 - Separate Zen and Go key pools, configurable tier preference, retries, and session affinity.
 - Optional anonymous Zen access with the OpenCode `public` credential.
-- Direct, HTTP, HTTPS, SOCKS5, and SOCKS5H connections, including a proxy file.
+- IPv6 egress rotation: each lane binds its own source address sampled from configured /48 (or wider) prefixes, with a single-lane IPv4-only fallback for upstreams that reject IPv6.
+- Optional proxy egress (`egress.proxies`): verified sing-box profile nodes join the same rotation as address lanes — one exit IP per lane, continuous gate verification, warm reserve, park/rotate, and persisted verdicts.
 - Dynamic model discovery, native protocol metadata, and disk caches.
 - A separate management port with configuration editing, a Playground, diagnostics, token statistics, and live logs.
 - Configuration hot reload with validation before switching new requests to a replacement gateway.
 - Go subscription quota dashboard with remaining percentages, reset times, and available models.
 - Local API key creation, naming, enabling, disabling, and deletion with immediate updates.
-- Sticky `sota` / `sweet` model groups with ordering, failure fallback, streaming protection, and persisted state.
+- Sticky `sota` / `sweet` model groups whose membership is derived from the live catalog's published prices, with ordering, failure fallback, streaming protection, and persisted state.
 
 See the [management console guide (Chinese)](docs/management.zh-CN.md) for the new pages and configuration.
 
@@ -101,8 +102,6 @@ docker run -d --name opencode2api \
   -v opencode2api-state:/var/lib/opencode2api \
   opencode2api:local
 ```
-
-A `proxyfile` used in Docker must also be available inside the container at the configured path.
 
 ## API usage
 
@@ -207,21 +206,23 @@ With `anonymous: true`, either condition makes a model eligible for the anonymou
 
 Eligibility is a routing decision; the upstream can still reject or rate-limit the request. Anonymous requests use `public` in the upstream authentication header.
 
+The Zen free tier is additionally gated upstream by a client fingerprint, so the gateway reproduces the official CLI's request profile exactly: `Authorization: Bearer public`, an `opencode/<channel>/<version>/cli` User-Agent, the canonical session ID on every `x-opencode-session`/`x-session-affinity`/`x-session-id`/`x-opencode-session-id` alias, and a body matching one of the two profiles the gate admits — agent traffic (`tools` contains a function named `read`) or the title generator (no tools plus its system prompt). Tool-less requests that are not the title profile are stamped with a single name-only `read` declaration; declared tool walls are preserved untouched, and title-generator requests are never given tools. Session IDs encode a per-millisecond counter in their 12 hex digits that the gate rejects above 63; the gateway mints them with the official encoder. A legacy `/zen` upstream base is migrated to the current `https://opencode.ai/inference` contract on load.
+
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once.
+1. For an eligible model, try each available anonymous egress lane once.
 2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
 Anonymous attempts are not cut short by `retry.max_attempts`, but all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
 
-Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/proxy retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
+Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/egress retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
 
 When only anonymous access is configured, `/v1/models` exposes only models eligible for that lane.
 
 ### Free model availability
 
-The gateway probes models whose IDs contain `free` (case-insensitive), or whose metadata reports zero input/output cost without deprecation, with a short request using its native protocol. It tries the enabled anonymous lane first and then one configured Zen Key. A valid completed response on either lane keeps the model enabled; the model is disabled in discovery and routing only when every attempted lane explicitly reports that the model does not exist or has been retired. Authentication errors, rate limits, timeouts, transport errors, 5xx responses, and malformed replies are inconclusive: they do not create a new disable, and are checked again in one hour. Probe traffic does not alter production key/proxy cooldowns or request statistics. It still reaches the upstream and may consume its free allowance.
+The gateway probes models whose IDs contain `free` (case-insensitive), or whose metadata reports zero input/output cost without deprecation, with a short request using its native protocol. It tries the enabled anonymous lane first and then one configured Zen Key. A valid completed response on either lane keeps the model enabled; the model is disabled in discovery and routing only when every attempted lane explicitly reports that the model does not exist or has been retired. Authentication errors, rate limits, timeouts, transport errors, 5xx responses, and malformed replies are inconclusive: they do not create a new disable, and are checked again in one hour. Probe traffic does not alter production key/egress cooldowns or request statistics. It still reaches the upstream and may consume its free allowance.
 
 System One models use a native `noul` question asking whether 1 + 1 equals 2; they are never sent chat/tool payloads. Model discovery includes `native_protocol` and `supported_endpoints`; rotation aliases are listed only when Go keys and eligible models exist. Legacy v1.3.6 disables are cleared on load and scheduled for immediate recheck because those probes used invalid session IDs.
 
@@ -231,15 +232,19 @@ State survives restarts in `config.json.<upstream-fingerprint>.availability.json
 
 Administration endpoints (login required; restore also requires CSRF): `GET /api/models/availability` and `POST /api/models/restore` with `{"model":"MODEL_ID"}`.
 
-### Sessions and proxies
+### Sessions and egress
 
-Keys are initially spread across proxies. Real traffic can trigger proxy checks, key rebinding, and cooldowns. Unhealthy proxies are rechecked every 15 minutes against Cloudflare trace.
+Keys are initially spread across egress lanes. Real traffic can trigger lane checks, key rebinding, and cooldowns. Unhealthy lanes are rechecked every 15 minutes against Cloudflare trace.
 
-A stable session hash selects the preferred key or anonymous proxy. Send an explicit `x-session-id` to separate independent conversations. The gateway also accepts `x-opencode-session`, `x-session-affinity`, `conversation-id`, `conversation_id`, and `metadata.session_id`.
+A stable session hash selects the preferred key or anonymous lane. Send an explicit `x-session-id` to separate independent conversations. The gateway also accepts `x-opencode-session`, `x-session-affinity`, `conversation-id`, `conversation_id`, and `metadata.session_id`.
 
 Without an explicit ID, the first user message is used as a seed. Conversations beginning with the same content can therefore share affinity. Changing pool membership can change the selected node.
 
 Cooldowns grow exponentially up to eight times `performance.failure_cooldown_seconds`, and a longer `Retry-After` is honored. If every authenticated key is cooling down, routing may try the key whose cooldown ends first. Anonymous nodes still in cooldown are skipped.
+
+The free-tier gate can flag a whole egress prefix upstream — a used `/48` answering `FreeTierError` from every `/64` while sibling prefixes on the same tunnel answer normally. The gateway attributes each `FreeTier` verdict to its configured prefix: a single verdict parks that one lane, and repeated verdicts from the same prefix cool the prefix out of replenishment sampling for 15 minutes so it stops minting lanes the gate rejects. A probation probe re-tests cooled prefixes every five minutes once their window expires and restores them automatically when the upstream flag clears; while a prefix is cooling, traffic keeps flowing through the remaining configured prefixes. `egress.prefix_weights` makes that resilience structural: the primary range draws most lanes while a reserve range draws the rest, so a flare on one range degrades into the other instead of stalling traffic.
+
+The gate can also reject an IPv6 range wholesale, below the granularity of the per-prefix flag above: the same shaped request answers `200` from one range and `403 FreeTierError` from another, including from never-used addresses in both. These blocks arrive in waves rather than as permanent bans: a range that served traffic for weeks can flare to all-`403` for minutes to hours and clear on its own, with plenty of successes still served from fresh `/64`s during shallower waves (a month of continuous rotation measured roughly one client-visible failure per 3,000 requests). Parked lanes, prefix cooling, and probation probing ride the waves out automatically, which is why the recommended deployment weights its `/48` as the primary and keeps rented ranges beside it as a reserve: a flare on one range degrades traffic into the other instead of stalling it. Only when every configured prefix is rejected at once and IPv4 answers `200` does rotation stop helping; then switch to `egress.ipv4_only` (with `egress.enable_ipv6: false`) to run the single unbound IPv4 lane until a passing IPv6 range is available. The prefix machinery stays dormant in that mode, so the configured prefixes can stay on file for when the upstream lifts the IPv6 block.
 
 ## Configuration reference
 
@@ -254,10 +259,20 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `zen_keys`, `go_keys`       | At least one upstream key is required unless anonymous access is enabled.   |
 | `anonymous`                 | `false`.                                                                    |
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                |
-| `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
-| `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
-| `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
-| `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
+| `upstream.zen`              | `https://opencode.ai/inference`.                                            |
+| `upstream.go`               | `https://opencode.ai/inference/go`.                                         |
+| `egress.enable_ipv6`        | `true`.                                                                     |
+| `egress.ipv4_only`          | `false`; forces the unbound lane to IPv4 (`tcp4`). Requires `enable_ipv6: false`. |
+| `egress.prefixes`           | `["2001:470:7331::/48"]`; up to 8 IPv6 CIDRs.                               |
+| `egress.prefix_weights`     | `{}`; per-prefix draw weights (default 1), matched canonically; entries for unconfigured prefixes are inert. |
+| `egress.pool_size`          | `100`; range 1–128 source addresses in rotation.                            |
+| `egress.proxies.enabled`    | `false`; joins verified sing-box profile nodes to the same rotation as address lanes. |
+| `egress.proxies.profile`    | Path to a sing-box outbounds document; required when `enabled`.             |
+| `egress.proxies.count`      | `64`; proxy lanes held in rotation (1–256), sharing the lane cap with address lanes. |
+| `egress.proxies.socks_port` | `20800`; loopback SOCKS5 port the multiplexer listens on.                   |
+| `egress.proxies.singbox_binary` | `sing-box`; multiplexer executable path. `log_level` sets its log level (`warn`). |
+| `egress.proxies.state_file` | `proxy-state.json` next to the profile; persists admission verdicts across restarts. |
+| `egress.proxies.verify_concurrency` | `16`; concurrent verification probes (1–32).                       |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |
 | `models.protocols`          | `{}`; per-model native protocol overrides.                                  |
 | `reasoning.effort`          | Empty (off); `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `none`. |
@@ -296,18 +311,19 @@ The management API returns them as `reasoning` from `GET /api/config` and accept
 the object in `PUT /api/config`; clients that omit the field keep the existing
 value, while sending an empty object clears it.
 
-Proxy entries accept `direct`, `http://`, `https://`, `socks5://`, and `socks5h://`, including URL credentials. The inline list is merged with `proxyfile` and deduplicated in order.
+Each egress lane binds one sampled IPv6 source address (or `direct` when IPv6 rotation is disabled). Addresses are sampled once per process start from the configured prefixes: a `/48` rotates whole `/64` subnets with a random interface ID, wider prefixes draw uniform host bits with the network address reserved. Prefixes that cannot yield `pool_size` unique addresses are rejected at startup. `egress.prefix_weights` scales each prefix's share of draws — weight 24 against six weight-1 prefixes draws the first ~80% of the pool — and the same weighting steers replacement lanes, so the primary/reserve mix survives FreeTier parks.
 
-A proxy file contains one entry per line and supports blank lines and comments:
+With `egress.ipv4_only: true` (and `enable_ipv6: false`) the pool holds one `direct4` lane instead: it still lets the kernel pick the source address, but every dial forces network `tcp4`. That is deliberate — a dual-stack lane would connect over IPv6 first, and a connection that succeeds at the TCP layer never falls back to IPv4, so requests would silently keep landing on the blocked family. Combining `ipv4_only` with `enable_ipv6: true` is rejected at load time.
 
-```text
-# Primary proxy
-http://user:password@127.0.0.1:7890
-socks5://127.0.0.1:1080  # Backup proxy
-direct
-```
+### Proxy exits (`egress.proxies`)
 
-Comment markers are `#`, `;`, and `//` at the start of a line or after whitespace.
+`egress.proxies` adds a second, independent kind of capacity beside the address rotation: verified sing-box profile nodes (the "expanded" outbounds shape) joined to the same lane pool. One node is one lane whose visible egress is that node's exit IP, sharing selection, FreeTier parks, health tracking, prefix bookkeeping, and the lane cap with address lanes — the request path cannot tell the two apart. The gateway runs one supervised sing-box process that multiplexes every profile node on a loopback SOCKS5 port (one `p<N>` user per node, shared password `p`), and each proxy lane's transport dials through it as its node.
+
+Admission is verification-gated because most public nodes do not pass the free-tier gate: a sweep probes candidates through the multiplexer with the exact request shape production traffic uses — streaming, anonymous fingerprint, title profile — and admits only 2xx answers. `403 FreeTierError` cools the node like a park, transport failures cool briefly, and every cooldown backs off on repeated failures, so a sweep over thousands of nodes settles instead of hammering blocked ones. Admitted nodes beyond the active lanes form a warm reserve; when a proxy lane is parked by a `FreeTierError` on live traffic, the next verified node replaces it while the parked lane rejoins rotation when its park expires. Verdicts persist to `state_file` keyed by the profile's fingerprint, so a restart resumes with warm lanes instead of re-sweeping; while lanes and reserve are full, the sweep idles and sends no gate probes at all.
+
+A flag storm that covers one prefix — or one day's worth of proxy exits — must not fail a request an independent lane could still serve. Scan order therefore interleaves fate classes (one class per configured egress prefix plus one shared by the proxy exits), so the first attempts of every request sample the tunnel and the proxy pool alternately instead of walking a contiguous run of same-fate lanes. When a scan still parks `freitierScanLimit` lanes in a row, a canary probe asks a freshly verified exit whether the canonical request profile is being served at all: if it is being refused, the verdict describes the request (every exit would have parked), and the parks the request charged are restored immediately instead of shrinking capacity for the requests that follow. The same canary guards verification: when a candidate probe returns a gate verdict and the canary agrees, the verdict is recorded as inconclusive and candidate sweeps pause (`proxyGateHold`, three minutes) instead of cooling healthy nodes — the hold shows as `sweep_held` in the resource snapshot. Transport deaths skip the canary entirely: a request-scoped wave cannot make an exit unreachable.
+
+A profile that cannot be read fails startup — enabling the pool is an explicit statement, so a broken path must be loud. A multiplexer that cannot start is retried with backoff by its supervisor while address lanes keep serving; a missing `sing-box` binary therefore degrades gracefully. The multiplexer's generated config and log live under `multiplexer/` beside `state_file`. The resource snapshot (`GET /api/resources`) reports a `proxy` block with `nodes`/`lanes`/`verified`/`available`/`cooling`/`pending` counts and `socks_ready`, and proxy lanes carry `"proxy": true` in the `egress` list.
 
 ### Timeouts and connection pools
 
@@ -318,12 +334,12 @@ Comment markers are `#`, `;`, and `//` at the start of a line or after whitespac
 | `performance.attempt_timeout_seconds`   | `0`     | Header wait per attempt; 0 uses the request timeout.   |
 | `performance.connect_timeout_seconds`   | `5`     | Connection establishment timeout.                      |
 | `performance.failure_cooldown_seconds`  | `15`    | Base failure cooldown.                                 |
-| `performance.max_idle_conns`            | `2048`  | Idle connection limit per proxy transport.             |
+| `performance.max_idle_conns`            | `2048`  | Idle connection limit per egress transport.            |
 | `performance.max_idle_conns_per_host`   | `256`   | Idle connection limit per host and transport.          |
 | `performance.max_conns_per_host`        | `0`     | Connection limit per host; 0 is unlimited.             |
 | `performance.idle_conn_timeout_seconds` | `120`   | Idle connection lifetime.                              |
 
-The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or proxies.
+The per-attempt header timeout is capped by the request timeout. Set it below the total timeout if a slow upstream should leave time for fallback. Expired request contexts stop further attempts without penalizing unused keys or lanes.
 
 ### Logging and management
 
@@ -339,7 +355,7 @@ The per-attempt header timeout is capped by the request timeout. Set it below th
 | `webui.password_hash`         | Generated Argon2id hash; replaces the plaintext password.     |
 | `webui.session_ttl_minutes`   | `720`; range 5–10,080.                                        |
 
-On startup, a bootstrap password is hashed and removed from the configuration. The backup containing that bootstrap plaintext is deleted. Keep configuration files and backups private: upstream keys and proxy credentials remain necessary configuration secrets.
+On startup, a bootstrap password is hashed and removed from the configuration. The backup containing that bootstrap plaintext is deleted. Keep configuration files and backups private: upstream keys remain necessary configuration secrets.
 
 Body dumps are opt-in and capped at 64 KiB per prepared body. Configured secrets are redacted, but conversation content may still be sensitive.
 
@@ -375,7 +391,7 @@ Playground requests require a session and `X-CSRF-Token` and are limited to 12 p
 
 The server forces `stream: false`. Use `{"mode":"selected","tier":"zen","id":"KEY_FINGERPRINT"}` to test a specific key from `/api/debug/models`. A selected request makes at most one upstream attempt, without anonymous access, key rotation, tier fallback, or reasoning replay.
 
-**Both automatic and selected diagnostics preserve production key cooldowns, failure counts, proxy health, and bindings.** They still make real upstream requests, can consume provider quota, and appear in monitoring.
+**Both automatic and selected diagnostics preserve production key cooldowns, failure counts, lane health, and bindings.** They still make real upstream requests, can consume provider quota, and appear in monitoring.
 
 After execution, the management endpoint returns HTTP 200 with the actual result in `ok`, `http_status`, `request_id`, `route`, and `response`. Selected-key results also include `selected_key` and `key_test`: `usable`, `rejected`, `rate_limited`, `transport_error`, `upstream_error`, `request_error`, or `unavailable`. Invalid management input, authentication, CSRF, and throttling retain their own HTTP error statuses.
 
@@ -383,7 +399,7 @@ After execution, the management endpoint returns HTTP 200 with the actual result
 
 The server validates a candidate configuration and builds its replacement gateway before saving and switching. Failed validation or persistence leaves the active gateway in place. Requests already running continue on their original gateway.
 
-Keys, proxies, upstream URLs, retry settings, model settings, logging, and routing preferences apply to new requests immediately. Changes to `listen`, `webui.listen`, or `webui.enabled` require a process restart. Saved JSON is normalized; comments are not retained.
+Keys, egress lanes, upstream URLs, retry settings, model settings, logging, and routing preferences apply to new requests immediately. Changes to `listen`, `webui.listen`, or `webui.enabled` require a process restart. Saved JSON is normalized; comments are not retained.
 
 ## Monitoring and persistence
 
@@ -407,9 +423,9 @@ Cache filenames are based on the actual configuration path. Lifetime counters me
 
 ### Health checks
 
-`/healthz` does not increment monitoring counters or trigger network requests. It reports resource counts without keys or proxy addresses.
+`/healthz` does not increment monitoring counters or trigger network requests. It reports resource counts without keys or addresses.
 
-- HTTP 503: initial catalog pending, no models routable with the current configuration, or no healthy proxies.
+- HTTP 503: initial catalog pending, no models routable with the current configuration, or no healthy egress lanes.
 - HTTP 200: ready, including when a usable catalog cache is stale. In that case the model status is `stale` and overall status is `degraded`.
 
 The staleness threshold is twice `models.refresh_seconds`, with a minimum of 60 seconds. Readiness is a discovery and resource check; it does not verify that an upstream key will accept the next inference.
@@ -474,8 +490,11 @@ npm run check:web
 | API returns 401                      | Use a configured local `server_keys` value.                                               |
 | Health remains `starting`            | Inspect catalog refresh logs and outbound connectivity; add protocol overrides if needed. |
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
-| Requests return 502/504              | Inspect upstream attempts, credentials, proxies, and total/per-attempt timeouts.          |
+| Requests return 502/504              | Inspect upstream attempts, credentials, egress lanes, and total/per-attempt timeouts.     |
+| `FreeTierError` from every lane      | The upstream may be flare-blocking that IPv6 range; park/rotate and prefix probation ride it out — keep a weighted reserve prefix, or `egress.ipv4_only` if every range is blocked at once. |
+| No proxy lanes appear                | Check `egress.proxies.enabled`, that `profile` reads (a bad path fails startup), and the `proxy` block in the resource snapshot; the multiplexer log sits under `multiplexer/` beside `state_file`. |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
+| `view_image` / image `Read` returns base64 | Tool-result images travel in a follow-up user message; update past the tool-result split fix and declare image input for the model. |
 | Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |
 | Container ports are unreachable      | Check listener addresses, published ports, and the active volume configuration.           |
 | Monitoring disappeared after restart | Monitoring is stored only in memory; collect stdout logs externally.                      |

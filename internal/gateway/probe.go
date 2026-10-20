@@ -22,6 +22,11 @@ type probeResult struct {
 	effort                             models.EffortProbe
 }
 
+// anonymousProbeLanes bounds how many anonymous lanes one availability probe
+// tries before reporting the model's state, so a single flagged prefix cannot
+// decide the probe outcome.
+const anonymousProbeLanes = 3
+
 func (g *Gateway) resolvedEffort(model string, tier config.Tier, protocol wire.Protocol) string {
 	effort := g.cfg.ForcedEffort(model)
 	if effort != "auto" {
@@ -61,34 +66,42 @@ func probePayload(model string, protocol wire.Protocol, effort string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	return prepareAnonymousBody(b, protocol), nil
+	return shapeAnonymousBody(b, protocol), nil
 }
 
 func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult {
 	if !g.catalog.IsFreeModel(model) {
 		return probeResult{reason: "not_free"}
 	}
-	d := g.catalog.Diagnostic(model, wire.Chat, g.zenNodes.Len() > 0, false, g.cfg.Anonymous)
+	d := g.catalog.Diagnostic(model, wire.Chat, g.keyAvailability(), g.cfg.Anonymous)
 	protocol := d.NativeProtocols[config.TierZen]
-	if !d.AvailableZen || !g.catalog.Supported(model) {
+	if !d.Available[string(config.TierZen)] || !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
-	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: identity.StableID("prj", "opencode2api:default-project")}
+	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: identity.ProjectID("")}
 	type lane struct {
 		key, name string
 		client    *http.Client
 	}
 	var lanes []lane
 	if g.cfg.Anonymous {
+		// A few anonymous lanes per probe: a single lane may sit on a
+		// FreeTier-flagged prefix and answer 403 without saying anything about
+		// the model. The first successful lane ends the scan.
 		cursor := g.anonymous.CursorFor(ids.Session)
-		if node := cursor.Next(); node != nil {
-			lanes = append(lanes, lane{anonymousZenKey, "anonymous", node.proxy.client})
+		for len(lanes) < anonymousProbeLanes {
+			node := cursor.Next()
+			if node == nil {
+				break
+			}
+			lanes = append(lanes, lane{anonymousZenKey, "anonymous", node.egress.client})
 		}
 	}
-	cursor := g.zenNodes.CursorFor(ids.Session)
+	zenChannel := g.channel(config.TierZen)
+	cursor := zenChannel.nodes.CursorFor(ids.Session)
 	if node := cursor.Next(); node != nil {
-		if proxy := g.zenNodes.Proxy(node); proxy != nil {
-			lanes = append(lanes, lane{node.key, "zen", proxy.client})
+		if egress := zenChannel.nodes.Egress(node); egress != nil {
+			lanes = append(lanes, lane{node.key, "zen", egress.client})
 		}
 	}
 	result := probeResult{reason: "no_probe_channel"}
@@ -104,10 +117,11 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		result.channel = lane.name
 		if result.success {
 			if g.cfg.ForcedEffort(model) == "auto" && protocol != wire.SystemOne {
-				if !g.catalog.MetadataForTier(model, config.TierZen).Reasoning {
+				md := g.catalog.MetadataForTier(model, config.TierZen)
+				if !md.Reasoning {
 					result.effort = models.EffortProbe{Effort: "none", Protocol: string(protocol)}
 				} else {
-					for _, effort := range []string{"max", "xhigh", "high", "medium", "low", "minimal", "none"} {
+					for _, effort := range probeEffortLadder(md.ReasoningEfforts) {
 						if effort == "none" {
 							// Baseline already succeeded without an effort field.
 							result.effort = models.EffortProbe{Effort: "none", Protocol: string(protocol)}
@@ -150,7 +164,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, key,
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	ids.Request = identity.RandomID("req", 16)
-	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, protocol, b, ids, key)
+	req, err := newUpstreamRequest(ctx, g.channel(config.TierZen).upstream, true, protocol, b, ids, key)
 	if err != nil {
 		return probeResult{reason: "request_creation_error"}
 	}
