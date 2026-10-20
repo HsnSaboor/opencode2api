@@ -327,7 +327,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
-		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, stream)
 		if err != nil {
 			finalTier := route.Tier
 			if meta != nil && meta.Tier != "" {
@@ -494,7 +494,9 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	}
 	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 	defer cancel()
-	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+	// The SystemOne decision path answers non-streaming today, so the
+	// anonymous scan validates and buffers the body before reporting success.
+	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, false)
 	if err != nil {
 		finalTier := route.Tier
 		if meta != nil && meta.Tier != "" {

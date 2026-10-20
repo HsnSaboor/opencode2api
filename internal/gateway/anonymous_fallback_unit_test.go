@@ -71,7 +71,7 @@ func TestAnonymousFallbackAfterKeyedExhaustion(t *testing.T) {
 		config.TierZen: []byte(`{"model":"zen-model-free","messages":[{"role":"user","content":"hi"}]}`),
 	}
 	ids := identity.RequestIDs{Request: "req_fallback_test", Session: "sess_fallback_test"}
-	resp, servingRoute, attempts, err := g.doUpstreamTiers(context.Background(), route, bodies, ids, 0)
+	resp, servingRoute, attempts, err := g.doUpstreamTiers(context.Background(), route, bodies, ids, 0, true)
 	if err != nil {
 		t.Fatalf("doUpstreamTiers: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestParkedKeyLanesSkipToAnonymousLayer(t *testing.T) {
 		config.TierZen: []byte(`{"model":"zen-model-free","messages":[{"role":"user","content":"hi"}]}`),
 	}
 	ids := identity.RequestIDs{Request: "req_parked_skip", Session: "sess_parked_skip"}
-	resp, servingRoute, attempts, err := g.doUpstreamTiers(context.Background(), route, bodies, ids, 0)
+	resp, servingRoute, attempts, err := g.doUpstreamTiers(context.Background(), route, bodies, ids, 0, true)
 	if err != nil {
 		t.Fatalf("doUpstreamTiers: %v", err)
 	}

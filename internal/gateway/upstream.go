@@ -54,8 +54,8 @@ func debugKeyOverrideFrom(ctx context.Context) (DebugKeyOverride, bool) {
 	return override, ok && override.KeyID != ""
 }
 
-func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs) (*http.Response, models.Route, error) {
-	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
+func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, stream bool) (*http.Response, models.Route, error) {
+	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0, stream)
 	if _, selected := debugKeyOverrideFrom(ctx); selected {
 		return resp, effectiveRoute, err
 	}
@@ -106,7 +106,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 	// the reply from the chain the client still holds; the stale references are
 	// already removed from the payload itself.
 	g.logger.Info("retrying upstream without stale reasoning references", "component", "upstream", "event", "reasoning_reference_retry", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
-	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts)
+	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts, stream)
 	if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
 		retryStatus := 0
 		if retryResp != nil {
@@ -190,7 +190,7 @@ func stripStaleReasoningInputs(route models.Route, bodies map[config.Tier][]byte
 	return out, changed
 }
 
-func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, models.Route, int, error) {
+func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, stream bool) (*http.Response, models.Route, int, error) {
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
@@ -201,7 +201,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		return resp, route, used, err
 	}
 	if route.Anonymous {
-		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
+		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts, stream)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, route, attempts, nil
@@ -260,7 +260,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		anonymousRoute.AnonymousFallback = false
 		effectiveRoute = anonymousRoute
 		g.logger.Debug("authenticated tiers exhausted; entering the anonymous bottom layer", "component", "upstream", "event", "anonymous_bottom_layer", "request_id", ids.Request, "attempts", attempts)
-		resp, err, used := g.doAnonymousUpstream(ctx, anonymousRoute, bodies, ids, attempts)
+		resp, err, used := g.doAnonymousUpstream(ctx, anonymousRoute, bodies, ids, attempts, stream)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, anonymousRoute, attempts, nil
@@ -350,6 +350,34 @@ func anonymousAttemptTimeout(configuredSeconds int) time.Duration {
 // there, so any other content type is a lane failure rather than a success.
 func anonymousEventStream(resp *http.Response) bool {
 	return resp != nil && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+}
+
+// bufferAnonymousBody validates a 2xx anonymous response before the scan
+// reports success. The anonymous tier is force-streamed, so a 2xx without an
+// event stream cannot be relayed at all. For a non-streaming client the body
+// must also be complete: the caller collapses the stream from memory, so a
+// lane that truncates mid-stream would only fail later and surface a 502 the
+// client cannot retry, while MarkSuccess promoted the exit to the lead of
+// every later scan. On success the body is replaced with the buffered bytes.
+// The returned reason is empty when the response is usable.
+func bufferAnonymousBody(resp *http.Response, stream bool) (string, error) {
+	if resp == nil || resp.StatusCode/100 != 2 {
+		return "", nil
+	}
+	if !anonymousEventStream(resp) {
+		httpx.DrainAndClose(resp.Body)
+		return "non_streaming_2xx", errAnonymousInvalidResponse
+	}
+	if stream {
+		return "", nil
+	}
+	buffered, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	httpx.DrainAndClose(resp.Body)
+	if err != nil {
+		return "truncated_body", err
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(buffered))
+	return "", nil
 }
 
 // anonymousUnavailableResponse builds the retryable 503 the anonymous tier
@@ -474,7 +502,7 @@ func (g *Gateway) waitForAnonymousLane(ctx context.Context) bool {
 	}
 }
 
-func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
+func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, stream bool) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
@@ -558,17 +586,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			return nil, ctx.Err(), attempts
 		}
-		if err == nil && resp != nil && resp.StatusCode/100 == 2 && !anonymousEventStream(resp) {
-			// The anonymous request is force-streamed, so a 2xx without an
-			// event stream cannot be relayed: the collapse in the caller would
-			// fail after this scan already reported success, surfacing a 502
-			// the client cannot retry, and MarkSuccess would promote the exit
-			// to the lead of every later scan. Fail the lane instead.
-			contentType := resp.Header.Get("Content-Type")
-			httpx.DrainAndClose(resp.Body)
-			resp = nil
-			err = errAnonymousInvalidResponse
-			g.logger.Warn("anonymous lane returned a non-streaming 2xx; trying the next lane", "component", "upstream", "event", "anonymous_invalid_response", "request_id", ids.Request, "attempt", attemptOffset+attempts, "egress", config.RedactURL(node.egress.address), "content_type", contentType, "duration_ms", duration.Milliseconds())
+		if err == nil {
+			if reason, cause := bufferAnonymousBody(resp, stream); reason != "" {
+				g.logger.Warn("anonymous lane returned an unusable 2xx; trying the next lane", "component", "upstream", "event", "anonymous_invalid_response", "reason", reason, "request_id", ids.Request, "attempt", attemptOffset+attempts, "egress", config.RedactURL(node.egress.address), "error", cause, "duration_ms", duration.Milliseconds())
+				resp = nil
+				err = errAnonymousInvalidResponse
+			}
 		}
 		g.observeAnonymousResult(ctx, node, resp, err)
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.egress, resp, err, duration)
