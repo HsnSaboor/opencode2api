@@ -389,6 +389,14 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		}
 		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		if err != nil {
+			// Log before answering: without this the 502 is invisible in the
+			// journal, which is what made these failures hard to attribute to a
+			// lane that answered 200 and then truncated its body.
+			egress := ""
+			if meta != nil {
+				egress = meta.Egress
+			}
+			g.logger.Warn("failed to read upstream response body", "component", "http", "event", "upstream_body_read_failed", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "egress", egress, "status", resp.StatusCode, "error", err)
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}

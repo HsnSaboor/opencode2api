@@ -322,6 +322,36 @@ const (
 	anonymousLanePoll = 250 * time.Millisecond
 )
 
+// anonymousFirstEventTimeout bounds how long an anonymous attempt may wait for
+// the first SSE event when the config sets no first-event timeout. The
+// anonymous tier is served streaming-only, so a lane that answers 200 and then
+// never emits an event is dead for this path; without the bound the attempt
+// would hold the request until the client gives up, and the relay would fail
+// after the scan had already accepted the lane.
+const anonymousFirstEventTimeout = 30 * time.Second
+
+// errAnonymousInvalidResponse marks a 2xx that cannot serve the streaming-only
+// anonymous path (no event-stream content type). It is fed to the pool as a
+// lane failure so the exit leaves the recent-success lead instead of being
+// promoted and failing the next client request in the same way.
+var errAnonymousInvalidResponse = errors.New("anonymous lane returned a non-streaming response")
+
+// anonymousAttemptTimeout resolves the first-event bound for anonymous
+// attempts: the configured value when set, otherwise the fallback.
+func anonymousAttemptTimeout(configuredSeconds int) time.Duration {
+	if configuredSeconds > 0 {
+		return time.Duration(configuredSeconds) * time.Second
+	}
+	return anonymousFirstEventTimeout
+}
+
+// anonymousEventStream reports whether resp carries the event stream the
+// force-streamed anonymous path can relay. Only an event stream is usable
+// there, so any other content type is a lane failure rather than a success.
+func anonymousEventStream(resp *http.Response) bool {
+	return resp != nil && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+}
+
 // anonymousUnavailableResponse builds the retryable 503 the anonymous tier
 // returns when its egress is not ready. Direct lanes are hard-parked, so
 // there is nothing healthy to fall through to; a 503 with Retry-After tells
@@ -515,7 +545,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.egress)
 		started := time.Now()
-		resp, err := doInferenceAttempt(node.egress.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+		resp, err := doInferenceAttempt(node.egress.client, req, anonymousAttemptTimeout(g.cfg.Performance.FirstEventTimeoutSeconds))
 		duration := time.Since(started)
 		if ctx.Err() != nil {
 			// The parent budget expired while this attempt was in flight. Its
@@ -527,6 +557,18 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				httpx.DrainAndClose(resp.Body)
 			}
 			return nil, ctx.Err(), attempts
+		}
+		if err == nil && resp != nil && resp.StatusCode/100 == 2 && !anonymousEventStream(resp) {
+			// The anonymous request is force-streamed, so a 2xx without an
+			// event stream cannot be relayed: the collapse in the caller would
+			// fail after this scan already reported success, surfacing a 502
+			// the client cannot retry, and MarkSuccess would promote the exit
+			// to the lead of every later scan. Fail the lane instead.
+			contentType := resp.Header.Get("Content-Type")
+			httpx.DrainAndClose(resp.Body)
+			resp = nil
+			err = errAnonymousInvalidResponse
+			g.logger.Warn("anonymous lane returned a non-streaming 2xx; trying the next lane", "component", "upstream", "event", "anonymous_invalid_response", "request_id", ids.Request, "attempt", attemptOffset+attempts, "egress", config.RedactURL(node.egress.address), "content_type", contentType, "duration_ms", duration.Milliseconds())
 		}
 		g.observeAnonymousResult(ctx, node, resp, err)
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.egress, resp, err, duration)
