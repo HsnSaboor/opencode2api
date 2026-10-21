@@ -1417,6 +1417,7 @@ type nodePool struct {
 	cooldown     time.Duration
 	bindingsMu   sync.Mutex
 	bindingCount []int
+	opencode     bool
 }
 
 // newNodePool distributes keys over egress lanes in round-robin order. When
@@ -1431,6 +1432,7 @@ func newNodePool(keys []string, transports *transportPool, cooldown time.Duratio
 		transports:   transports,
 		cooldown:     cooldown,
 		bindingCount: make([]int, len(transports.items)),
+		opencode:     true,
 	}
 	if len(keys) == 0 {
 		return pool, nil
@@ -1621,6 +1623,9 @@ func (p *nodePool) RebalanceEgress(occupied []bool, home egressHome) int {
 	p.ensureBindingsLocked(n)
 
 	benched := func(egress *egressTransport) bool {
+		if !p.opencode {
+			return false
+		}
 		return freitierParked(egress) || p.transports.subnetCooled(egress.address)
 	}
 	empty := func(want func(*egressTransport) bool) int {
@@ -1931,7 +1936,7 @@ func (c *nodeCursor) Next() *upstreamNode {
 // return one when every lane is cooling, which preserves liveness exactly as
 // before.
 func (p *nodePool) laneParked(node *upstreamNode) bool {
-	if p == nil || p.transports == nil || node == nil {
+	if p == nil || !p.opencode || p.transports == nil || node == nil {
 		return false
 	}
 	items := p.transports.snapshot()

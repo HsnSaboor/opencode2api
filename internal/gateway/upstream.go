@@ -1236,6 +1236,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
+	if maxAttempts > 1 && !channel.opencode && nodes.Len() > maxAttempts {
+		maxAttempts = nodes.Len()
+	}
 	results := make(chan keyAttemptResult, maxAttempts)
 	cancels := make(map[int]context.CancelCauseFunc, maxAttempts)
 	used := make(map[*upstreamNode]struct{}, maxAttempts)
@@ -1375,7 +1378,10 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			// candidates). Attempting it would spend the request budget on
 			// the lane's own known verdict — a parked FreeTier lane answers
 			// the same 403 again — so hand the request to the layers below.
-			if nodes.laneParked(candidate) {
+			if channel.opencode && nodes.laneParked(candidate) {
+				return false, nil
+			}
+			if candidate.cooldownUntil.Load() > time.Now().UnixNano() {
 				return false, nil
 			}
 			if _, seen := used[candidate]; seen {

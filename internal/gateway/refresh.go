@@ -606,7 +606,14 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 func (g *Gateway) refreshTier(ctx context.Context, channel *channel) []string {
 	nodes := channel.nodes
 	cursor := nodes.Cursor()
-	for attempt := 0; attempt < g.cfg.Retry.MaxAttempts; attempt++ {
+	maxAttempts := g.cfg.Retry.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	if nodes.Len() > maxAttempts {
+		maxAttempts = min(nodes.Len(), 20)
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		node := cursor.Next()
 		if node == nil {
 			return nil

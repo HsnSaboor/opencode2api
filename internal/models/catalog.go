@@ -581,6 +581,9 @@ func (c *Catalog) Supported(model string) bool {
 // models.dev; capability flags always come from the catalog. The zero value is
 // returned for models neither source describes (or before the first refresh).
 func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
+	if c == nil {
+		return Metadata{}
+	}
 	c.mu.RLock()
 	md := c.modelMeta[tier][model]
 	equiv := equivalentFreeModel(model)

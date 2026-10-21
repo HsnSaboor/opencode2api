@@ -128,6 +128,8 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		if err != nil {
 			return nil, fmt.Errorf("%s node pool: %w", tier, err)
 		}
+		isOpencode := tier == config.TierZen || tier == config.TierGo
+		nodes.opencode = isOpencode
 		home := homeDedicated
 		if tier == config.TierZen {
 			// Zen keys ride their dedicated /64 lanes only; no proxy
@@ -137,7 +139,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*G
 		channels[tier] = &channel{
 			tier:     tier,
 			upstream: cfg.TierUpstream(tier),
-			opencode: tier == config.TierZen || tier == config.TierGo,
+			opencode: isOpencode,
 			home:     home,
 			suffix:   cfg.TierModelSuffix(tier),
 			nodes:    nodes,
@@ -577,6 +579,9 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 	for _, tier := range route.KeyTiers {
 		addTier(tier)
 	}
+	if route.AnonymousFallback {
+		addTier(config.TierZen)
+	}
 	if len(tiers) == 0 {
 		return nil, errors.New("no usable upstream tier")
 	}
@@ -602,7 +607,11 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 				tierInput = withReplacedTools(input, tools)
 			}
 		}
-		target := wire.Target{InterleavedField: g.catalog.MetadataForTier(route.ID, tier).InterleavedField}
+		var interleaved string
+		if g.catalog != nil {
+			interleaved = g.catalog.MetadataForTier(route.ID, tier).InterleavedField
+		}
+		target := wire.Target{InterleavedField: interleaved}
 		upstreamPayload, err := wire.PrepareRequest(from, protocol, tierInput, target)
 		if err != nil {
 			if tier != route.Tier {
