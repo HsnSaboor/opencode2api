@@ -2006,3 +2006,49 @@ func retryAfterOf(resp *http.Response) time.Duration {
 	}
 	return parseRetryAfter(resp.Header.Get("Retry-After"))
 }
+
+// BestCoolingNode returns the least-cooling eligible lane in the pool when
+// every eligible lane is cooling, preferring WARP exits. It returns nil if
+// the pool is empty or every lane is unhealthy, FreeTier-parked, or direct-parked.
+func (p *anonymousPool) BestCoolingNode(transports *transportPool) *anonymousNode {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	nodes := append([]*anonymousNode(nil), p.nodes...)
+	p.mu.RUnlock()
+	if len(nodes) == 0 {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	directParked := transports != nil && transports.DirectEgressParked()
+	var best *anonymousNode
+	var earliest int64
+	bestIsWarp := false
+
+	for _, node := range nodes {
+		if node == nil || node.egress == nil || !node.egress.healthy.Load() || node.egress.freitierUntil.Load() > now {
+			continue
+		}
+		if directParked && node.egress.proxy == nil {
+			continue
+		}
+		until := node.cooldownUntil.Load()
+		warp := isWarpLane(node)
+		if best == nil {
+			best, earliest, bestIsWarp = node, until, warp
+			continue
+		}
+		if warp && !bestIsWarp {
+			best, earliest, bestIsWarp = node, until, true
+			continue
+		}
+		if bestIsWarp && !warp {
+			continue
+		}
+		if until < earliest {
+			best, earliest = node, until
+		}
+	}
+	return best
+}

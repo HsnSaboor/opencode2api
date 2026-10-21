@@ -339,8 +339,12 @@ func (m *proxyManager) completeVerify(index int, outcome proxyProbeOutcome) {
 		state.failures++
 		state.coolingUntil = now.Add(m.cooldownFor(index, outcome, state.failures))
 		// A failed verdict — including one on a stale re-verify — retires
-		// the admission until the node passes again.
-		state.verified = false
+		// the admission until the node passes again. Rate-limiting (429) proves
+		// the proxy is functional and reached the upstream gate; keep it verified
+		// so it becomes selectable immediately once the cooldown expires.
+		if outcome != proxyOutcomeRateLimited {
+			state.verified = false
+		}
 		if m.logger != nil {
 			// WARP lanes are few and operator-managed: surface their probe
 			// verdicts at info. The public proxy mass stays at debug.

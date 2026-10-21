@@ -613,6 +613,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			breakerWaited = true
 		}
 		node := cursor.Next()
+		if attempts == 0 && node == nil && !g.anonymousEgressDown() {
+			if coolingNode := g.anonymous.BestCoolingNode(g.transports); coolingNode != nil {
+				node = coolingNode
+			}
+		}
 		if node == nil {
 			break
 		}
