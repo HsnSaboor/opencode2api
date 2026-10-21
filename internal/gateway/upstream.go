@@ -229,6 +229,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		keyTiers = []config.Tier{route.Tier}
 	}
 	for _, tier := range keyTiers {
+		if ctx.Err() != nil {
+			break
+		}
 		if lastResponse != nil {
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -1355,7 +1358,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			return lastResponse, nil, launched
 		}
 		if launched == 0 && lastErr == nil {
-			lastErr = fmt.Errorf("%w: no %s key could be tried", errUpstreamUnavailable, route.Tier)
+			if ctx.Err() != nil {
+				lastErr = ctx.Err()
+			} else {
+				lastErr = fmt.Errorf("%w: no %s key could be tried", errUpstreamUnavailable, route.Tier)
+			}
 		}
 		return nil, lastErr, launched
 	}
@@ -1453,7 +1460,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	}
 	if !started {
 		if lastErr == nil {
-			lastErr = fmt.Errorf("%w: no %s key could be tried", errUpstreamUnavailable, route.Tier)
+			if ctx.Err() != nil {
+				lastErr = ctx.Err()
+			} else {
+				lastErr = fmt.Errorf("%w: no %s key could be tried", errUpstreamUnavailable, route.Tier)
+			}
 		}
 		return nil, lastErr, 0
 	}
