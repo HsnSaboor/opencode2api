@@ -266,9 +266,30 @@ func (c *Catalog) routeLocked(model string, hasKeys map[config.Tier]bool, hasAno
 	// there, even if the current catalog only advertises them on Go: an
 	// upstream rejection will move the request into the authenticated
 	// fallback plan.
+	zenModel := model
+	if strings.HasSuffix(model, ":free") {
+		zenModel = strings.TrimSuffix(model, ":free") + "-free"
+	}
+	zenAdvertised := (c.advertised[config.TierZen] != nil && (c.advertised[config.TierZen][model] || c.advertised[config.TierZen][zenModel]))
+	if hasKeys[config.TierZen] && (c.zenGoPendingLocked() || zenAdvertised) && len(keyTiers) > 0 {
+		alreadyKeyed := false
+		for _, tier := range keyTiers {
+			if tier == config.TierZen {
+				alreadyKeyed = true
+				break
+			}
+		}
+		if !alreadyKeyed {
+			keyTiers = append(keyTiers, config.TierZen)
+		}
+	}
+
 	decision := c.anonymousDecision(model)
+	if !decision.Allowed && zenModel != model {
+		decision = c.anonymousDecision(zenModel)
+	}
 	anonymousEligible := hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(c.zenGoPendingLocked() || c.advertised[config.TierZen][model] || c.advertised[config.TierGo][model])
+		(c.zenGoPendingLocked() || zenAdvertised || c.advertised[config.TierGo][model])
 	// A configured Zen key pool outranks the public credential. Real API keys
 	// carry per-account quota instead of the shared per-IP free allowance, so
 	// free models are tried keyed first and the anonymous lane becomes the
@@ -334,6 +355,12 @@ func (c *Catalog) protocolForLocked(model string, tier config.Tier) wire.Protoco
 	}
 	if protocol := c.nativeProtocols[tier][model]; protocol != "" {
 		return protocol
+	}
+	if strings.HasSuffix(model, ":free") {
+		zenModel := strings.TrimSuffix(model, ":free") + "-free"
+		if protocol := c.nativeProtocols[tier][zenModel]; protocol != "" {
+			return protocol
+		}
 	}
 	// The OpenCode capability catalog is authoritative when available. Chat is
 	// the only safe protocol-neutral fallback for an ID that has just appeared
@@ -550,6 +577,9 @@ func (c *Catalog) Supported(model string) bool {
 func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	c.mu.RLock()
 	md := c.modelMeta[tier][model]
+	if md.ContextWindow == 0 && strings.HasSuffix(model, ":free") {
+		md = c.modelMeta[tier][strings.TrimSuffix(model, ":free")+"-free"]
+	}
 	pricing := c.pricing
 	c.mu.RUnlock()
 	if pricing == nil {
