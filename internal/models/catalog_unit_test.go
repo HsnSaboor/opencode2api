@@ -176,3 +176,67 @@ func TestCatalogCacheRoundTripsProviderTiers(t *testing.T) {
 		t.Fatalf("restored snapshot tiers = %v", snapshot.Tiers)
 	}
 }
+
+// Free models transparently fall back between Zen (-free suffix) and external
+// providers (:free suffix) regardless of which naming format the client requested.
+func TestBidirectionalFreeModelFallback(t *testing.T) {
+	catalog := NewCatalog(config.TierZen, testTiers, nil)
+	catalog.ReplaceWithCapabilities(
+		map[config.Tier][]string{
+			config.TierZen:             {"deepseek-v4.1-flash-free"},
+			config.Tier("tokenharbor"): {"deepseek-v4.1-flash:free"},
+		},
+		map[config.Tier]map[string]wire.Protocol{
+			config.TierZen:             {"deepseek-v4.1-flash-free": wire.Chat},
+			config.Tier("tokenharbor"): {"deepseek-v4.1-flash:free": wire.Chat},
+		},
+		nil, nil,
+	)
+
+	hasAllKeys := map[config.Tier]bool{
+		config.TierZen:             true,
+		config.Tier("tokenharbor"): true,
+	}
+
+	// 1. Client requests :free format with all keys available.
+	routeColon, err := catalog.Route("deepseek-v4.1-flash:free", hasAllKeys, true)
+	if err != nil {
+		t.Fatalf("Route(:free) failed: %v", err)
+	}
+	if routeColon.Tier != config.TierZen || len(routeColon.KeyTiers) != 2 || routeColon.KeyTiers[0] != config.TierZen || routeColon.KeyTiers[1] != config.Tier("tokenharbor") || !routeColon.AnonymousFallback {
+		t.Fatalf("unexpected route for :free: %+v", routeColon)
+	}
+
+	// 2. Client requests -free format with all keys available.
+	routeHyphen, err := catalog.Route("deepseek-v4.1-flash-free", hasAllKeys, true)
+	if err != nil {
+		t.Fatalf("Route(-free) failed: %v", err)
+	}
+	if routeHyphen.Tier != config.TierZen || len(routeHyphen.KeyTiers) != 2 || routeHyphen.KeyTiers[0] != config.TierZen || routeHyphen.KeyTiers[1] != config.Tier("tokenharbor") || !routeHyphen.AnonymousFallback {
+		t.Fatalf("unexpected route for -free: %+v", routeHyphen)
+	}
+
+	// 3. Client requests -free format when Zen has no keys (or is down).
+	hasOnlyProviderKeys := map[config.Tier]bool{
+		config.Tier("tokenharbor"): true,
+	}
+	routeProviderOnly, err := catalog.Route("deepseek-v4.1-flash-free", hasOnlyProviderKeys, true)
+	if err != nil {
+		t.Fatalf("Route(-free with only provider keys) failed: %v", err)
+	}
+	if routeProviderOnly.Tier != config.Tier("tokenharbor") || len(routeProviderOnly.KeyTiers) != 1 || routeProviderOnly.KeyTiers[0] != config.Tier("tokenharbor") || !routeProviderOnly.AnonymousFallback {
+		t.Fatalf("unexpected route for provider-only -free: %+v", routeProviderOnly)
+	}
+
+	// 4. Client requests :free format when Provider has no keys.
+	hasOnlyZenKeys := map[config.Tier]bool{
+		config.TierZen: true,
+	}
+	routeZenOnly, err := catalog.Route("deepseek-v4.1-flash:free", hasOnlyZenKeys, true)
+	if err != nil {
+		t.Fatalf("Route(:free with only zen keys) failed: %v", err)
+	}
+	if routeZenOnly.Tier != config.TierZen || len(routeZenOnly.KeyTiers) != 1 || routeZenOnly.KeyTiers[0] != config.TierZen || !routeZenOnly.AnonymousFallback {
+		t.Fatalf("unexpected route for zen-only :free: %+v", routeZenOnly)
+	}
+}

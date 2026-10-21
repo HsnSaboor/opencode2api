@@ -262,39 +262,21 @@ func (c *Catalog) routeLocked(model string, hasKeys map[config.Tier]bool, hasAno
 		return Route{}, fmt.Errorf("model %q is disabled after a failed availability check; restore it in the WebUI or wait for the next probe", model)
 	}
 	keyTiers := c.keyTierOrderLocked(model, hasKeys)
-	// OpenCode's public credential is a Zen-only lane. Free models start
-	// there, even if the current catalog only advertises them on Go: an
-	// upstream rejection will move the request into the authenticated
-	// fallback plan.
+
 	zenModel := model
 	if strings.HasSuffix(model, ":free") {
 		zenModel = strings.TrimSuffix(model, ":free") + "-free"
 	}
 	zenAdvertised := (c.advertised[config.TierZen] != nil && (c.advertised[config.TierZen][model] || c.advertised[config.TierZen][zenModel]))
-	if hasKeys[config.TierZen] && (c.zenGoPendingLocked() || zenAdvertised) && len(keyTiers) > 0 {
-		alreadyKeyed := false
-		for _, tier := range keyTiers {
-			if tier == config.TierZen {
-				alreadyKeyed = true
-				break
-			}
-		}
-		if !alreadyKeyed {
-			keyTiers = append(keyTiers, config.TierZen)
-		}
-	}
 
 	decision := c.anonymousDecision(model)
 	if !decision.Allowed && zenModel != model {
 		decision = c.anonymousDecision(zenModel)
 	}
-	anonymousEligible := hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[config.TierZen][model]) &&
-		(c.zenGoPendingLocked() || zenAdvertised || c.advertised[config.TierGo][model])
-	// A configured Zen key pool outranks the public credential. Real API keys
-	// carry per-account quota instead of the shared per-IP free allowance, so
-	// free models are tried keyed first and the anonymous lane becomes the
-	// last-resort layer after every keyed tier is exhausted (429s, blocks,
-	// outages).
+	anonymousEligible := hasAnonymous && decision.Allowed &&
+		(c.protocols[model] != "" || c.protocols[zenModel] != "" || !c.unsupported[config.TierZen][model] || !c.unsupported[config.TierZen][zenModel]) &&
+		(c.zenGoPendingLocked() || zenAdvertised || c.advertised[config.TierGo][model] || c.advertised[config.TierGo][zenModel])
+
 	zenKeyed := false
 	for _, tier := range keyTiers {
 		if tier == config.TierZen {
@@ -302,7 +284,7 @@ func (c *Catalog) routeLocked(model string, hasKeys map[config.Tier]bool, hasAno
 			break
 		}
 	}
-	if anonymousEligible && zenKeyed {
+	if anonymousEligible && (zenKeyed || len(keyTiers) > 0) {
 		protocols := c.protocolsForLocked(model, keyTiers, true)
 		return Route{ID: model, Tier: keyTiers[0], Protocol: protocols[keyTiers[0]], Protocols: protocols, AnonymousFallback: true, KeyTiers: keyTiers}, nil
 	}
@@ -356,9 +338,12 @@ func (c *Catalog) protocolForLocked(model string, tier config.Tier) wire.Protoco
 	if protocol := c.nativeProtocols[tier][model]; protocol != "" {
 		return protocol
 	}
-	if strings.HasSuffix(model, ":free") {
-		zenModel := strings.TrimSuffix(model, ":free") + "-free"
-		if protocol := c.nativeProtocols[tier][zenModel]; protocol != "" {
+	equiv := equivalentFreeModel(model)
+	if equiv != model {
+		if protocol := c.protocols[equiv]; protocol != "" {
+			return protocol
+		}
+		if protocol := c.nativeProtocols[tier][equiv]; protocol != "" {
 			return protocol
 		}
 	}
@@ -374,9 +359,20 @@ func (c *Catalog) protocolForLocked(model string, tier config.Tier) wire.Protoco
 // tier's first successful catalog refresh it stays usable, so temporary
 // discovery failures do not take that tier offline.
 func (c *Catalog) keyTierOrderLocked(model string, hasKeys map[config.Tier]bool) []config.Tier {
+	equiv := equivalentFreeModel(model)
 	available := func(tier config.Tier) bool {
 		pending := c.tierPendingLocked(tier)
-		return hasKeys[tier] && (pending || c.advertised[tier][model]) && c.tierSupportedLocked(model, tier)
+		if !hasKeys[tier] {
+			return false
+		}
+		if pending {
+			return true
+		}
+		advertised := c.advertised[tier][model] || (equiv != model && c.advertised[tier][equiv])
+		if !advertised {
+			return false
+		}
+		return c.tierSupportedLocked(model, tier) || (equiv != model && c.tierSupportedLocked(equiv, tier))
 	}
 	order := make([]config.Tier, 0, len(c.order))
 	if c.prefer != "" {
@@ -486,6 +482,16 @@ func (c *Catalog) Diagnostic(model string, requested wire.Protocol, hasKeys map[
 	return diagnostic
 }
 
+func equivalentFreeModel(model string) string {
+	if strings.HasSuffix(model, ":free") {
+		return strings.TrimSuffix(model, ":free") + "-free"
+	}
+	if strings.HasSuffix(model, "-free") {
+		return strings.TrimSuffix(model, "-free") + ":free"
+	}
+	return model
+}
+
 func isFreeModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "free")
 }
@@ -577,8 +583,9 @@ func (c *Catalog) Supported(model string) bool {
 func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 	c.mu.RLock()
 	md := c.modelMeta[tier][model]
-	if md.ContextWindow == 0 && strings.HasSuffix(model, ":free") {
-		md = c.modelMeta[tier][strings.TrimSuffix(model, ":free")+"-free"]
+	equiv := equivalentFreeModel(model)
+	if md.ContextWindow == 0 && equiv != model {
+		md = c.modelMeta[tier][equiv]
 	}
 	pricing := c.pricing
 	c.mu.RUnlock()
@@ -610,11 +617,12 @@ func (c *Catalog) MetadataForTier(model string, tier config.Tier) Metadata {
 }
 
 func (c *Catalog) supportedLocked(model string) bool {
+	equiv := equivalentFreeModel(model)
 	for _, tier := range c.order {
-		if !c.tierPendingLocked(tier) && !c.advertised[tier][model] {
+		if !c.tierPendingLocked(tier) && !c.advertised[tier][model] && (equiv == model || !c.advertised[tier][equiv]) {
 			continue
 		}
-		if c.tierSupportedLocked(model, tier) {
+		if c.tierSupportedLocked(model, tier) || (equiv != model && c.tierSupportedLocked(equiv, tier)) {
 			return true
 		}
 	}

@@ -590,6 +590,12 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 				cloned["model"] = strings.TrimSuffix(m, ":free") + "-free"
 				tierInput = cloned
 			}
+		} else {
+			if m, ok := tierInput["model"].(string); ok && strings.HasSuffix(m, "-free") {
+				cloned := jsonutil.CloneMap(tierInput)
+				cloned["model"] = strings.TrimSuffix(m, "-free") + ":free"
+				tierInput = cloned
+			}
 		}
 		if from == wire.Responses {
 			if tools, ok := sanitizeToolsForUpstream(input, protocol); ok {
