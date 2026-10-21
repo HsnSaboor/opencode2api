@@ -104,6 +104,12 @@ type anonymousPool struct {
 	nodes    []*anonymousNode
 	next     atomic.Uint64
 	cooldown time.Duration
+	// breakerFailures counts consecutive pure-transport failures (an error
+	// with no response headers) across requests; reaching
+	// anonymousBreakerFailures opens the breaker. breakerUntil holds the end
+	// of the open window as unix nanoseconds, zero when closed.
+	breakerFailures atomic.Uint32
+	breakerUntil    atomic.Int64
 	// enabled mirrors the anonymous tier switch: when false the pool holds
 	// no nodes even though the lanes exist for key tiers.
 	enabled bool
@@ -129,8 +135,9 @@ type anonymousPool struct {
 type anonymousNode struct {
 	egress   *egressTransport
 	failures atomic.Uint32
-	// total429s counts lifetime 429s on this lane and drives the escalating
-	// 429 backoff. It is never reset by success, mirroring the zen pool.
+	// total429s counts 429s since the last success on this lane and drives
+	// the escalating 429 backoff. MarkSuccess clears it so a recovered lane
+	// starts again at the base delay.
 	total429s     atomic.Uint32
 	cooldownUntil atomic.Int64
 }
@@ -164,11 +171,17 @@ func cooldownFor(base time.Duration, failures uint32, retryAfter time.Duration) 
 	return delay
 }
 
-// cooldown429For returns the escalating zen-grade 429 backoff for the
-// n-th 429 on a lane (n >= 1): 5min * 3^min(n-1,5), capped at 8h. The
-// first offense parks the lane briefly; repeat offenders escalate to the
-// full quota-reset window. Callers still stretch to Retry-After via
-// storeCooldownDelay when the upstream asks for longer.
+// cooldown429Cap bounds the calculated 429 park. Free-tier quotas reset on
+// short rolling windows, so a multi-hour park outlives the upstream outage:
+// nine keys limited within one minute stayed benched for eight hours and
+// left the pool with a single key and no hedge. Retry-After can still ask
+// for a longer park and is honored by storeCooldownDelay.
+const cooldown429Cap = 30 * time.Minute
+
+// cooldown429For returns the escalating 429 backoff for the n-th 429 on a
+// lane (n >= 1): 5min * 3^(n-1), capped at cooldown429Cap. The first offense
+// parks the lane briefly; repeat offenders back off to the cap. MarkSuccess
+// clears the 429 history so a key that serves again starts at the base.
 func cooldown429For(prior429s uint32) time.Duration {
 	if prior429s == 0 {
 		prior429s = 1
@@ -178,7 +191,7 @@ func cooldown429For(prior429s uint32) time.Duration {
 	for range shift {
 		delay *= 3
 	}
-	return min(delay, 8*time.Hour)
+	return min(delay, cooldown429Cap)
 }
 
 // storeCooldownDelay records an explicit delay starting now, stretched to
@@ -272,9 +285,17 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	return anonymousCursor{pool: p, nodes: interleaveByFate(p, nodes, startForAffinity(&p.next, affinity, len(nodes)), recent)}
 }
 
-// interleaveByFate reorders one cursor snapshot: the given lead lanes (the
-// pool's recent successes, most recent first) come first, then the
-// affinity-chosen lane, then the remaining lanes round-robin by fate class.
+// isWarpLane reports whether a lane is a local Cloudflare WARP exit. WARP
+// exits are multiplexed separately from the public chk proxies and have a
+// much better anonymous success rate, so the cursor leads with one.
+func isWarpLane(node *anonymousNode) bool {
+	return node != nil && node.egress != nil && node.egress.proxy != nil &&
+		strings.HasPrefix(node.egress.proxy.Tag, "cf-warp-")
+}
+
+// interleaveByFate reorders one cursor snapshot: one WARP lane first, then
+// the given lead lanes (the pool's recent successes, most recent first), then
+// the affinity-chosen lane, then the remaining lanes round-robin by fate class.
 // With the pool's typical composition (many address lanes behind one
 // tunnel, a handful of independent proxy exits) a contiguous walk could
 // spend every attempt of a request inside a single blocked prefix; the
@@ -285,12 +306,27 @@ func interleaveByFate(pool *anonymousPool, nodes []*anonymousNode, start int, le
 	if size < 2 {
 		return nodes
 	}
-	ordered := interleaveOrder(pool, nodes, start)
-	if len(lead) == 0 {
-		return ordered
+	// WARP exits are the healthiest anonymous egress class in production
+	// (82% 2xx over 24h versus 42% for public chk exits). Start the fate
+	// round-robin on a WARP lane so the scan tries it first and then keeps
+	// alternating classes; starting on a chk lane and moving one WARP lane to
+	// the front would leave two chk lanes back to back. The cursor still skips
+	// the WARP lane when it is cooling or parked.
+	for index, node := range nodes {
+		if isWarpLane(node) {
+			start = index
+			break
+		}
 	}
+	ordered := interleaveOrder(pool, nodes, start)
 	out := make([]*anonymousNode, 0, size)
-	seen := make(map[*anonymousNode]bool, len(lead))
+	seen := make(map[*anonymousNode]bool, len(nodes))
+	if len(ordered) > 0 && isWarpLane(ordered[0]) {
+		seen[ordered[0]] = true
+		out = append(out, ordered[0])
+	}
+	// Recent successes follow. They keep a request on an exit that answered
+	// lately without letting the lead displace the WARP head start.
 	for _, node := range lead {
 		if node == nil || seen[node] {
 			continue
@@ -389,6 +425,12 @@ func (p *anonymousPool) fateKey(egress *egressTransport) string {
 		return "none"
 	}
 	if egress.proxy != nil {
+		// WARP exits are a distinct fate from public proxies: the two
+		// classes fail independently, so interleave them rather than
+		// treating every proxy as one bucket.
+		if strings.HasPrefix(egress.proxy.Tag, "cf-warp-") {
+			return "warp"
+		}
 		return "proxy"
 	}
 	if p != nil {
@@ -468,6 +510,7 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.total429s.Store(0)
 	if node.egress != nil {
 		// A served request proves the exit is not flagged: reset the FreeTier
 		// park escalation so a later flag starts at the short base again.
@@ -506,6 +549,77 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 		return
 	}
 	storeCooldownUntil(&node.cooldownUntil, p.cooldown, node.failures.Add(1), retryAfterOf(resp))
+}
+
+// anonymousBreakerFailures is the number of consecutive no-response
+// transport failures across requests that opens the anonymous egress
+// breaker. A live lane answers with response headers in well under a second;
+// only a dead egress path (hanging connect or TLS, or an exit dropping
+// requests before any byte) produces a run of attempts with no response at
+// all. Without the breaker those attempts consume the whole request budget
+// and the client sees a timeout instead of a retryable pool outage.
+const anonymousBreakerFailures = 3
+
+// anonymousBreakerCooldown is how long new anonymous requests fail fast once
+// the breaker opens. It is deliberately short: a recovering egress path
+// should not stay unserved, and the half-open probe needs three fresh
+// failures, so a stale counter cannot reopen it. The tradeoff of opening
+// wrongly is a few requests answered with the retryable 503 instead of
+// waiting on a slow but live lane.
+const anonymousBreakerCooldown = 10 * time.Second
+
+// AllowAttempt reports whether the anonymous egress path may start a new
+// upstream attempt. False means the breaker is open from a run of
+// transport-level failures with no response.
+func (p *anonymousPool) AllowAttempt() bool {
+	if p == nil {
+		return true
+	}
+	until := p.breakerUntil.Load()
+	return until == 0 || time.Now().UnixNano() >= until
+}
+
+// BreakerRemaining reports how long the breaker stays open, or zero when it
+// is closed. It lets a request wait out the cooldown before probing instead
+// of failing immediately with zero attempts.
+func (p *anonymousPool) BreakerRemaining() time.Duration {
+	if p == nil {
+		return 0
+	}
+	until := p.breakerUntil.Load()
+	if until == 0 {
+		return 0
+	}
+	remaining := time.Until(time.Unix(0, until))
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// RecordTransportFailure counts a no-response transport failure. The third
+// consecutive failure opens the breaker for anonymousBreakerCooldown and
+// resets the counter, so the next probe window needs three fresh failures
+// rather than inheriting the previous run.
+func (p *anonymousPool) RecordTransportFailure() {
+	if p == nil {
+		return
+	}
+	if p.breakerFailures.Add(1) < anonymousBreakerFailures {
+		return
+	}
+	p.breakerFailures.Store(0)
+	p.breakerUntil.Store(time.Now().Add(anonymousBreakerCooldown).UnixNano())
+}
+
+// RecordTransportSuccess clears the failure streak and any open breaker: a
+// served lane proves the egress path works.
+func (p *anonymousPool) RecordTransportSuccess() {
+	if p == nil {
+		return
+	}
+	p.breakerFailures.Store(0)
+	p.breakerUntil.Store(0)
 }
 
 // recentSuccessLimit bounds the anonymous pool's recent-success memory: the
@@ -1288,7 +1402,9 @@ type upstreamNode struct {
 	preferredEgress int
 	egressIndex     atomic.Int64
 	failures        atomic.Uint32
-	// total429s counts lifetime 429s on this key and drives the escalating
+	// total429s counts 429s since the last success on this key and drives
+	// the escalating 429 backoff. MarkSuccess clears it so a recovered key
+	// starts again at the base delay.
 	// 429 backoff. It is never reset by success, mirroring the zen pool.
 	total429s     atomic.Uint32
 	cooldownUntil atomic.Int64
@@ -1830,6 +1946,7 @@ func (p *nodePool) laneParked(node *upstreamNode) bool {
 func (p *nodePool) MarkSuccess(node *upstreamNode) {
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.total429s.Store(0)
 }
 
 func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {

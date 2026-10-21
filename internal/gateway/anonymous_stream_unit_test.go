@@ -39,8 +39,8 @@ func TestAnonymousAttemptTimeout(t *testing.T) {
 		configured int
 		want       time.Duration
 	}{
-		{0, anonymousFirstEventTimeout},
-		{-1, anonymousFirstEventTimeout},
+		{0, defaultFirstContentTimeout},
+		{-1, defaultFirstContentTimeout},
 		{45, 45 * time.Second},
 		{1, time.Second},
 	}

@@ -170,12 +170,28 @@ func (emitter *bridgeStreamEmitter) emitError(message, errorType string) error {
 			"sequence_number": emitter.nextSequence(),
 		})
 	default:
-		if err := emitter.sse("", map[string]any{"error": map[string]any{
-			"message": message,
-			"type":    errorType,
-			"param":   nil,
-			"code":    nil,
-		}}); err != nil {
+		// OpenAI's chat chunk schema has no error frame: a bare
+		// {"error": ...} data line is not a chat.completion.chunk, and
+		// strict clients (OpenCode) reject it as an invalid stream event,
+		// which aborts the whole session step mid-turn instead of ending
+		// the turn. Say what happened as content, then close with a
+		// schema-valid terminal chunk so the client ends the turn cleanly.
+		if !emitter.started {
+			if err := emitter.start(); err != nil {
+				return err
+			}
+		}
+		emitter.done = true
+		notice := message
+		if len(notice) > 200 {
+			notice = notice[:200]
+		}
+		if err := emitter.chatChunk(map[string]any{
+			"content": "\n\n[gateway] upstream stream failed mid-response: " + notice,
+		}, nil); err != nil {
+			return err
+		}
+		if err := emitter.chatChunk(map[string]any{}, "stop"); err != nil {
 			return err
 		}
 		return emitter.rawSSE("", "[DONE]")
@@ -330,7 +346,11 @@ func (emitter *bridgeStreamEmitter) emitReasoningSignature(signature string) err
 	}
 	switch emitter.target {
 	case Chat:
-		return emitter.chatChunk(map[string]any{"reasoning_signature": signature}, nil)
+		// No OpenAI chat delta carries a reasoning signature, and an
+		// invented "reasoning_signature" field fails strict schema
+		// validation on the client side. Drop it for chat targets; the
+		// Anthropic target below is where a signature belongs.
+		return nil
 	case Anthropic:
 		return emitter.sse("content_block_delta", map[string]any{
 			"type":  "content_block_delta",

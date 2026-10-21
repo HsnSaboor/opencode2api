@@ -127,7 +127,7 @@ func Load(path string) (Config, error) {
 	cfg := Config{
 		Listen:      "127.0.0.1:8080",
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/inference", Go: "https://opencode.ai/inference/go"},
-		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
+		Retry:       RetryConfig{MaxAttempts: 6, TimeoutSeconds: 240},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},

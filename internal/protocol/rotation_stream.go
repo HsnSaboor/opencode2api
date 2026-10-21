@@ -52,7 +52,11 @@ func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader
 				return upstreamFailure
 			}
 			if !committed {
-				effective := event.Kind == "text" || event.Kind == "reasoning" || event.Kind == "reasoning_signature" || event.Kind == "tool_start" || event.Kind == "tool_delta" || event.Kind == "done"
+				// Only a real assistant payload commits the response. Role,
+				// start, usage, signature, and terminal events are held (or
+				// dropped with the stream) so a role-only stream can be
+				// retried before any downstream header is written.
+				effective := event.Kind == "text" || event.Kind == "reasoning" || event.Kind == "tool_start" || event.Kind == "tool_delta"
 				if !effective {
 					if len(pending) >= 256 {
 						return &StreamFailure{Type: "invalid_prelude"}
@@ -82,6 +86,12 @@ func RotationStream(ctx context.Context, w http.ResponseWriter, reader io.Reader
 	})
 	usage, reported = emitter.usage, emitter.usageReported
 	if errors.Is(readErr, errStreamNormalTermination) {
+		if !committed {
+			// The stream ended normally without ever carrying a real
+			// assistant delta. Report it as a failed attempt so the caller
+			// retries the next model instead of committing an empty 200.
+			return usage, reported, false, &StreamFailure{Type: "empty_content"}
+		}
 		return usage, reported, committed, nil
 	}
 	if readErr == nil {

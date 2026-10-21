@@ -336,12 +336,17 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			keyID, channel, anonymous := requestCredential(requestCtx)
 			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 			// An exhausted request budget is a timeout, not a bad gateway: the
-			// distinction matters to clients that retry on 502.
-			if errors.Is(err, context.DeadlineExceeded) {
+			// distinction matters to clients that retry on 502. A pool with
+			// nothing left to try is a retryable outage (503); everything
+			// else is an upstream failure (502).
+			switch {
+			case errors.Is(requestCtx.Err(), context.DeadlineExceeded):
 				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
-				return
+			case errors.Is(err, errUpstreamUnavailable), errors.Is(err, errAnonymousInvalidResponse):
+				wire.WriteError(w, external, http.StatusServiceUnavailable, "no upstream capacity available", "upstream_unavailable", ids.Request)
+			default:
+				wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			}
-			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
 		defer resp.Body.Close()
@@ -351,6 +356,10 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		}
 		w.Header().Set("x-request-id", ids.Request)
 		if resp.StatusCode/100 != 2 {
+			if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
+				return
+			}
 			copyErrorResponse(w, external, resp, ids.Request)
 			return
 		}
@@ -400,11 +409,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
-		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
+		if eventStreamResponse(resp) {
 			// The anonymous lane and key-tier shaped requests were
 			// force-streamed (see shapeAnonymousBody); collapse the events
 			// back into the single document this non-streaming client
-			// asked for.
+			// asked for. The retry loops normally do this while validating,
+			// so this only runs for a response that bypassed them.
 			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
 			if err != nil {
 				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
@@ -423,6 +433,15 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
 				return
 			}
+		}
+		if !wire.HasAssistantContent(external, responseBody) {
+			// Last line of defence: never answer 200 with an error envelope,
+			// an empty choice list, or whitespace. The retry loops validate
+			// first; reaching this means the response changed shape during
+			// conversion or bypassed them.
+			g.logger.Warn("upstream response carried no assistant content", "component", "upstream", "event", "downstream_empty_response", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "status", resp.StatusCode)
+			wire.WriteError(w, external, http.StatusBadGateway, "upstream returned no assistant content", "upstream_error", ids.Request)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)

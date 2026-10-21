@@ -197,7 +197,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	attempts := attemptOffset
 	g.dumpOutboundBodies(route, bodies, ids, attemptOffset)
 	if override, selected := debugKeyOverrideFrom(ctx); selected {
-		resp, err, used := g.doSelectedKeyUpstream(ctx, route, bodies, ids, override, attemptOffset)
+		resp, err, used := g.doSelectedKeyUpstream(ctx, route, bodies, ids, override, attemptOffset, stream)
 		return resp, route, used, err
 	}
 	if route.Anonymous {
@@ -238,7 +238,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		keyRoute.Anonymous = false
 		keyRoute.Protocol = route.ProtocolFor(tier)
 		effectiveRoute = keyRoute
-		resp, err, used := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts)
+		resp, err, used := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts, stream)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, keyRoute, attempts, nil
@@ -267,25 +267,33 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		}
 		lastResponse, lastErr = resp, err
 	}
+	if lastResponse != nil && lastResponse.StatusCode/100 == 2 {
+		// No 2xx may leave the hierarchy unless its retry loop validated it.
+		httpx.DrainAndClose(lastResponse.Body)
+		lastResponse = nil
+		if lastErr == nil {
+			lastErr = errUpstreamNoAssistantContent
+		}
+	}
 	if lastResponse != nil {
 		return lastResponse, effectiveRoute, attempts, nil
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no usable upstream route")
+		lastErr = fmt.Errorf("%w: no usable upstream route", errUpstreamUnavailable)
 	}
 	return nil, effectiveRoute, attempts, lastErr
 }
 
 // freitierScanLimit bounds how many lanes one request may park on a FreeTier
 // verdict before the scan concludes the verdict is request-scoped. The cursor
-// interleaves fate classes (configured prefixes and proxy exits), so ten
-// parks cover every independent class a healthy-sized pool holds; a wave that
+// interleaves fate classes (configured prefixes and proxy exits), so the cap
+// covers every independent class a healthy-sized pool holds; a wave that
 // flags one prefix — or one day's worth of proxy nodes — cannot exhaust the
 // budget before an independent lane is tried. When the cap is reached anyway,
 // a canary probe through a verified exit decides whether the verdicts
 // described the request (parks restored, request fails) or the exits (parks
 // stand, request fails), so the pool survives global rejections intact.
-const freitierScanLimit = 10
+const freitierScanLimit = 24
 
 // freitierScanExtendedLimit is the second, one-shot budget a scan may spend
 // when the canary proves the gate still serves the canonical profile from a
@@ -295,7 +303,7 @@ const freitierScanLimit = 10
 // serve. The extended budget walks past the flagged prefix classes into the
 // independent exits; when it is spent without a 2xx the scan still fails fast,
 // so a total wave costs at most one canary round and one budget per request.
-const freitierScanExtendedLimit = 24
+const freitierScanExtendedLimit = 48
 
 const (
 	// anonymousRetryAfter is the delay advertised when the anonymous tier has
@@ -322,27 +330,16 @@ const (
 	anonymousLanePoll = 250 * time.Millisecond
 )
 
-// anonymousFirstEventTimeout bounds how long an anonymous attempt may wait for
-// the first SSE event when the config sets no first-event timeout. The
-// anonymous tier is served streaming-only, so a lane that answers 200 and then
-// never emits an event is dead for this path; without the bound the attempt
-// would hold the request until the client gives up, and the relay would fail
-// after the scan had already accepted the lane.
-const anonymousFirstEventTimeout = 30 * time.Second
-
 // errAnonymousInvalidResponse marks a 2xx that cannot serve the streaming-only
 // anonymous path (no event-stream content type). It is fed to the pool as a
 // lane failure so the exit leaves the recent-success lead instead of being
 // promoted and failing the next client request in the same way.
 var errAnonymousInvalidResponse = errors.New("anonymous lane returned a non-streaming response")
 
-// anonymousAttemptTimeout resolves the first-event bound for anonymous
+// anonymousAttemptTimeout resolves the first-content bound for anonymous
 // attempts: the configured value when set, otherwise the fallback.
 func anonymousAttemptTimeout(configuredSeconds int) time.Duration {
-	if configuredSeconds > 0 {
-		return time.Duration(configuredSeconds) * time.Second
-	}
-	return anonymousFirstEventTimeout
+	return firstContentTimeout(configuredSeconds)
 }
 
 // anonymousEventStream reports whether resp carries the event stream the
@@ -502,6 +499,46 @@ func (g *Gateway) waitForAnonymousLane(ctx context.Context) bool {
 	}
 }
 
+// anonymousBreakerWaitLimit caps how long a request waits for an open
+// anonymous breaker before it takes a half-open probe anyway. It is a var so
+// tests can shorten the window; production uses the full ten seconds.
+var anonymousBreakerWaitLimit = 10 * time.Second
+
+// waitForAnonymousBreaker blocks while the anonymous breaker is open, up to
+// its remaining cooldown (capped at anonymousBreakerWaitLimit) and the request
+// context. It returns false only when the context ended; returning true while
+// the breaker is still open means the caller should probe half-open rather
+// than answer with a zero-attempt 503.
+func (g *Gateway) waitForAnonymousBreaker(ctx context.Context) bool {
+	if g == nil || g.anonymous == nil || g.anonymous.AllowAttempt() {
+		return true
+	}
+	deadline := time.Now().Add(anonymousBreakerWaitLimit)
+	for !g.anonymous.AllowAttempt() {
+		if ctx.Err() != nil {
+			return false
+		}
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return true
+		}
+		if remaining := g.anonymous.BreakerRemaining(); remaining > 0 && remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			return true
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+	return true
+}
+
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, stream bool) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -509,6 +546,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	limit := g.anonymous.Len()
 	attempts := 0
 	freitierParks := 0
+	breakerWaited := false
 	// scanLimit is the FreeTier park budget for this request. It starts at
 	// the base cap and extends once when the canary proves the gate still
 	// serves (see freitierScanExtendedLimit).
@@ -520,7 +558,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	var requestParks []*egressTransport
 	body := bodies[config.TierZen]
 	if len(body) == 0 {
-		return nil, errors.New("no prepared Zen request body"), 0
+		return nil, fmt.Errorf("%w: no prepared Zen request body", errUpstreamUnavailable), 0
+	}
+	if !g.anonymous.AllowAttempt() {
+		// A run of transport-level failures opened the breaker. Wait out the
+		// cooldown (bounded by the request context and the 10s cap) and take
+		// a half-open probe instead of failing with zero attempts.
+		g.logger.Warn("anonymous egress breaker is open; waiting for a half-open probe", "component", "upstream", "event", "anonymous_breaker_wait", "request_id", ids.Request, "attempts", 0, "remaining_ms", g.anonymous.BreakerRemaining().Milliseconds())
+		if !g.waitForAnonymousBreaker(ctx) {
+			return nil, ctx.Err(), 0
+		}
+		breakerWaited = true
 	}
 	if !g.waitForAnonymousEgress(ctx) {
 		if ctx.Err() != nil {
@@ -554,6 +602,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			break
 		}
+		if attempts > 0 && !g.anonymous.AllowAttempt() {
+			// The breaker opened during this scan. Wait for the cooldown
+			// instead of aborting the scan: a half-open probe may still
+			// reach a live exit while the request budget remains.
+			g.logger.Warn("anonymous egress breaker opened mid-scan; waiting before continuing", "component", "upstream", "event", "anonymous_breaker_wait", "request_id", ids.Request, "attempts", attempts, "remaining_ms", g.anonymous.BreakerRemaining().Milliseconds())
+			if !g.waitForAnonymousBreaker(ctx) {
+				return nil, ctx.Err(), attempts
+			}
+			breakerWaited = true
+		}
 		node := cursor.Next()
 		if node == nil {
 			break
@@ -573,7 +631,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, node.egress)
 		started := time.Now()
-		resp, err := doInferenceAttempt(node.egress.client, req, anonymousAttemptTimeout(g.cfg.Performance.FirstEventTimeoutSeconds))
+		resp, err := doInferenceAttempt(node.egress.client, req, anonymousAttemptTimeout(g.cfg.Performance.FirstEventTimeoutSeconds), route.Protocol)
 		duration := time.Since(started)
 		if ctx.Err() != nil {
 			// The parent budget expired while this attempt was in flight. Its
@@ -586,11 +644,24 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			return nil, ctx.Err(), attempts
 		}
+		if err != nil && resp == nil && ctx.Err() == nil {
+			// No response headers at all and the request budget is intact: a
+			// pure transport failure. Responses (even 5xx) and cancelled
+			// attempts say nothing about whether the egress path is alive.
+			g.anonymous.RecordTransportFailure()
+		}
 		if err == nil {
 			if reason, cause := bufferAnonymousBody(resp, stream); reason != "" {
 				g.logger.Warn("anonymous lane returned an unusable 2xx; trying the next lane", "component", "upstream", "event", "anonymous_invalid_response", "reason", reason, "request_id", ids.Request, "attempt", attemptOffset+attempts, "egress", config.RedactURL(node.egress.address), "error", cause, "duration_ms", duration.Milliseconds())
 				resp = nil
 				err = errAnonymousInvalidResponse
+			} else if reason, cause := validateUpstreamSuccess(resp, route, stream); reason != "" {
+				g.logger.Warn("anonymous lane returned a 2xx without assistant content; trying the next lane", "component", "upstream", "event", "anonymous_empty_response", "reason", reason, "request_id", ids.Request, "attempt", attemptOffset+attempts, "egress", config.RedactURL(node.egress.address), "error", cause, "duration_ms", duration.Milliseconds())
+				resp = nil
+				err = cause
+				if err == nil {
+					err = errUpstreamNoAssistantContent
+				}
 			}
 		}
 		g.observeAnonymousResult(ctx, node, resp, err)
@@ -674,6 +745,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			continue
 		}
 		if err == nil && resp.StatusCode/100 == 2 {
+			g.anonymous.RecordTransportSuccess()
 			g.transports.ClearPrefix(node.egress.address)
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
@@ -693,6 +765,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "duration_ms", duration.Milliseconds(), "error", err)
 		} else {
 			g.logger.Debug("anonymous upstream returned an error response; trying the next lane", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "egress", config.RedactURL(node.egress.address), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+		}
+	}
+	if lastResponse != nil && lastResponse.StatusCode/100 == 2 {
+		// A 2xx must never leave this scan unless a retry loop validated it.
+		// Defensive: drain it and report exhaustion instead of forwarding an
+		// empty success to the client.
+		httpx.DrainAndClose(lastResponse.Body)
+		lastResponse = nil
+		if lastErr == nil {
+			lastErr = errUpstreamNoAssistantContent
 		}
 	}
 	if lastResponse != nil {
@@ -732,6 +814,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		// hand clients the retryable signal instead of a 502 that they may
 		// treat as fatal.
 		g.logger.Warn("anonymous scan ended without a response after FreeTier verdicts; returning a retryable 503", "component", "upstream", "event", "anonymous_scan_degraded", "request_id", ids.Request, "attempts", attempts, "parks", freitierParks, "retry_after_s", int(anonymousRetryAfter/time.Second))
+		return anonymousUnavailableResponse(anonymousRetryAfter), nil, attempts
+	}
+	if breakerWaited {
+		// The breaker was open for this request and every half-open probe
+		// failed. Report the retryable pool outage, not a 502.
+		g.logger.Warn("anonymous half-open probes failed; returning a retryable 503", "component", "upstream", "event", "anonymous_breaker_probe_failed", "request_id", ids.Request, "attempts", attempts, "retry_after_s", int(anonymousRetryAfter/time.Second))
 		return anonymousUnavailableResponse(anonymousRetryAfter), nil, attempts
 	}
 	if lastErr == nil {
@@ -1032,7 +1120,7 @@ func (g *Gateway) shapeKeyBody(channel *channel, body []byte, route models.Route
 // untouched on purpose: a diagnostic request must never cool a production key or
 // evict a lane, which is exactly what made a bad Playground request degrade
 // live traffic before.
-func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, override DebugKeyOverride, attemptOffset int) (*http.Response, error, int) {
+func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, override DebugKeyOverride, attemptOffset int, stream bool) (*http.Response, error, int) {
 	channel := g.channel(override.Tier)
 	if channel == nil {
 		return nil, fmt.Errorf("selected %s key tier is no longer configured", override.Tier), 0
@@ -1061,13 +1149,26 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	}
 	keyID := config.KeyDisplayID(node.key)
 	setRequestCredential(ctx, override.Tier, keyID, "key", false, egress)
-	req, err := newUpstreamRequest(ctx, channel.upstream, channel.opencode, route.ProtocolFor(override.Tier), body, ids, node.key)
+	protocol := route.ProtocolFor(override.Tier)
+	req, err := newUpstreamRequest(ctx, channel.upstream, channel.opencode, protocol, body, ids, node.key)
 	if err != nil {
 		return nil, err, 0
 	}
 	started := time.Now()
-	resp, err := doInferenceAttempt(egress.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
+	resp, err := doInferenceAttempt(egress.client, req, firstContentTimeout(g.cfg.Performance.FirstEventTimeoutSeconds), protocol)
 	duration := time.Since(started)
+	if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+		selectedRoute := route
+		selectedRoute.Protocol = protocol
+		if reason, cause := validateUpstreamSuccess(resp, selectedRoute, stream); reason != "" {
+			g.logger.Warn("selected key returned a 2xx without assistant content", "component", "upstream", "event", "selected_key_empty_response", "reason", reason, "request_id", ids.Request, "tier", override.Tier, "key_id", keyID, "error", cause, "duration_ms", duration.Milliseconds())
+			resp.Body = http.NoBody
+			err = cause
+			if err == nil {
+				err = errUpstreamNoAssistantContent
+			}
+		}
+	}
 	g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+1, keyID, "key", false, egress, resp, err, duration)
 	if err != nil {
 		return nil, err, 1
@@ -1075,22 +1176,49 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	return resp, nil, 1
 }
 
-func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
+// keyHedgeDelay is how long one key attempt may wait for response headers
+// before the next key is raced alongside it. A hanging free-tier key/lane
+// otherwise costs the full 45s header timeout; serial attempts then exhaust
+// the request budget before the client sees any bytes.
+var keyHedgeDelay = 5 * time.Second
+
+// maxKeyHedgeConcurrency caps how many key attempts may be in flight at once.
+// The total budget is retry.max_attempts; replacements launch as each attempt
+// fails, but never more than this many simultaneously.
+const maxKeyHedgeConcurrency = 3
+
+// errKeyHedgeSettled is the cancellation cause for hedge losers. Cancelled
+// attempts are ignored by the pool: a race loser says nothing about the key
+// or the lane, so it must never cool a healthy key.
+var errKeyHedgeSettled = errors.New("key hedge settled")
+
+type keyAttemptResult struct {
+	node     *upstreamNode
+	egress   *egressTransport
+	keyID    string
+	resp     *http.Response
+	err      error
+	duration time.Duration
+	// attempt is the one-based launch order used for logs and telemetry.
+	attempt  int
+	canceled bool
+}
+
+func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, stream bool) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	channel := g.channel(route.Tier)
 	if channel == nil {
-		return nil, fmt.Errorf("no %s tier is configured", route.Tier), 0
+		return nil, fmt.Errorf("%w: no %s tier is configured", errUpstreamUnavailable, route.Tier), 0
 	}
 	nodes := channel.nodes
 	cursor := nodes.CursorFor(ids.Session)
 	if nodes.Len() == 0 {
-		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
+		return nil, fmt.Errorf("%w: no %s nodes configured", errUpstreamUnavailable, route.Tier), 0
 	}
-	attempts := 0
 	body := bodies[route.Tier]
 	if len(body) == 0 {
-		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
+		return nil, fmt.Errorf("%w: no prepared %s request body", errUpstreamUnavailable, route.Tier), 0
 	}
 	if shaped, changed := g.shapeKeyBody(channel, body, route); changed {
 		body = shaped
@@ -1098,111 +1226,382 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			meta.Shaped = true
 		}
 	}
-	for attempts < g.cfg.Retry.MaxAttempts {
-		if ctx.Err() != nil {
-			// Same guard as the anonymous loop: an exhausted request budget
-			// must not be spent rotating keys that were never really tried.
-			if lastErr == nil {
-				lastErr = ctx.Err()
+
+	maxAttempts := g.cfg.Retry.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	results := make(chan keyAttemptResult, maxAttempts)
+	cancels := make(map[int]context.CancelCauseFunc, maxAttempts)
+	used := make(map[*upstreamNode]struct{}, maxAttempts)
+	launched, inflight := 0, 0
+	exhausted := false
+	canceledAll := false
+
+	// The event loop is the only caller; the bool keeps a later return path
+	// from cancelling (or racing with) a set that was already settled.
+	cancelAllExcept := func(keep int) {
+		if canceledAll {
+			return
+		}
+		canceledAll = true
+		for attempt, cancel := range cancels {
+			if attempt != keep {
+				cancel(errKeyHedgeSettled)
 			}
-			break
 		}
-		node := cursor.Next()
-		if node == nil {
-			break
+	}
+
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	stopTimer := func() {
+		if timer == nil {
+			return
 		}
-		// Cursor.Next only returns a benched node when every lane in the
-		// pool is benched (its cooldown fallback ran out of unbenched
-		// candidates). Attempting it would spend the request budget on
-		// the lane's own known verdict — a parked FreeTier lane answers
-		// the same 403 again — so hand the request to the layers below.
-		if nodes.laneParked(node) {
-			break
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
 		}
-		attempts++
-		// Keep the request-level trace synchronized with the attempt that is
-		// about to be sent. Only the redacted key suffix is retained.
-		if meta := telemetry.MetaFromContext(ctx); meta != nil {
-			meta.Attempts = attemptOffset + attempts
-			meta.Tier = string(route.Tier)
+		timerC = nil
+	}
+	defer stopTimer()
+	armTimer := func() {
+		// Hedge only OpenCode keyed traffic. Provider channels bill per
+		// request, so a slow-but-healthy paid attempt must not be duplicated
+		// just because its headers are late.
+		if !channel.opencode || launched >= maxAttempts || inflight >= maxKeyHedgeConcurrency || ctx.Err() != nil {
+			stopTimer()
+			return
 		}
+		if timer == nil {
+			timer = time.NewTimer(keyHedgeDelay)
+		} else {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(keyHedgeDelay)
+		}
+		timerC = timer.C
+	}
+
+	discard := func(r keyAttemptResult) {
+		if r.resp != nil {
+			httpx.DrainAndClose(r.resp.Body)
+		}
+	}
+	drainAsync := func(n int) {
+		if n <= 0 {
+			return
+		}
+		go func() {
+			for i := 0; i < n; i++ {
+				discard(<-results)
+			}
+		}()
+	}
+	drainSync := func(n int) {
+		for i := 0; i < n; i++ {
+			discard(<-results)
+		}
+	}
+	// stash retains the newest retryable response so an all-failed hedge can
+	// still return the last 403/5xx exactly as the serial loop did. The
+	// previous body is drained here, and only bodies still owned by this
+	// function are ever closed.
+	stash := func(resp *http.Response, err error) {
+		if resp != nil && resp.StatusCode/100 == 2 {
+			// Only a validated success may leave this loop as a 2xx. A
+			// rejected empty body is drained here so finish() can never hand
+			// it back to the client.
+			httpx.DrainAndClose(resp.Body)
+			resp = nil
+			if err == nil {
+				err = errUpstreamNoAssistantContent
+			}
+		}
+		if lastResponse != nil && lastResponse != resp {
+			httpx.DrainAndClose(lastResponse.Body)
+		}
+		lastResponse, lastErr = resp, err
+	}
+	clearStash := func() {
 		if lastResponse != nil {
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, channel.upstream, channel.opencode, route.Protocol, body, ids, node.key)
-		if err != nil {
-			return nil, err, attempts
+	}
+	finish := func() (*http.Response, error, int) {
+		if lastResponse != nil && lastResponse.StatusCode/100 == 2 {
+			httpx.DrainAndClose(lastResponse.Body)
+			lastResponse = nil
+			if lastErr == nil {
+				lastErr = errUpstreamNoAssistantContent
+			}
+		}
+		if lastResponse != nil {
+			return lastResponse, nil, launched
+		}
+		if launched == 0 && lastErr == nil {
+			lastErr = fmt.Errorf("%w: no %s key could be tried", errUpstreamUnavailable, route.Tier)
+		}
+		return nil, lastErr, launched
+	}
+
+	// launch starts one key attempt and returns false when the pool has no
+	// unused, unparked node left. Selection happens inside the event loop, so
+	// the cursor and the used set need no lock.
+	launch := func() (bool, error) {
+		if launched >= maxAttempts || ctx.Err() != nil {
+			return false, nil
+		}
+		var node *upstreamNode
+		for tries := 0; tries < nodes.Len(); tries++ {
+			candidate := cursor.Next()
+			if candidate == nil {
+				return false, nil
+			}
+			// Cursor.Next only returns a benched node when every lane in the
+			// pool is benched (its cooldown fallback ran out of unbenched
+			// candidates). Attempting it would spend the request budget on
+			// the lane's own known verdict — a parked FreeTier lane answers
+			// the same 403 again — so hand the request to the layers below.
+			if nodes.laneParked(candidate) {
+				return false, nil
+			}
+			if _, seen := used[candidate]; seen {
+				continue
+			}
+			node = candidate
+			break
+		}
+		if node == nil {
+			return false, nil
 		}
 		egress := nodes.Egress(node)
 		if egress == nil {
-			lastErr = errors.New("upstream key has no egress binding")
-			break
+			lastErr = fmt.Errorf("%w: upstream key has no egress binding", errUpstreamUnavailable)
+			return false, nil
+		}
+		attemptNumber := launched + 1
+		attemptCtx, cancel := context.WithCancelCause(ctx)
+		req, err := newUpstreamRequest(attemptCtx, channel.upstream, channel.opencode, route.Protocol, body, ids, node.key)
+		if err != nil {
+			cancel(err)
+			return false, err
 		}
 		keyID := config.KeyDisplayID(node.key)
+		// Keep the request-level trace synchronized with the attempt that is
+		// about to be sent. Only the redacted key suffix is retained.
+		if meta := telemetry.MetaFromContext(ctx); meta != nil {
+			meta.Attempts = attemptOffset + attemptNumber
+			meta.Tier = string(route.Tier)
+		}
 		setRequestCredential(ctx, route.Tier, keyID, "key", false, egress)
-		attemptStarted := time.Now()
-		resp, err := doInferenceAttempt(egress.client, req, time.Duration(g.cfg.Performance.FirstEventTimeoutSeconds)*time.Second)
-		attemptDuration := time.Since(attemptStarted)
-		if ctx.Err() != nil {
-			// The request budget expired while this attempt was in flight. A
-			// cancelled context says nothing about the key or the lane: without
-			// this guard the instant DeadlineExceeded would cool a healthy key
-			// and evict a healthy lane from the pool.
-			lastResponse, lastErr = resp, err
-			if lastErr == nil && lastResponse == nil {
+		used[node] = struct{}{}
+		cancels[attemptNumber] = cancel
+		launched++
+		inflight++
+		go func() {
+			started := time.Now()
+			resp, err := doInferenceAttempt(egress.client, req, firstContentTimeout(g.cfg.Performance.FirstEventTimeoutSeconds), route.Protocol)
+			if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+				if reason, cause := validateUpstreamSuccess(resp, route, stream); reason != "" {
+					g.logger.Warn("upstream 2xx rejected; trying the next key", "component", "upstream", "event", "key_empty_response", "reason", reason, "request_id", ids.Request, "attempt", attemptNumber, "tier", route.Tier, "key_id", keyID, "egress", config.RedactURL(egress.address), "error", cause, "duration_ms", time.Since(started).Milliseconds())
+					resp.Body = http.NoBody
+					err = cause
+					if err == nil {
+						err = errUpstreamNoAssistantContent
+					}
+				}
+			}
+			results <- keyAttemptResult{
+				node:     node,
+				egress:   egress,
+				keyID:    keyID,
+				resp:     resp,
+				err:      err,
+				duration: time.Since(started),
+				attempt:  attemptNumber,
+				// A parent cancellation is not a hedge loss: the request
+				// budget ended, and the ctx.Done branch handles it without
+				// observing the key.
+				canceled: attemptCtx.Err() != nil && ctx.Err() == nil,
+			}
+		}()
+		return true, nil
+	}
+
+	started, err := launch()
+	if err != nil {
+		return nil, err, 0
+	}
+	if !started {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("%w: no %s key could be tried", errUpstreamUnavailable, route.Tier)
+		}
+		return nil, lastErr, 0
+	}
+	armTimer()
+
+	// One attempt starts immediately; every later attempt either replaces a
+	// retryable failure at once or joins after keyHedgeDelay. The first
+	// response therefore arrives after one hedge delay, not after the whole
+	// serial retry chain. With maxAttempts == 1 no timer is ever armed, so
+	// the behavior is exactly the old single-attempt path.
+	for {
+		if inflight == 0 && (launched >= maxAttempts || exhausted) {
+			return finish()
+		}
+		select {
+		case r := <-results:
+			inflight--
+			if r.canceled || ctx.Err() != nil {
+				// Hedge losers and parent-cancelled attempts must not cool a
+				// healthy key or evict a healthy lane.
+				discard(r)
+				if ctx.Err() == nil {
+					continue
+				}
+				cancelAllExcept(0)
+				drainSync(inflight)
+				if lastErr == nil {
+					lastErr = ctx.Err()
+				}
+				return finish()
+			}
+			g.observeKeyResult(ctx, channel, r.node, r.egress, r.resp, r.err)
+			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+r.attempt, r.keyID, "key", false, r.egress, r.resp, r.err, r.duration)
+			// Same 403 taxonomy as the anonymous loop: account blocks fail the
+			// tier fast, FreeTier flags park the lane, region blocks cool the
+			// /64. MarkFailure already cooled the lane via cooldownWorthy; the
+			// park/cool here is the additional exit-attributable signal. It is an
+			// OpenCode gate contract: provider verdicts never touch lane state.
+			if channel.opencode && r.err == nil && r.resp != nil && r.resp.StatusCode == http.StatusForbidden {
+				verdict := classifyForbidden(peekForbiddenSnippet(r.resp, 2048))
+				g.logger.Info("upstream returned 403", "component", "upstream", "event", "attempt_forbidden", "request_id", ids.Request, "attempt", r.attempt, "tier", route.Tier, "key_id", r.keyID, "verdict", string(verdict), "egress", config.RedactURL(r.egress.address), "duration_ms", r.duration.Milliseconds())
+				if verdict == forbiddenAccount {
+					cancelAllExcept(r.attempt)
+					drainAsync(inflight)
+					clearStash()
+					return r.resp, nil, launched
+				}
+				if verdict == forbiddenFreeTier {
+					g.parkEgressFreitier(r.egress)
+				}
+				if verdict == forbiddenRegion {
+					g.transports.CoolSubnet(r.egress.address, forbiddenRegionCooldown)
+					g.transports.pruneSubnetCooldowns()
+				}
+				consumed := false
+				if launched < maxAttempts {
+					// peekForbiddenSnippet reads through the body before
+					// restoring it. A response that will be retried past is
+					// closed now so a final all-failed return can never hand
+					// back a consumed body.
+					httpx.DrainAndClose(r.resp.Body)
+					consumed = true
+					if lastErr == nil {
+						lastErr = fmt.Errorf("upstream returned 403 %s with retries available", verdict)
+					}
+				}
+				next, nextErr := launch()
+				if nextErr != nil {
+					cancelAllExcept(r.attempt)
+					drainAsync(inflight)
+					clearStash()
+					return nil, nextErr, launched
+				}
+				if next {
+					armTimer()
+				} else {
+					exhausted = true
+					stopTimer()
+				}
+				if !consumed {
+					stash(r.resp, nil)
+				}
+				continue
+			}
+			if r.err == nil && r.resp != nil && r.resp.StatusCode/100 == 2 {
+				g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", r.attempt, "tier", route.Tier, "key_id", r.keyID, "egress", config.RedactURL(r.egress.address), "status", r.resp.StatusCode, "duration_ms", r.duration.Milliseconds())
+				// Settle the hedge: cancel every other in-flight attempt and
+				// drain it in the background so its body and connection are
+				// released. The winner is excluded from cancellation and its
+				// body stays untouched for the caller.
+				cancelAllExcept(r.attempt)
+				drainAsync(inflight)
+				clearStash()
+				return r.resp, nil, launched
+			}
+			// Request-shape errors are deterministic and must leave this tier without
+			// rotating through unrelated keys. The outer route may still try the next
+			// tier in prefer order. Authentication, throttling, server, and transport
+			// failures remain retryable inside this tier.
+			if isNonRetryableClientResponse(r.resp, r.err) {
+				g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", r.attempt, "tier", route.Tier, "key_id", r.keyID, "status", r.resp.StatusCode, "egress", config.RedactURL(r.egress.address), "duration_ms", r.duration.Milliseconds())
+				cancelAllExcept(r.attempt)
+				drainAsync(inflight)
+				clearStash()
+				return r.resp, nil, launched
+			}
+			stash(r.resp, r.err)
+			if r.err != nil {
+				g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", r.attempt, "tier", route.Tier, "key_id", r.keyID, "egress", config.RedactURL(r.egress.address), "duration_ms", r.duration.Milliseconds(), "error", r.err)
+			} else {
+				g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", r.attempt, "tier", route.Tier, "key_id", r.keyID, "status", r.resp.StatusCode, "egress", config.RedactURL(r.egress.address), "duration_ms", r.duration.Milliseconds())
+			}
+			// A definitive failure frees a hedge slot immediately; do not
+			// wait for the timer that only exists for silent hangs.
+			next, nextErr := launch()
+			if nextErr != nil {
+				cancelAllExcept(r.attempt)
+				drainAsync(inflight)
+				clearStash()
+				return nil, nextErr, launched
+			}
+			if next {
+				armTimer()
+			} else {
+				exhausted = true
+				stopTimer()
+			}
+		case <-timerC:
+			timerC = nil
+			if inflight >= maxKeyHedgeConcurrency {
+				// A result filled the last slot before this timer fired; the
+				// result path owns the next launch.
+				continue
+			}
+			next, nextErr := launch()
+			if nextErr != nil {
+				cancelAllExcept(0)
+				drainAsync(inflight)
+				clearStash()
+				return nil, nextErr, launched
+			}
+			if next {
+				armTimer()
+			} else {
+				exhausted = true
+				stopTimer()
+			}
+		case <-ctx.Done():
+			// Same guard as the anonymous loop: an exhausted request budget
+			// must not be spent rotating keys that were never really tried.
+			// Cancelled attempts are drained without observing the key.
+			cancelAllExcept(0)
+			drainSync(inflight)
+			if lastErr == nil {
 				lastErr = ctx.Err()
 			}
-			break
-		}
-		g.observeKeyResult(ctx, channel, node, egress, resp, err)
-		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, keyID, "key", false, egress, resp, err, attemptDuration)
-		// Same 403 taxonomy as the anonymous loop: account blocks fail the
-		// tier fast, FreeTier flags park the lane, region blocks cool the
-		// /64. MarkFailure already cooled the lane via cooldownWorthy; the
-		// park/cool here is the additional exit-attributable signal. It is an
-		// OpenCode gate contract: provider verdicts never touch lane state.
-		if channel.opencode && err == nil && resp.StatusCode == http.StatusForbidden {
-			verdict := classifyForbidden(peekForbiddenSnippet(resp, 2048))
-			g.logger.Info("upstream returned 403", "component", "upstream", "event", "attempt_forbidden", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "verdict", string(verdict), "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
-			if verdict == forbiddenAccount {
-				return resp, nil, attempts
-			}
-			if verdict == forbiddenFreeTier {
-				g.parkEgressFreitier(egress)
-			}
-			if verdict == forbiddenRegion {
-				g.transports.CoolSubnet(egress.address, forbiddenRegionCooldown)
-				g.transports.pruneSubnetCooldowns()
-			}
-			lastResponse = resp
-			lastErr = err
-			continue
-		}
-		if err == nil && resp.StatusCode/100 == 2 {
-			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "egress", config.RedactURL(egress.address), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
-			return resp, nil, attempts
-		}
-		// Request-shape errors are deterministic and must leave this tier without
-		// rotating through unrelated keys. The outer route may still try the next
-		// tier in prefer order. Authentication, throttling, server, and transport
-		// failures remain retryable inside this tier.
-		if isNonRetryableClientResponse(resp, err) {
-			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
-			return resp, nil, attempts
-		}
-		lastResponse = resp
-		lastErr = err
-		if err != nil {
-			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds(), "error", err)
-		} else {
-			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "egress", config.RedactURL(egress.address), "duration_ms", attemptDuration.Milliseconds())
+			return finish()
 		}
 	}
-	if lastResponse != nil {
-		return lastResponse, nil, attempts
-	}
-	return nil, lastErr, attempts
 }
 
 // Diagnostics use the same routing and transports as production, but must not
@@ -1282,6 +1681,8 @@ func (g *Gateway) recordUpstreamAttempt(ctx context.Context, route models.Route,
 	outcome := "retryable_failure"
 	if success {
 		outcome = "success"
+	} else if errors.Is(err, errUpstreamNoAssistantContent) || errors.Is(err, errUpstreamInvalidContent) {
+		outcome = "empty_content"
 	} else if err != nil {
 		outcome = "transport_error"
 	} else if isNonRetryableClientResponse(resp, nil) {

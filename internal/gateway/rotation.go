@@ -438,17 +438,8 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		err = errors.New("upstream error envelope")
 	}
 	if err == nil {
-		valid := false
-		switch route.Protocol {
-		case wire.Chat:
-			_, valid = document["choices"].([]any)
-		case wire.Anthropic:
-			_, valid = document["content"].([]any)
-		case wire.Responses:
-			_, valid = document["output"].([]any)
-		}
-		if !valid {
-			err = errors.New("invalid response schema")
+		if !wire.HasAssistantContent(route.Protocol, b) {
+			err = errors.New("upstream response contains no assistant content")
 		}
 	}
 	if err == nil && external != route.Protocol {
